@@ -1,11 +1,14 @@
 model:
-  # Only this model is supported for now.
-  repo_id: "Qwen/Qwen3.5-9B"
+  # Hugging Face model repo id.
+  # Examples:
+  # - Qwen/Qwen3-VL-8B-Instruct
+  # - Qwen/Qwen3-VL-30B-A3B-Instruct
+  repo_id: "Qwen/Qwen3-VL-8B-Instruct"
   # Model is always stored at: model/<model_name>
   # Cache is always stored at: model/cache
   trust_remote_code: true
-  torch_dtype: "float16"   # auto | float16 | bfloat16 | float32
-  device: "mps"        # auto | cpu | cuda | mps
+  torch_dtype: "auto"   # auto | float16 | bfloat16 | float32
+  device: "auto"        # auto | cpu | cuda | mps
   download_if_missing: true
 
 input:
@@ -22,8 +25,8 @@ input:
   prompt_text: ""
 
 generation:
-  max_new_tokens: 128
-  temperature: 1.0
+  max_new_tokens: 16
+  temperature: 0.0
   top_p: 1.0
   do_sample: false
 

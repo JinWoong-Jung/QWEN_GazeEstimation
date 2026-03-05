@@ -1,2 +1,4 @@
 data/
 model/
+__pycache__/
+*.log

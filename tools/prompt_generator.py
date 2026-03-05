@@ -80,13 +80,10 @@ def normalize_bbox(
 def build_prompt(image_name: str, bbox_norm: tuple[float, float, float, float]) -> str:
     xmin, ymin, xmax, ymax = bbox_norm
     return (
-        "Task:\n"
-        "You are given a person's head bounding box in the image. "
-        "Predict the normalized gaze point (x, y) in [0, 1] where this person is looking.\n\n"
-        f"- Image file: {image_name}\n"
-        f"- Person Head Bbox [xmin, ymin, xmax, ymax] (normalized) = [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]\n\n"
-        "Output Format:\n"
-        "x, y  # normalized in [0,1]\n"
+        "Task: Predict normalized gaze point (x y), each in [0,1].\n\n"
+        "Head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]\n\n"
+
+        "Output Format(only one line): x y"
     )
 
 

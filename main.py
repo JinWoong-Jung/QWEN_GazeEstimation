@@ -2,20 +2,22 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 from pathlib import Path
 from typing import Any
 
+import requests
 import torch
 import yaml
 from PIL import Image
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, hf_hub_url, snapshot_download
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT_DIR / "config.yaml"
-SUPPORTED_MODEL = "Qwen/Qwen3.5-9B"
+MODEL_STORAGE_ROOT = ROOT_DIR / "model"
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -32,6 +34,62 @@ def resolve_path(base_dir: Path, raw_path: str) -> Path:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def should_ignore(path: str, ignore_patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(path, pattern) for pattern in ignore_patterns)
+
+
+def cleanup_partial_downloads(local_dir: Path) -> None:
+    # Some object-storage mounts do not support append ("ab").
+    # Remove partial artifacts so snapshot_download starts fresh.
+    patterns = ("tmp_*", "*.incomplete", "*.lock")
+    for pattern in patterns:
+        for p in local_dir.glob(pattern):
+            try:
+                if p.is_dir():
+                    for child in p.rglob("*"):
+                        if child.is_file() or child.is_symlink():
+                            child.unlink(missing_ok=True)
+                    # Remove directories bottom-up.
+                    for d in sorted([x for x in p.rglob("*") if x.is_dir()], key=lambda x: len(x.parts), reverse=True):
+                        d.rmdir()
+                    p.rmdir()
+                else:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                # Best effort cleanup only.
+                pass
+
+
+def snapshot_download_no_append(
+    repo_id: str,
+    local_dir: Path,
+    ignore_patterns: list[str],
+) -> None:
+    api = HfApi()
+    repo_files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+    if not repo_files:
+        raise RuntimeError(f"No files listed for repo: {repo_id}")
+
+    kept = [f for f in repo_files if not should_ignore(f, ignore_patterns)]
+    total = len(kept)
+    for idx, rel_path in enumerate(kept, start=1):
+        out_path = local_dir / rel_path
+        if out_path.exists() and out_path.stat().st_size > 0:
+            continue
+
+        ensure_dir(out_path.parent)
+        url = hf_hub_url(repo_id=repo_id, filename=rel_path, repo_type="model")
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmpdl")
+        print(f"[DL] ({idx}/{total}) {rel_path}")
+        with requests.get(url, stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+            with tmp_path.open("wb") as f:
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        tmp_path.replace(out_path)
 
 
 def model_name_from_repo(repo_id: str) -> str:
@@ -62,30 +120,45 @@ def select_torch_dtype(dtype_cfg: str) -> torch.dtype | str:
 
 
 def prepare_model(model_cfg: dict[str, Any], config_dir: Path) -> tuple[Path, str, torch.dtype | str, bool]:
-    repo_id = model_cfg["repo_id"]
-    if repo_id != SUPPORTED_MODEL:
-        raise ValueError(f"Only {SUPPORTED_MODEL} is supported for now. Got: {repo_id}")
+    repo_id = str(model_cfg.get("repo_id", "")).strip()
+    if not repo_id:
+        raise ValueError("model.repo_id is required.")
 
     model_name = model_name_from_repo(repo_id)
-    local_dir = ROOT_DIR / "model" / model_name
-    cache_dir = ROOT_DIR / "model" / "cache"
+    local_dir = MODEL_STORAGE_ROOT / model_name
+    cache_dir = MODEL_STORAGE_ROOT / "cache"
     ensure_dir(local_dir)
     ensure_dir(cache_dir)
 
-    # Keep all HF/transformers caches under model/ as requested.
+    # Keep all HF/transformers caches under the mounted model storage path.
     os.environ["HF_HOME"] = str(cache_dir)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir)
     os.environ["TRANSFORMERS_CACHE"] = str(cache_dir)
+    # Xet-based download path can fail on some object-storage mounts (Illegal seek).
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
     download_if_missing = bool(model_cfg.get("download_if_missing", True))
     has_model_files = any(local_dir.glob("*.json")) and any(local_dir.glob("*.safetensors")) or any(local_dir.glob("pytorch_model*.bin"))
     if download_if_missing and not has_model_files:
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=str(local_dir),
-            local_dir_use_symlinks=False,
-            ignore_patterns=["*.msgpack", "*.h5", "*.ot", "*.tflite"],
-        )
+        cleanup_partial_downloads(local_dir)
+        ignore_patterns = ["*.msgpack", "*.h5", "*.ot", "*.tflite"]
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                local_dir=str(local_dir),
+                max_workers=1,
+                ignore_patterns=ignore_patterns,
+            )
+        except PermissionError as e:
+            # Some mounted object storages reject append writes used by huggingface_hub.
+            if "Operation not permitted" not in str(e):
+                raise
+            print("[WARN] snapshot_download append-write failed on this filesystem; switching to no-append downloader.")
+            snapshot_download_no_append(
+                repo_id=repo_id,
+                local_dir=local_dir,
+                ignore_patterns=ignore_patterns,
+            )
 
     device = select_device(str(model_cfg.get("device", "auto")))
     torch_dtype = select_torch_dtype(str(model_cfg.get("torch_dtype", "auto")))
@@ -124,6 +197,16 @@ def load_prompt(prompt_path: Path | None, prompt_text: str) -> str:
     if prompt_path is None:
         raise ValueError("No prompt provided. Set input.prompt_text or input.prompt_path.")
     return prompt_path.read_text(encoding="utf-8")
+
+
+def enforce_numeric_output_prompt(prompt_text: str) -> str:
+    return (
+        prompt_text.rstrip()
+        + "\n\n"
+        + "Return only the final normalized gaze point as two numbers in one line.\n"
+        + "Format: x y\n"
+        + "No explanation. No labels. No extra text."
+    )
 
 
 def validate_input_config(input_cfg: dict[str, Any], config_dir: Path) -> None:
@@ -171,6 +254,8 @@ def generate_one(
 ) -> str:
     with Image.open(image_path) as img:
         image = img.convert("RGB")
+
+    prompt_text = enforce_numeric_output_prompt(prompt_text)
 
     messages = [
         {
@@ -252,7 +337,7 @@ def main() -> None:
                 continue
 
             prompt_text = load_prompt(prompt_path, str(input_cfg.get("prompt_text", "")))
-            pred = generate_one(
+            raw_pred = generate_one(
                 processor=processor,
                 model=model,
                 device=device,
@@ -260,6 +345,8 @@ def main() -> None:
                 prompt_text=prompt_text,
                 gen_cfg=cfg["generation"],
             )
+            pred = raw_pred
+            parse_source = "raw_model_output"
 
             # Save each sample result immediately.
             out_path.write_text(pred + "\n", encoding="utf-8")
@@ -268,6 +355,8 @@ def main() -> None:
                 "image_path": str(image_path),
                 "prompt_path": str(prompt_path) if prompt_path else None,
                 "prediction": pred,
+                "raw_prediction": raw_pred,
+                "parse_source": parse_source,
             }
             jf.write(json.dumps(row, ensure_ascii=False) + "\n")
             jf.flush()
