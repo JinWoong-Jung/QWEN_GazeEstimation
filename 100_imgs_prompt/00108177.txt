@@ -1,0 +1,8 @@
+Task:
+You are given a person's head bounding box in the image. Predict the normalized gaze point (x, y) in [0, 1] where this person is looking.
+
+- Image file: 00108177.jpg
+- Person Head Bbox [xmin, ymin, xmax, ymax] (normalized) = [0.570312, 0.023438, 0.654948, 0.189453]
+
+Output Format:
+x, y  # normalized in [0,1]

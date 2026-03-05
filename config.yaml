@@ -1,0 +1,32 @@
+model:
+  # Only this model is supported for now.
+  repo_id: "Qwen/Qwen3.5-9B"
+  # Model is always stored at: model/<model_name>
+  # Cache is always stored at: model/cache
+  trust_remote_code: true
+  torch_dtype: "float16"   # auto | float16 | bfloat16 | float32
+  device: "mps"        # auto | cpu | cuda | mps
+  download_if_missing: true
+
+input:
+  mode: "batch"         # batch | single
+
+  # batch mode
+  image_dir: "100_imgs"
+  prompt_dir: "100_imgs_prompt"
+  image_extensions: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
+
+  # single mode (used only when input.mode == single)
+  image_path: ""
+  prompt_path: ""
+  prompt_text: ""
+
+generation:
+  max_new_tokens: 128
+  temperature: 1.0
+  top_p: 1.0
+  do_sample: false
+
+output:
+  # Outputs are always saved at: 100_imgs_output/<model_name>
+  overwrite: false
