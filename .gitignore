@@ -1,4 +1,12 @@
-data/
-model/
+# Ignore generated sample directories
+100_imgs*/
+
+
+# Ignore Python cache
 __pycache__/
-*.log
+**/__pycache__/
+
+# Ignore dataset directory
+data/
+
+model/

@@ -77,13 +77,40 @@ def normalize_bbox(
     return xmin / width, ymin / height, xmax / width, ymax / height
 
 
-def build_prompt(image_name: str, bbox_norm: tuple[float, float, float, float]) -> str:
+def sanitize_bbox(
+    bbox: tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> tuple[float, float, float, float] | None:
+    xmin, ymin, xmax, ymax = bbox
+
+    # Some rows have reversed order or slight out-of-bound values.
+    x1, x2 = sorted((xmin, xmax))
+    y1, y2 = sorted((ymin, ymax))
+
+    x1 = max(0.0, min(x1, float(width)))
+    y1 = max(0.0, min(y1, float(height)))
+    x2 = max(0.0, min(x2, float(width)))
+    y2 = max(0.0, min(y2, float(height)))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def build_prompt(bbox_norm: tuple[float, float, float, float]) -> str:
     xmin, ymin, xmax, ymax = bbox_norm
     return (
-        "Task: Predict normalized gaze point (x y), each in [0,1].\n\n"
-        "Head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]\n\n"
-
-        "Output Format(only one line): x y"
+        "Given the highlighted subject, estimate where the subject is looking(normalized gaze point).\n"
+        f"Head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]\n"
+        "Important rules:\n"
+        "1) Predict where the person is looking AT in the scene (target object/location),\n"
+        "NOT the eye position, face center, or head center.\n"
+        "2) Coordinates must be in FULL SCENE coordinates, not head-crop coordinates.\n"
+        "3) Prefer a point on the likely attended object along the gaze direction.\n"
+        "4) Avoid points inside the head bbox unless no other plausible target is visible.\n"
+        "\n"
+        "Output format (one line only): x y"
     )
 
 
@@ -98,6 +125,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=ROOT_DIR / "100_imgs_prompt")
     parser.add_argument(
         "--overwrite",
+        default=True,
         action="store_true",
         help="Overwrite existing txt files.",
     )
@@ -145,13 +173,19 @@ def main() -> None:
             missing += 1
             continue
 
-        bbox_norm = normalize_bbox(bbox=bbox, width=width, height=height)
+        sanitized_bbox = sanitize_bbox(bbox=bbox, width=width, height=height)
+        if sanitized_bbox is None:
+            print(f"[INVALID] empty bbox after sanitize: {image_name}")
+            missing += 1
+            continue
+
+        bbox_norm = normalize_bbox(bbox=sanitized_bbox, width=width, height=height)
         if not all(0.0 <= v <= 1.0 for v in bbox_norm):
             print(f"[INVALID] normalized bbox out of range [0,1]: {image_name}")
             missing += 1
             continue
 
-        prompt_text = build_prompt(image_name=image_name, bbox_norm=bbox_norm)
+        prompt_text = build_prompt(bbox_norm=bbox_norm)
         out_path.write_text(prompt_text, encoding="utf-8")
         created += 1
 

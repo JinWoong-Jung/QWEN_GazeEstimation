@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import re
@@ -10,13 +11,23 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_PRED_ROOT = ROOT_DIR / "100_imgs_output"
 DEFAULT_GT_DIR = ROOT_DIR / "100_imgs_target"
-FLOAT_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+)")
+FLOAT_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?")
 XY_LINE_RE = re.compile(
     rf"^\s*({FLOAT_RE.pattern})\s*(?:,|\s)\s*({FLOAT_RE.pattern})\s*$"
 )
+XY_LABELED_RE = re.compile(
+    rf"[xX]\s*[:=]\s*({FLOAT_RE.pattern})[^0-9+\-.eE]+[yY]\s*[:=]\s*({FLOAT_RE.pattern})"
+)
+XY_PAREN_RE = re.compile(
+    rf"[\(\[]\s*({FLOAT_RE.pattern})\s*,\s*({FLOAT_RE.pattern})\s*[\)\]]"
+)
 
 
-def parse_points_from_txt(path: Path) -> list[tuple[float, float]]:
+def is_normalized_point(point: tuple[float, float]) -> bool:
+    return 0.0 <= point[0] <= 1.0 and 0.0 <= point[1] <= 1.0
+
+
+def parse_gt_points_from_txt(path: Path) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -29,6 +40,52 @@ def parse_points_from_txt(path: Path) -> list[tuple[float, float]]:
         y = float(m.group(2))
         points.append((x, y))
     return points
+
+
+def parse_prediction_point_from_txt(path: Path) -> tuple[tuple[float, float] | None, str]:
+    text = path.read_text(encoding="utf-8")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    # 1) Strict one-line format: "x y" or "x, y"
+    strict_candidates: list[tuple[float, float]] = []
+    for line in lines:
+        m = XY_LINE_RE.match(line)
+        if m:
+            strict_candidates.append((float(m.group(1)), float(m.group(2))))
+    if strict_candidates:
+        for pt in reversed(strict_candidates):
+            if is_normalized_point(pt):
+                return pt, "strict_line"
+        return None, "strict_line_out_of_range"
+
+    # 2) Labeled format: "x=..., y=..."
+    labeled_matches = list(XY_LABELED_RE.finditer(text))
+    if labeled_matches:
+        for m in reversed(labeled_matches):
+            pt = (float(m.group(1)), float(m.group(2)))
+            if is_normalized_point(pt):
+                return pt, "labeled_pair"
+        return None, "labeled_pair_out_of_range"
+
+    # 3) Parenthesized format: "(x, y)" or "[x, y]"
+    paren_matches = list(XY_PAREN_RE.finditer(text))
+    if paren_matches:
+        for m in reversed(paren_matches):
+            pt = (float(m.group(1)), float(m.group(2)))
+            if is_normalized_point(pt):
+                return pt, "paren_pair"
+        return None, "paren_pair_out_of_range"
+
+    # 4) Fallback: use last pair of numbers in [0,1] from whole text.
+    nums = [float(x) for x in FLOAT_RE.findall(text)]
+    if len(nums) < 2:
+        return None, "no_numbers"
+
+    candidates = [(nums[i], nums[i + 1]) for i in range(len(nums) - 1)]
+    in_range_candidates = [pt for pt in candidates if is_normalized_point(pt)]
+    if in_range_candidates:
+        return in_range_candidates[-1], "fallback_last_in_range_pair"
+    return None, "fallback_no_in_range_pair"
 
 
 def euclidean(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -107,15 +164,16 @@ def evaluate(pred_dir: Path, gt_dir: Path) -> dict[str, object]:
     invalid_pred: list[str] = []
     invalid_gt: list[str] = []
     gt_point_counts: list[int] = []
+    pred_parse_source_counts: Counter[str] = Counter()
 
     for sample_id in common_ids:
-        pred_points = parse_points_from_txt(pred_files[sample_id])
-        if not pred_points:
+        gp_pred, pred_parse_source = parse_prediction_point_from_txt(pred_files[sample_id])
+        pred_parse_source_counts[pred_parse_source] += 1
+        if gp_pred is None:
             invalid_pred.append(sample_id)
             continue
-        gp_pred = pred_points[0]
 
-        gp_gt_all = parse_points_from_txt(gt_files[sample_id])
+        gp_gt_all = parse_gt_points_from_txt(gt_files[sample_id])
         gp_gt = [pt for pt in gp_gt_all if pt[0] != -1]
         if not gp_gt:
             invalid_gt.append(sample_id)
@@ -167,6 +225,7 @@ def evaluate(pred_dir: Path, gt_dir: Path) -> dict[str, object]:
         "extra_pred_ids": extra_pred,
         "invalid_pred_ids": invalid_pred,
         "invalid_gt_ids": invalid_gt,
+        "pred_parse_source_counts": dict(pred_parse_source_counts),
     }
 
 
@@ -229,6 +288,8 @@ def main() -> None:
         f"invalid_pred={result['invalid_pred_count']}, "
         f"invalid_gt={result['invalid_gt_count']}"
     )
+    if result["pred_parse_source_counts"]:
+        print(f"pred_parse_sources={json.dumps(result['pred_parse_source_counts'], ensure_ascii=False)}")
 
     if args.save_json is not None:
         args.save_json.parent.mkdir(parents=True, exist_ok=True)

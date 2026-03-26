@@ -1,35 +1,80 @@
 model:
-  # Hugging Face model repo id.
-  # Examples:
-  # - Qwen/Qwen3-VL-8B-Instruct
-  # - Qwen/Qwen3-VL-30B-A3B-Instruct
-  repo_id: "Qwen/Qwen3-VL-8B-Instruct"
-  # Model is always stored at: model/<model_name>
-  # Cache is always stored at: model/cache
+  # HF repo id. For image+text inference, this should be a VLM checkpoint.
+  # Current request uses:
+  repo_id: "Qwen/Qwen3-VL-4B-Instruct"
+  #"Qwen/Qwen3-VL-4B-Instruct"
+
+  # Optional local model directory override.
+  # If set, loader uses this path directly.
+  local_model_dir: ""
+  model_name: ""
+
   trust_remote_code: true
-  torch_dtype: "auto"   # auto | float16 | bfloat16 | float32
-  device: "auto"        # auto | cpu | cuda | mps
+  torch_dtype: "bfloat16"   # auto | float16 | bfloat16 | float32
+  device: "cuda"            # auto | cpu | cuda | mps
   download_if_missing: true
 
+  # Passed to AutoProcessor.from_pretrained(...)
+  processor_kwargs: {}
+
+  # Passed to AutoModelForImageTextToText.from_pretrained(...)
+  # Example:
+  # model_kwargs:
+  #   attn_implementation: "flash_attention_2"
+  #   device_map: "auto"
+  model_kwargs: {}
+
 input:
-  mode: "batch"         # batch | single
+  mode: "batch"             # batch | single
+  use_image: true           # true for VLM
+  use_head_crop: false       # include head crop image as an additional image input
+  strict_head_bbox: true    # fail if bbox cannot be parsed/cropped from prompt
 
   # batch mode
   image_dir: "100_imgs"
   prompt_dir: "100_imgs_prompt"
   image_extensions: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
 
-  # single mode (used only when input.mode == single)
+  # single mode (used only when mode == single)
   image_path: ""
   prompt_path: ""
   prompt_text: ""
 
+prompt:
+  use_chat_template: true
+  add_generation_prompt: true
+  head_crop_context_text: "The first image is the full scene and the second image is the cropped head region."
+  append_numeric_instruction: true
+  numeric_instruction: |
+    Return only the final normalized gaze point as two numbers in one line.
+    Format: x y
+    No explanation. No labels. No extra text.
+
 generation:
+  # Common settings
   max_new_tokens: 16
+  do_sample: false
   temperature: 0.0
   top_p: 1.0
-  do_sample: false
+
+  # Optional extra kwargs for model.generate(...)
+  # Example:
+  # extra_kwargs:
+  #   top_k: 20
+  #   repetition_penalty: 1.05
+  extra_kwargs: {}
 
 output:
-  # Outputs are always saved at: 100_imgs_output/<model_name>
-  overwrite: false
+  # Saved to: <root_dir>/<model_name>/*.txt
+  root_dir: "100_imgs_output"
+  overwrite: true
+
+  # If true and parsing succeeds, save normalized "x y" to each txt.
+  prefer_parsed_output: true
+  parsed_output_decimals: 6
+
+evaluation:
+  # If true, run evaluation.py logic immediately after generation.
+  run_after_generation: true
+  gt_dir: "100_imgs_target"
+  save_json: ""
