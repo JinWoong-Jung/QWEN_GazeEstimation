@@ -1,41 +1,39 @@
+run:
+  # train | infer
+  mode: "train"
+
+data_paths:
+  train_images_dir: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/train"
+  val_images_dir: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/train"
+  test_images_dir: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/test2"
+  test_annotation_file: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/test_annotations_release.txt"
+
 model:
-  # HF repo id. For image+text inference, this should be a VLM checkpoint.
-  # Current request uses:
   repo_id: "Qwen/Qwen3-VL-4B-Instruct"
-  #"Qwen/Qwen3-VL-4B-Instruct"
-
-  # Optional local model directory override.
-  # If set, loader uses this path directly.
+  # repo_id: "Qwen/Qwen3-VL-4B-Instruct"
   local_model_dir: ""
-  model_name: ""
-
+  model_name: "qwen3vl-gazefollow-lora"
   trust_remote_code: true
   torch_dtype: "bfloat16"   # auto | float16 | bfloat16 | float32
   device: "cuda"            # auto | cpu | cuda | mps
   download_if_missing: true
-
-  # Passed to AutoProcessor.from_pretrained(...)
-  processor_kwargs: {}
-
-  # Passed to AutoModelForImageTextToText.from_pretrained(...)
-  # Example:
-  # model_kwargs:
-  #   attn_implementation: "flash_attention_2"
-  #   device_map: "auto"
+  processor_kwargs:
+    # Spatial task(gaze)라 너무 낮추지 않고 중간 이상 유지
+    min_pixels: 262144
+    max_pixels: 786432
   model_kwargs: {}
 
 input:
-  mode: "batch"             # batch | single
-  use_image: true           # true for VLM
-  use_head_crop: false       # include head crop image as an additional image input
-  strict_head_bbox: true    # fail if bbox cannot be parsed/cropped from prompt
+  # train/infer 공통
+  use_image: true
+  use_head_crop: false
+  strict_head_bbox: true
 
-  # batch mode
+  # infer 전용
+  mode: "batch"             # batch | single
   image_dir: "100_imgs"
   prompt_dir: "100_imgs_prompt"
   image_extensions: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
-
-  # single mode (used only when mode == single)
   image_path: ""
   prompt_path: ""
   prompt_text: ""
@@ -49,32 +47,125 @@ prompt:
     Return only the final normalized gaze point as two numbers in one line.
     Format: x y
     No explanation. No labels. No extra text.
+  # Optional custom template for training prompts.
+  # Available placeholders: {xmin}, {ymin}, {xmax}, {ymax}
+  train_prompt_template: ""
+
+train:
+  # one-line target format: "x y"
+  target_decimals: 6
+  max_seq_length: 2048
+  resume_from_checkpoint: ""
+
+  dataset:
+    train_images_dir: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/train"
+    val_images_dir: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/train"
+    test_images_dir: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/test2"
+    train_annotation_file: "data/gazefollow/train_annotations_new.txt"
+    val_annotation_file: "data/gazefollow/val_annotations_new.txt"
+    train_split_prefix: "train/"
+    val_split_prefix: "train/"
+    strip_split_prefix: true
+    skip_outside_frame: true
+    # SFT 포맷 안정화 단계에서는 부분 데이터로 빠르게 수렴 확인
+    max_train_samples: 30000
+    max_val_samples: 1000
+    show_loading_tqdm: true
+
+  lora:
+    # SFT로 출력 포맷 안정화 우선
+    r: 32
+    alpha: 64
+    dropout: 0.05
+    bias: "none"
+    task_type: "CAUSAL_LM"
+    freeze_vision: true
+    vision_freeze_patterns:
+      - "visual"
+      - "vision"
+      - "vision_tower"
+      - "image_tower"
+      - "visual_encoder"
+      - "vit"
+    target_modules:
+      - "q_proj"
+      - "v_proj"
+      - "o_proj"
+    # attention 전체로 확장하고 싶으면 아래처럼 교체:
+    # target_modules:
+    #   - "q_proj"
+    #   - "k_proj"
+    #   - "v_proj"
+    #   - "o_proj"
+
+  optimizer:
+    learning_rate: 1e-4
+    weight_decay: 0
+    warmup_ratio: 0.03
+    lr_scheduler_type: "cosine"
+    max_grad_norm: 1.0
+
+  trainer:
+    per_device_train_batch_size: 2
+    per_device_eval_batch_size: 2
+    gradient_accumulation_steps: 4
+    num_train_epochs: 1
+    max_steps: -1
+    gradient_checkpointing: true
+    dataloader_num_workers: 2
+    bf16: true
+    fp16: false
+    logging_steps: 20
+    save_strategy: "steps"
+    save_steps: 1000
+    save_total_limit: 3
+    # 속도 우선: train 중간 eval 비활성화 (마지막 test_eval로 확인)
+    evaluation_strategy: "no"
+    eval_steps: 0
+    save_safetensors: true
+    report_to: "none"
+    disable_tqdm: false   # true로 바꾸면 tqdm 비활성화
+
+  output:
+    # LoRA checkpoints는 반드시 project_root/checkpoints/ 하위에 저장됨.
+    checkpoints_subdir: ""
+    run_name: "qwen3vl_gazefollow_lora"
+
+  wandb:
+    enabled: true
+    project: "gaze_mllm"
+    entity: "semgaze"
+    name: "qwen3vl-gazefollow-lora"
+    tags: []
+    notes: ""
+
+  test_eval:
+    enabled: true
+    annotation_file: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/test_annotations_release.txt"
+    images_dir: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_extended/test2"
+    split_prefix: "test2/"
+    strip_split_prefix: true
+    # 빠른 확인용. 최종 성능 확인 시 0(전체)로 변경
+    max_samples: 1000
+    show_tqdm: true
 
 generation:
-  # Common settings
+  # infer 전용
   max_new_tokens: 16
   do_sample: false
   temperature: 0.0
   top_p: 1.0
-
-  # Optional extra kwargs for model.generate(...)
-  # Example:
-  # extra_kwargs:
-  #   top_k: 20
-  #   repetition_penalty: 1.05
   extra_kwargs: {}
 
 output:
-  # Saved to: <root_dir>/<model_name>/*.txt
+  # infer 전용: <root_dir>/<model_name>/*.txt
   root_dir: "100_imgs_output"
   overwrite: true
-
-  # If true and parsing succeeds, save normalized "x y" to each txt.
   prefer_parsed_output: true
   parsed_output_decimals: 6
 
 evaluation:
-  # If true, run evaluation.py logic immediately after generation.
+  # infer 전용
   run_after_generation: true
   gt_dir: "100_imgs_target"
   save_json: ""
