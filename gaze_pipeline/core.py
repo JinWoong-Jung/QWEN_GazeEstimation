@@ -216,8 +216,10 @@ def build_model_kwargs(
 ) -> dict[str, Any]:
     kwargs = dict(model_cfg.get("model_kwargs", {}) or {})
     kwargs.setdefault("trust_remote_code", trust_remote_code)
+    if "torch_dtype" in kwargs and "dtype" not in kwargs:
+        kwargs["dtype"] = kwargs.pop("torch_dtype")
     if torch_dtype != "auto":
-        kwargs.setdefault("torch_dtype", torch_dtype)
+        kwargs.setdefault("dtype", torch_dtype)
     return kwargs
 
 
@@ -353,7 +355,68 @@ def is_normalized_point(point: tuple[float, float]) -> bool:
     return 0.0 <= point[0] <= 1.0 and 0.0 <= point[1] <= 1.0
 
 
-def parse_prediction_point_from_text(text: str) -> tuple[tuple[float, float] | None, str]:
+def quantize_point(x: float, y: float, bins: int = 1000) -> tuple[int, int]:
+    if bins <= 1:
+        raise ValueError("coord bins must be > 1")
+    x = max(0.0, min(1.0, float(x)))
+    y = max(0.0, min(1.0, float(y)))
+    scale = bins - 1
+    ix = int(round(x * scale))
+    iy = int(round(y * scale))
+    ix = max(0, min(ix, scale))
+    iy = max(0, min(iy, scale))
+    return ix, iy
+
+
+def dequantize_point(ix: int, iy: int, bins: int = 1000) -> tuple[float, float]:
+    if bins <= 1:
+        raise ValueError("coord bins must be > 1")
+    scale = bins - 1
+    ix = max(0, min(int(ix), scale))
+    iy = max(0, min(int(iy), scale))
+    return ix / scale, iy / scale
+
+
+def render_target_text(
+    x: float,
+    y: float,
+    target_format: str = "xy_float",
+    coord_bins: int = 1000,
+    target_decimals: int = 6,
+) -> str:
+    fmt = str(target_format).strip().lower()
+    if fmt == "xy_bins":
+        ix, iy = quantize_point(x, y, bins=coord_bins)
+        return f"{ix} {iy}"
+    return f"{x:.{target_decimals}f} {y:.{target_decimals}f}"
+
+
+def _is_integer_like(v: float, eps: float = 1e-6) -> bool:
+    return abs(v - round(v)) <= eps
+
+
+def _candidate_to_point(
+    pt: tuple[float, float],
+    coord_bins: int | None,
+) -> tuple[tuple[float, float] | None, str]:
+    if is_normalized_point(pt):
+        return pt, "normalized"
+    if coord_bins is None or coord_bins <= 1:
+        return None, "not_normalized"
+
+    x, y = pt
+    if _is_integer_like(x) and _is_integer_like(y):
+        ix = int(round(x))
+        iy = int(round(y))
+        if 0 <= ix < coord_bins and 0 <= iy < coord_bins:
+            return dequantize_point(ix, iy, bins=coord_bins), "bins"
+    return None, "not_bins"
+
+
+def parse_prediction_point_from_text(
+    text: str,
+    coord_bins: int = 1000,
+) -> tuple[tuple[float, float] | None, str]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     strict_candidates: list[tuple[float, float]] = []
@@ -363,42 +426,58 @@ def parse_prediction_point_from_text(text: str) -> tuple[tuple[float, float] | N
             strict_candidates.append((float(m.group(1)), float(m.group(2))))
     if strict_candidates:
         for pt in reversed(strict_candidates):
-            if is_normalized_point(pt):
-                return pt, "strict_line"
-        return None, "strict_line_out_of_range"
+            parsed, kind = _candidate_to_point(pt, coord_bins=coord_bins)
+            if parsed is not None:
+                if kind == "bins":
+                    return parsed, "strict_line_bins"
+                return parsed, "strict_line"
+        return None, "strict_line_not_parseable"
 
     labeled_matches = list(XY_LABELED_RE.finditer(text))
     if labeled_matches:
         for m in reversed(labeled_matches):
             pt = (float(m.group(1)), float(m.group(2)))
-            if is_normalized_point(pt):
-                return pt, "labeled_pair"
-        return None, "labeled_pair_out_of_range"
+            parsed, kind = _candidate_to_point(pt, coord_bins=coord_bins)
+            if parsed is not None:
+                if kind == "bins":
+                    return parsed, "labeled_pair_bins"
+                return parsed, "labeled_pair"
+        return None, "labeled_pair_not_parseable"
 
     paren_matches = list(XY_PAREN_RE.finditer(text))
     if paren_matches:
         for m in reversed(paren_matches):
             pt = (float(m.group(1)), float(m.group(2)))
-            if is_normalized_point(pt):
-                return pt, "paren_pair"
-        return None, "paren_pair_out_of_range"
+            parsed, kind = _candidate_to_point(pt, coord_bins=coord_bins)
+            if parsed is not None:
+                if kind == "bins":
+                    return parsed, "paren_pair_bins"
+                return parsed, "paren_pair"
+        return None, "paren_pair_not_parseable"
 
     nums = [float(x) for x in FLOAT_RE.findall(text)]
     if len(nums) < 2:
         return None, "no_numbers"
 
     candidates = [(nums[i], nums[i + 1]) for i in range(len(nums) - 1)]
-    in_range_candidates = [pt for pt in candidates if is_normalized_point(pt)]
-    if in_range_candidates:
-        return in_range_candidates[-1], "fallback_last_in_range_pair"
-    return None, "fallback_no_in_range_pair"
+    for pt in reversed(candidates):
+        parsed, kind = _candidate_to_point(pt, coord_bins=coord_bins)
+        if parsed is not None:
+            if kind == "bins":
+                return parsed, "fallback_last_bins_pair"
+            return parsed, "fallback_last_in_range_pair"
+    return None, "fallback_no_parseable_pair"
 
 
 def finalize_prediction(
     raw_prediction: str,
     output_cfg: dict[str, Any],
 ) -> tuple[str, tuple[float, float] | None, str]:
-    parsed_point, parse_source = parse_prediction_point_from_text(raw_prediction)
+    coord_bins = int(output_cfg.get("coord_bins", 1000))
+    parsed_point, parse_source = parse_prediction_point_from_text(
+        raw_prediction,
+        coord_bins=coord_bins,
+    )
     prefer_parsed = bool(output_cfg.get("prefer_parsed_output", True))
     decimals = int(output_cfg.get("parsed_output_decimals", 6))
 
@@ -450,6 +529,7 @@ def generate_one(
     input_cfg: dict[str, Any],
     prompt_cfg: dict[str, Any],
     generation_kwargs: dict[str, Any],
+    bbox_norm: tuple[float, float, float, float] | None = None,
 ) -> str:
     use_image = bool(input_cfg.get("use_image", True))
     use_head_crop = use_image and bool(input_cfg.get("use_head_crop", True))
@@ -461,14 +541,16 @@ def generate_one(
         with Image.open(image_path) as img:
             image = img.convert("RGB")
         if use_head_crop:
-            bbox_norm = parse_head_bbox_from_prompt(prompt_text)
-            if bbox_norm is None:
+            bbox_to_use = bbox_norm
+            if bbox_to_use is None:
+                bbox_to_use = parse_head_bbox_from_prompt(prompt_text)
+            if bbox_to_use is None:
                 if strict_head_bbox:
                     raise RuntimeError(
                         f"Head bbox not found in prompt for sample: {image_path.stem}"
                     )
             else:
-                head_crop_image = crop_head_from_bbox(image, bbox_norm)
+                head_crop_image = crop_head_from_bbox(image, bbox_to_use)
                 if head_crop_image is None and strict_head_bbox:
                     raise RuntimeError(
                         f"Failed to crop head image from bbox for sample: {image_path.stem}"

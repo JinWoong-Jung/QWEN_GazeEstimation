@@ -27,6 +27,7 @@ from .core import (
     parse_lora_target_modules,
     parse_prediction_point_from_text,
     prepare_model,
+    render_target_text,
     resolve_path,
     sanitize_bbox_pixels,
 )
@@ -166,11 +167,15 @@ class GazeFollowTrainDataset(Dataset):
         records: list[dict[str, Any]],
         input_cfg: dict[str, Any],
         prompt_cfg: dict[str, Any],
+        target_format: str,
+        coord_bins: int,
         target_decimals: int,
     ) -> None:
         self.records = records
         self.input_cfg = input_cfg
         self.prompt_cfg = prompt_cfg
+        self.target_format = target_format
+        self.coord_bins = coord_bins
         self.target_decimals = target_decimals
         self.use_head_crop = bool(input_cfg.get("use_head_crop", False))
 
@@ -186,9 +191,12 @@ class GazeFollowTrainDataset(Dataset):
         bbox_norm = tuple(record["bbox_norm"])
         prompt_text = build_gazefollow_prompt(bbox_norm, self.prompt_cfg)
         prompt_text = enforce_numeric_output_prompt(prompt_text, self.prompt_cfg)
-        target_text = (
-            f"{float(record['gaze_x']):.{self.target_decimals}f} "
-            f"{float(record['gaze_y']):.{self.target_decimals}f}"
+        target_text = render_target_text(
+            x=float(record["gaze_x"]),
+            y=float(record["gaze_y"]),
+            target_format=self.target_format,
+            coord_bins=self.coord_bins,
+            target_decimals=self.target_decimals,
         )
 
         head_crop_image = None
@@ -339,6 +347,50 @@ def load_grouped_rows_for_split(
     return rows_by_image
 
 
+def _rounded_bbox_key(
+    row: list[str],
+    bbox_round_decimals: int,
+) -> tuple[float, float, float, float] | None:
+    bbox = parse_head_bbox_from_row(row)
+    if bbox is None:
+        return None
+    return tuple(round(float(v), bbox_round_decimals) for v in bbox)
+
+
+def build_test_eval_groups(
+    rows_by_image: dict[str, list[list[str]]],
+    group_mode: str,
+    bbox_round_decimals: int,
+) -> tuple[list[tuple[str, list[list[str]]]], str, int]:
+    mode = str(group_mode).strip().lower()
+    if mode not in {"auto", "image", "image_bbox"}:
+        raise ValueError(f"Unsupported test_eval.group_mode: {group_mode}")
+
+    multi_subject_images = 0
+    for _image_rel, rows in rows_by_image.items():
+        bbox_keys = {k for k in (_rounded_bbox_key(r, bbox_round_decimals) for r in rows) if k is not None}
+        if len(bbox_keys) > 1:
+            multi_subject_images += 1
+
+    if mode == "auto":
+        mode = "image_bbox" if multi_subject_images > 0 else "image"
+
+    groups: list[tuple[str, list[list[str]]]] = []
+    if mode == "image":
+        for image_rel, rows in rows_by_image.items():
+            groups.append((image_rel, rows))
+        return groups, mode, multi_subject_images
+
+    for image_rel, rows in rows_by_image.items():
+        by_bbox: dict[tuple[float, float, float, float] | None, list[list[str]]] = {}
+        for row in rows:
+            key = _rounded_bbox_key(row, bbox_round_decimals)
+            by_bbox.setdefault(key, []).append(row)
+        for _bbox_key, group_rows in by_bbox.items():
+            groups.append((image_rel, group_rows))
+    return groups, mode, multi_subject_images
+
+
 def parse_gt_points_from_rows(rows: list[list[str]]) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
     for row in rows:
@@ -368,6 +420,99 @@ def parse_head_bbox_from_row(row: list[str]) -> tuple[float, float, float, float
 
 def euclidean(a: tuple[float, float], b: tuple[float, float]) -> float:
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def generate_batch_for_test_eval(
+    processor: Any,
+    model: Any,
+    device: str,
+    batch_items: list[dict[str, Any]],
+    input_cfg: dict[str, Any],
+    prompt_cfg: dict[str, Any],
+    generation_kwargs: dict[str, Any],
+) -> list[str]:
+    use_image = bool(input_cfg.get("use_image", True))
+    use_head_crop = use_image and bool(input_cfg.get("use_head_crop", True))
+    strict_head_bbox = bool(input_cfg.get("strict_head_bbox", True))
+    use_chat_template = bool(prompt_cfg.get("use_chat_template", True))
+    add_generation_prompt = bool(prompt_cfg.get("add_generation_prompt", True))
+    head_crop_context_text = str(
+        prompt_cfg.get(
+            "head_crop_context_text",
+            "The first image is the full scene and the second image is the cropped head region.",
+        )
+    ).strip()
+
+    prompts: list[str] = []
+    images_payload: list[Any] = []
+
+    for item in batch_items:
+        image_path = Path(item["image_path"])
+        prompt_text = enforce_numeric_output_prompt(str(item["prompt_text"]), prompt_cfg)
+        bbox_norm = item.get("bbox_norm")
+
+        image = None
+        head_crop_image = None
+        if use_image:
+            with Image.open(image_path) as img:
+                image = img.convert("RGB")
+            if use_head_crop:
+                if bbox_norm is None:
+                    if strict_head_bbox:
+                        raise RuntimeError(f"Head bbox missing for sample: {item['image_rel']}")
+                else:
+                    head_crop_image = crop_head_from_bbox(image, bbox_norm)
+                    if head_crop_image is None and strict_head_bbox:
+                        raise RuntimeError(f"Failed to crop head image for sample: {item['image_rel']}")
+
+        if use_chat_template and hasattr(processor, "apply_chat_template"):
+            content: list[dict[str, Any]] = []
+            if use_image:
+                content.append({"type": "image", "image": image})
+                if head_crop_image is not None:
+                    content.append({"type": "image", "image": head_crop_image})
+                    if head_crop_context_text:
+                        content.append({"type": "text", "text": head_crop_context_text})
+            content.append({"type": "text", "text": prompt_text})
+            messages = [{"role": "user", "content": content}]
+            prompt = processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        else:
+            prompt = prompt_text
+
+        prompts.append(prompt)
+        if use_image:
+            if head_crop_image is not None:
+                images_payload.append([image, head_crop_image])
+            else:
+                images_payload.append(image)
+
+    processor_inputs: dict[str, Any] = {
+        "text": prompts,
+        "return_tensors": "pt",
+        "padding": True,
+    }
+    if use_image:
+        processor_inputs["images"] = images_payload
+
+    inputs = processor(**processor_inputs)
+    inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    generated = model.generate(**inputs, **generation_kwargs)
+
+    if "input_ids" in inputs and generated.shape[1] >= inputs["input_ids"].shape[1]:
+        new_tokens = generated[:, inputs["input_ids"].shape[1] :]
+    else:
+        new_tokens = generated
+
+    texts = processor.batch_decode(
+        new_tokens,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    return [t.strip() for t in texts]
 
 
 def run_final_test_eval(
@@ -406,6 +551,11 @@ def run_final_test_eval(
     strip_split_prefix = bool(test_eval_cfg.get("strip_split_prefix", True))
     max_samples = int(test_eval_cfg.get("max_samples", 0))
     show_tqdm = bool(test_eval_cfg.get("show_tqdm", True))
+    coord_bins = int(test_eval_cfg.get("coord_bins", 1000))
+    group_mode = str(test_eval_cfg.get("group_mode", "auto"))
+    bbox_round_decimals = int(test_eval_cfg.get("bbox_round_decimals", 3))
+    batch_size = max(1, int(test_eval_cfg.get("batch_size", 1)))
+    fail_on_no_valid_predictions = bool(test_eval_cfg.get("fail_on_no_valid_predictions", False))
 
     if not annotation_file.exists():
         raise FileNotFoundError(f"[test] annotation file not found: {annotation_file}")
@@ -413,16 +563,27 @@ def run_final_test_eval(
         raise FileNotFoundError(f"[test] images root not found: {images_root}")
 
     rows_by_image = load_grouped_rows_for_split(annotation_file, split_prefix)
-    image_rels = sorted(rows_by_image.keys())
+    eval_groups, mode_used, multi_subject_images = build_test_eval_groups(
+        rows_by_image=rows_by_image,
+        group_mode=group_mode,
+        bbox_round_decimals=bbox_round_decimals,
+    )
+    eval_groups = sorted(eval_groups, key=lambda x: x[0])
     if max_samples > 0:
-        image_rels = image_rels[:max_samples]
-    if not image_rels:
+        eval_groups = eval_groups[:max_samples]
+    if not eval_groups:
         raise RuntimeError("[test] no test samples found with current split_prefix.")
 
     print(f"[INFO][test] annotation_file={annotation_file}")
     print(f"[INFO][test] images_root={images_root}")
     print(f"[INFO][test] split_prefix={split_prefix}")
-    print(f"[INFO][test] total_samples={len(image_rels)}")
+    print(
+        f"[INFO][test] group_mode={mode_used} "
+        f"(requested={group_mode}, multi_subject_images={multi_subject_images}, "
+        f"bbox_round_decimals={bbox_round_decimals})"
+    )
+    print(f"[INFO][test] total_samples={len(eval_groups)}")
+    print(f"[INFO][test] batch_size={batch_size}")
 
     sum_dist_to_avg = 0.0
     sum_avg_dist = 0.0
@@ -433,20 +594,114 @@ def run_final_test_eval(
     invalid_bbox = 0
     invalid_pred = 0
     failed_infer = 0
+    failed_batch_infer = 0
+    first_missing_image: str | None = None
+    first_failed_infer_error: str | None = None
 
     eval_input_cfg = dict(input_cfg)
     eval_input_cfg["use_image"] = True
+    if hasattr(processor, "tokenizer"):
+        padding_side = getattr(processor.tokenizer, "padding_side", None)
+        if padding_side != "left":
+            processor.tokenizer.padding_side = "left"
+            print(
+                f"[INFO][test] tokenizer.padding_side changed: {padding_side} -> left "
+                "(decoder-only generation)"
+            )
+
+    def consume_batch(batch_items: list[dict[str, Any]]) -> None:
+        nonlocal sum_dist_to_avg
+        nonlocal sum_avg_dist
+        nonlocal sum_min_dist
+        nonlocal num_obs
+        nonlocal invalid_pred
+        nonlocal failed_infer
+        nonlocal failed_batch_infer
+        nonlocal first_failed_infer_error
+
+        if not batch_items:
+            return
+
+        def consume_one(item: dict[str, Any], raw_pred: str) -> None:
+            nonlocal sum_dist_to_avg
+            nonlocal sum_avg_dist
+            nonlocal sum_min_dist
+            nonlocal num_obs
+            nonlocal invalid_pred
+
+            pred_point, _ = parse_prediction_point_from_text(
+                raw_pred,
+                coord_bins=coord_bins,
+            )
+            if pred_point is None:
+                invalid_pred += 1
+                return
+
+            gt_points = item["gt_points"]
+            gt_avg = (
+                sum(p[0] for p in gt_points) / len(gt_points),
+                sum(p[1] for p in gt_points) / len(gt_points),
+            )
+            dists = [euclidean(pred_point, gt_pt) for gt_pt in gt_points]
+            sum_dist_to_avg += euclidean(pred_point, gt_avg)
+            sum_avg_dist += sum(dists) / len(dists)
+            sum_min_dist += min(dists)
+            num_obs += 1
+
+        try:
+            raw_preds = generate_batch_for_test_eval(
+                processor=processor,
+                model=model,
+                device=device,
+                batch_items=batch_items,
+                input_cfg=eval_input_cfg,
+                prompt_cfg=prompt_cfg,
+                generation_kwargs=generation_kwargs,
+            )
+            if len(raw_preds) != len(batch_items):
+                raise RuntimeError(
+                    f"Batched output size mismatch: got {len(raw_preds)} for {len(batch_items)} items."
+                )
+            for item, raw_pred in zip(batch_items, raw_preds):
+                consume_one(item, raw_pred)
+            return
+        except Exception as batch_e:
+            failed_batch_infer += 1
+            if first_failed_infer_error is None:
+                first_failed_infer_error = repr(batch_e)
+
+        for item in batch_items:
+            try:
+                raw_pred = generate_one(
+                    processor=processor,
+                    model=model,
+                    device=device,
+                    image_path=item["image_path"],
+                    prompt_text=item["prompt_text"],
+                    input_cfg=eval_input_cfg,
+                    prompt_cfg=prompt_cfg,
+                    generation_kwargs=generation_kwargs,
+                    bbox_norm=item["bbox_norm"],
+                )
+            except Exception as e:
+                failed_infer += 1
+                if first_failed_infer_error is None:
+                    first_failed_infer_error = repr(e)
+                continue
+            consume_one(item, raw_pred)
 
     with torch.inference_mode():
-        iterator = tqdm(image_rels, desc="Final test eval", unit="sample", disable=not show_tqdm)
-        for image_rel in iterator:
-            rows = rows_by_image[image_rel]
+        iterator = tqdm(eval_groups, desc="Final test eval", unit="sample", disable=not show_tqdm)
+        pending_batch: list[dict[str, Any]] = []
+        for image_rel, rows in iterator:
             image_rel_for_join = image_rel
             if split_prefix and strip_split_prefix and image_rel.startswith(split_prefix):
                 image_rel_for_join = image_rel[len(split_prefix) :]
             image_path = images_root / image_rel_for_join
             if not image_path.exists():
                 missing_image += 1
+                if first_missing_image is None:
+                    first_missing_image = str(image_path)
                 continue
 
             gt_points = parse_gt_points_from_rows(rows)
@@ -475,39 +730,51 @@ def run_final_test_eval(
                 continue
             bbox_norm = normalize_bbox_pixels(sanitized_bbox, width, height)
             prompt_text = build_gazefollow_prompt(bbox_norm, prompt_cfg)
-
-            try:
-                raw_pred = generate_one(
-                    processor=processor,
-                    model=model,
-                    device=device,
-                    image_path=image_path,
-                    prompt_text=prompt_text,
-                    input_cfg=eval_input_cfg,
-                    prompt_cfg=prompt_cfg,
-                    generation_kwargs=generation_kwargs,
-                )
-            except Exception:
-                failed_infer += 1
-                continue
-
-            pred_point, _ = parse_prediction_point_from_text(raw_pred)
-            if pred_point is None:
-                invalid_pred += 1
-                continue
-
-            gt_avg = (
-                sum(p[0] for p in gt_points) / len(gt_points),
-                sum(p[1] for p in gt_points) / len(gt_points),
+            pending_batch.append(
+                {
+                    "image_rel": image_rel,
+                    "image_path": image_path,
+                    "prompt_text": prompt_text,
+                    "bbox_norm": bbox_norm,
+                    "gt_points": gt_points,
+                }
             )
-            dists = [euclidean(pred_point, gt_pt) for gt_pt in gt_points]
-            sum_dist_to_avg += euclidean(pred_point, gt_avg)
-            sum_avg_dist += sum(dists) / len(dists)
-            sum_min_dist += min(dists)
-            num_obs += 1
+            if len(pending_batch) >= batch_size:
+                consume_batch(pending_batch)
+                pending_batch = []
+
+        if pending_batch:
+            consume_batch(pending_batch)
 
     if num_obs == 0:
-        raise RuntimeError("[test] no valid predictions to evaluate.")
+        msg = (
+            "[test] no valid predictions to evaluate. "
+            f"counts: missing_image={missing_image}, invalid_gt={invalid_gt}, "
+            f"invalid_bbox={invalid_bbox}, invalid_pred={invalid_pred}, "
+            f"failed_batch_infer={failed_batch_infer}, failed_infer={failed_infer}"
+        )
+        print(f"[WARN]{msg}")
+        if first_missing_image is not None:
+            print(f"[WARN][test] first_missing_image_path={first_missing_image}")
+        if first_failed_infer_error is not None:
+            print(f"[WARN][test] first_failed_infer_error={first_failed_infer_error}")
+        if fail_on_no_valid_predictions:
+            raise RuntimeError(msg)
+        return {
+            "status": "no_valid_predictions",
+            "dist": None,
+            "avg_l2": None,
+            "min_l2": None,
+            "num_obs": 0,
+            "missing_image": missing_image,
+            "invalid_gt": invalid_gt,
+            "invalid_bbox": invalid_bbox,
+            "invalid_pred": invalid_pred,
+            "failed_batch_infer": failed_batch_infer,
+            "failed_infer": failed_infer,
+            "first_missing_image_path": first_missing_image,
+            "first_failed_infer_error": first_failed_infer_error,
+        }
 
     dist = sum_dist_to_avg / num_obs
     avg_l2 = sum_avg_dist / num_obs
@@ -523,6 +790,7 @@ def run_final_test_eval(
         f"invalid_gt={invalid_gt}, "
         f"invalid_bbox={invalid_bbox}, "
         f"invalid_pred={invalid_pred}, "
+        f"failed_batch_infer={failed_batch_infer}, "
         f"failed_infer={failed_infer}"
     )
     return {
@@ -534,6 +802,7 @@ def run_final_test_eval(
         "invalid_gt": invalid_gt,
         "invalid_bbox": invalid_bbox,
         "invalid_pred": invalid_pred,
+        "failed_batch_infer": failed_batch_infer,
         "failed_infer": failed_infer,
     }
 
@@ -716,11 +985,15 @@ def run_trainer(
             print("[WARN][train] val annotation is set but no valid val records found. Eval disabled.")
             do_eval = False
 
+    target_format = str(train_cfg.get("target_format", "xy_float")).strip().lower()
+    coord_bins = int(train_cfg.get("coord_bins", 1000))
     target_decimals = int(train_cfg.get("target_decimals", 6))
     train_dataset = GazeFollowTrainDataset(
         records=train_records,
         input_cfg=input_cfg,
         prompt_cfg=prompt_cfg,
+        target_format=target_format,
+        coord_bins=coord_bins,
         target_decimals=target_decimals,
     )
     eval_dataset = (
@@ -728,6 +1001,8 @@ def run_trainer(
             records=val_records,
             input_cfg=input_cfg,
             prompt_cfg=prompt_cfg,
+            target_format=target_format,
+            coord_bins=coord_bins,
             target_decimals=target_decimals,
         )
         if do_eval and val_records
@@ -820,6 +1095,7 @@ def run_trainer(
     print(f"[INFO][train] run_output_dir={run_output_dir}")
     print(f"[INFO][train] tqdm_enabled={not training_args.disable_tqdm}")
     print(f"[INFO][train] wandb_enabled={wandb_enabled}")
+    print(f"[INFO][train] target_format={target_format}, coord_bins={coord_bins}")
 
     trainer = Trainer(
         model=model,
@@ -851,6 +1127,7 @@ def run_trainer(
     merged_test_eval_cfg.setdefault("strip_split_prefix", True)
     merged_test_eval_cfg.setdefault("max_samples", 0)
     merged_test_eval_cfg.setdefault("show_tqdm", True)
+    merged_test_eval_cfg.setdefault("coord_bins", coord_bins)
     run_final_test_eval(
         model=trainer.model,
         processor=processor,
@@ -861,3 +1138,21 @@ def run_trainer(
         config_dir=config_dir,
         test_eval_cfg=merged_test_eval_cfg,
     )
+
+    save_merged_model = bool(output_cfg.get("save_merged_model", True))
+    merged_model_subdir = str(output_cfg.get("merged_model_subdir", "merged_model")).strip()
+    if save_merged_model and merged_model_subdir:
+        merged_model_dir = run_output_dir / merged_model_subdir
+        ensure_dir(merged_model_dir)
+        try:
+            model_for_export = trainer.model
+            if hasattr(model_for_export, "merge_and_unload"):
+                model_for_export = model_for_export.merge_and_unload()
+            model_for_export.save_pretrained(
+                str(merged_model_dir),
+                safe_serialization=bool(trainer_cfg.get("save_safetensors", True)),
+            )
+            processor.save_pretrained(str(merged_model_dir))
+            print(f"[INFO][train] merged_model_saved={merged_model_dir}")
+        except Exception as e:
+            print(f"[WARN][train] failed_to_save_merged_model: {e}")

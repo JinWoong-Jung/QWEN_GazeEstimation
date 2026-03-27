@@ -1,16 +1,16 @@
-# Ignore generated sample directories
-100_imgs*/
-
-
-# Ignore Python cache
+# Python
 __pycache__/
 **/__pycache__/
+*.py[cod]
 
-# Ignore dataset directory
-data/
+# macOS / editor noise
+.DS_Store
 
+# Local generated artifacts
+100_imgs*/
+wandb/
+checkpoints/
 model/
 
-checkpoints/
-
-wandb/
+# Local datasets
+data/

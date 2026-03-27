@@ -7,6 +7,7 @@ from typing import Any
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from .core import (
+    CHECKPOINT_ROOT,
     build_generation_kwargs,
     build_model_kwargs,
     build_processor_kwargs,
@@ -58,6 +59,120 @@ def maybe_run_evaluation(
         print(f"[EVAL] saved_json={save_json_path}")
 
 
+def _has_model_files(model_dir: Path) -> bool:
+    if not model_dir.exists():
+        return False
+    return (
+        any(model_dir.glob("*.safetensors"))
+        or any(model_dir.glob("pytorch_model*.bin"))
+        or (model_dir / "model.safetensors.index.json").exists()
+    )
+
+
+def _has_processor_files(model_dir: Path) -> bool:
+    if not model_dir.exists():
+        return False
+    candidates = (
+        "processor_config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+    )
+    return any((model_dir / name).exists() for name in candidates)
+
+
+def _resolve_optional_path(config_dir: Path, raw: str) -> Path | None:
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    return resolve_path(config_dir, raw)
+
+
+def _resolve_default_train_artifact_dirs(cfg: dict[str, Any]) -> tuple[Path | None, Path | None]:
+    train_cfg = dict(cfg.get("train", {}) or {})
+    train_output_cfg = dict(train_cfg.get("output", {}) or {})
+    checkpoints_subdir = str(train_output_cfg.get("checkpoints_subdir", "")).strip()
+    run_name = str(train_output_cfg.get("run_name", "")).strip()
+    if not run_name:
+        return None, None
+    run_parent = CHECKPOINT_ROOT / checkpoints_subdir if checkpoints_subdir else CHECKPOINT_ROOT
+    run_dir = run_parent / run_name
+    merged_subdir = str(train_output_cfg.get("merged_model_subdir", "merged_model")).strip()
+    merged_dir = run_dir / merged_subdir if merged_subdir else None
+    adapter_dir = run_dir / "final_adapter"
+    return merged_dir, adapter_dir
+
+
+def load_model_for_inference(
+    cfg: dict[str, Any],
+    config_dir: Path,
+    base_model_dir: Path,
+    base_model_name: str,
+    processor_kwargs: dict[str, Any],
+    model_kwargs: dict[str, Any],
+) -> tuple[Any, Any, str, str]:
+    infer_cfg = dict(cfg.get("inference", {}) or {})
+
+    explicit_model_dir = _resolve_optional_path(config_dir, infer_cfg.get("model_dir", ""))
+    explicit_merged_dir = _resolve_optional_path(config_dir, infer_cfg.get("merged_model_dir", ""))
+    explicit_adapter_dir = _resolve_optional_path(config_dir, infer_cfg.get("adapter_dir", ""))
+    explicit_base_model_dir = _resolve_optional_path(config_dir, infer_cfg.get("base_model_dir", ""))
+
+    use_train_artifacts = bool(infer_cfg.get("use_train_artifacts", True))
+    prefer_merged_model = bool(infer_cfg.get("prefer_merged_model", True))
+    allow_adapter_fallback = bool(infer_cfg.get("allow_adapter_fallback", True))
+
+    default_merged_dir = None
+    default_adapter_dir = None
+    if use_train_artifacts:
+        default_merged_dir, default_adapter_dir = _resolve_default_train_artifact_dirs(cfg)
+
+    model_source = "base_model"
+    model_name = base_model_name
+
+    if explicit_model_dir is not None and _has_model_files(explicit_model_dir):
+        processor = AutoProcessor.from_pretrained(str(explicit_model_dir), **processor_kwargs)
+        model = AutoModelForImageTextToText.from_pretrained(str(explicit_model_dir), **model_kwargs)
+        return processor, model, explicit_model_dir.name, "explicit_model_dir"
+
+    merged_dir = None
+    if explicit_merged_dir is not None and _has_model_files(explicit_merged_dir):
+        merged_dir = explicit_merged_dir
+    elif prefer_merged_model and default_merged_dir is not None and _has_model_files(default_merged_dir):
+        merged_dir = default_merged_dir
+    if merged_dir is not None:
+        processor = AutoProcessor.from_pretrained(str(merged_dir), **processor_kwargs)
+        model = AutoModelForImageTextToText.from_pretrained(str(merged_dir), **model_kwargs)
+        return processor, model, merged_dir.name, "merged_model"
+
+    adapter_dir = None
+    if explicit_adapter_dir is not None and explicit_adapter_dir.exists():
+        adapter_dir = explicit_adapter_dir
+    elif allow_adapter_fallback and default_adapter_dir is not None and default_adapter_dir.exists():
+        adapter_dir = default_adapter_dir
+
+    if adapter_dir is not None:
+        try:
+            from peft import PeftModel
+        except Exception as e:
+            raise RuntimeError(
+                "Adapter inference requested but peft is not available. Install peft or use merged model."
+            ) from e
+
+        base_dir = explicit_base_model_dir if explicit_base_model_dir is not None else base_model_dir
+        base_model = AutoModelForImageTextToText.from_pretrained(str(base_dir), **model_kwargs)
+        model = PeftModel.from_pretrained(base_model, str(adapter_dir), is_trainable=False)
+        processor_dir = adapter_dir if _has_processor_files(adapter_dir) else base_dir
+        processor = AutoProcessor.from_pretrained(str(processor_dir), **processor_kwargs)
+        model_source = f"base_plus_adapter({adapter_dir})"
+        model_name = f"{base_model_name}+{adapter_dir.name}"
+        return processor, model, model_name, model_source
+
+    processor = AutoProcessor.from_pretrained(str(base_model_dir), **processor_kwargs)
+    model = AutoModelForImageTextToText.from_pretrained(str(base_model_dir), **model_kwargs)
+    return processor, model, model_name, model_source
+
+
 def run_inference(
     cfg: dict[str, Any],
     config_dir: Path,
@@ -69,9 +184,23 @@ def run_inference(
 
     validate_input_config(input_cfg, config_dir)
 
-    model_dir, model_name, device, torch_dtype, trust_remote_code = prepare_model(
+    model_dir, base_model_name, device, torch_dtype, trust_remote_code = prepare_model(
         dict(cfg.get("model", {}) or {}),
         config_dir,
+    )
+
+    model_cfg = dict(cfg.get("model", {}) or {})
+    processor_kwargs = build_processor_kwargs(model_cfg, trust_remote_code)
+    model_kwargs = build_model_kwargs(model_cfg, trust_remote_code, torch_dtype)
+    generation_kwargs = build_generation_kwargs(generation_cfg)
+
+    processor, model, model_name, model_source = load_model_for_inference(
+        cfg=cfg,
+        config_dir=config_dir,
+        base_model_dir=model_dir,
+        base_model_name=base_model_name,
+        processor_kwargs=processor_kwargs,
+        model_kwargs=model_kwargs,
     )
 
     output_root = resolve_path(config_dir, str(output_cfg.get("root_dir", "100_imgs_output")))
@@ -79,24 +208,11 @@ def run_inference(
     overwrite = bool(output_cfg.get("overwrite", True))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] model_dir={model_dir}")
+    print(f"[INFO] base_model_dir={model_dir}")
     print(f"[INFO] model_name={model_name}")
+    print(f"[INFO] model_source={model_source}")
     print(f"[INFO] device={device}, torch_dtype={torch_dtype}")
     print(f"[INFO] output_dir={output_dir}")
-
-    model_cfg = dict(cfg.get("model", {}) or {})
-    processor_kwargs = build_processor_kwargs(model_cfg, trust_remote_code)
-    model_kwargs = build_model_kwargs(model_cfg, trust_remote_code, torch_dtype)
-    generation_kwargs = build_generation_kwargs(generation_cfg)
-
-    processor = AutoProcessor.from_pretrained(str(model_dir), **processor_kwargs)
-    try:
-        model = AutoModelForImageTextToText.from_pretrained(str(model_dir), **model_kwargs)
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to load model with AutoModelForImageTextToText. "
-            "For image+prompt inference, use a VLM checkpoint (for example, a *-VL-* model)."
-        ) from e
 
     if "device_map" not in model_kwargs:
         model.to(device)
