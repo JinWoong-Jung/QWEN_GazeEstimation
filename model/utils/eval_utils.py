@@ -38,6 +38,12 @@ def run_eval(
             target_point = batch["target_point"].to(device)
             use_cls_id = bool(torch.any(target_label >= 0).item())
             use_cls_emb = bool(torch.any(target_label_valid > 0).item())
+            backbone_kwargs = None
+            if "joint_inputs" in batch:
+                backbone_kwargs = {
+                    "joint_inputs": batch["joint_inputs"],
+                    "joint_bsz": int(batch.get("joint_bsz", len(batch.get("text_inputs", [])))),
+                }
 
             with torch.autocast(
                 device_type=device.type,
@@ -45,14 +51,17 @@ def run_eval(
                 enabled=(device.type == "cuda"),
             ):
                 out = model(
-                    scene_image=batch["scene_images"],
-                    head_image=batch["head_images"],
-                    text_inputs=batch["text_inputs"],
+                    scene_image=batch.get("scene_images", None),
+                    head_image=batch.get("head_images", None),
+                    text_inputs=batch.get("text_inputs", None),
                     target_heatmap=target_heatmap,
                     target_label=target_label if use_cls_id else None,
                     target_label_emb=target_label_emb if use_cls_emb else None,
                     target_label_valid=target_label_valid if use_cls_emb else None,
                     use_softargmax=False,
+                    compute_point_soft=False,
+                    compute_point_hard=True,
+                    backbone_kwargs=backbone_kwargs,
                 )
 
             loss_dict = out.get("loss_dict", {})
@@ -155,16 +164,25 @@ def run_test_metrics(
             disable=not show_tqdm,
         )
         for batch in test_iter:
+            backbone_kwargs = None
+            if "joint_inputs" in batch:
+                backbone_kwargs = {
+                    "joint_inputs": batch["joint_inputs"],
+                    "joint_bsz": int(batch.get("joint_bsz", len(batch.get("text_inputs", [])))),
+                }
             with torch.autocast(
                 device_type=device.type,
                 dtype=amp_dtype,
                 enabled=(device.type == "cuda"),
             ):
                 out = model(
-                    scene_image=batch["scene_images"],
-                    head_image=batch["head_images"],
-                    text_inputs=batch["text_inputs"],
+                    scene_image=batch.get("scene_images", None),
+                    head_image=batch.get("head_images", None),
+                    text_inputs=batch.get("text_inputs", None),
                     use_softargmax=False,
+                    compute_point_soft=False,
+                    compute_point_hard=True,
+                    backbone_kwargs=backbone_kwargs,
                 )
 
             heatmaps = out["heatmap"][:, 0, :, :].detach().cpu()
@@ -255,4 +273,3 @@ def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
     for k, v in rows:
         print(f"| {k.ljust(key_w)} | {v:>{val_w}.6f} |")
     print(line)
-

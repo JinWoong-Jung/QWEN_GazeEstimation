@@ -14,6 +14,10 @@ from .modules import (
     SubjectConditioning,
     SubjectSummary,
 )
+from .recognition_objectives import (
+    is_embedding_recognition_objective,
+    normalize_recognition_objective,
+)
 
 
 class QwenGazeIntegratedModel(nn.Module):
@@ -68,10 +72,11 @@ class QwenGazeIntegratedModel(nn.Module):
             upsample_mode="bilinear",
             apply_sigmoid=True,
         )
-        self.recognition_objective = str(recognition_objective).strip().lower()
+        self.recognition_objective = normalize_recognition_objective(recognition_objective)
         self.label_emb_dim = int(label_emb_dim)
         build_recognition = False
-        if self.recognition_objective in {"infonce", "batch_local_infonce"}:
+        embedding_objective = is_embedding_recognition_objective(self.recognition_objective)
+        if embedding_objective:
             build_recognition = True
         elif self.recognition_objective == "ce" and num_classes is not None and int(num_classes) > 0:
             build_recognition = True
@@ -82,15 +87,15 @@ class QwenGazeIntegratedModel(nn.Module):
                 output_dim=(int(hidden_dim) if self.recognition_objective == "ce" else int(label_emb_dim)),
                 mlp_hidden_dim=(
                     int(hidden_dim)
-                    if self.recognition_objective in {"infonce", "batch_local_infonce"}
+                    if embedding_objective
                     else None
                 ),
                 mlp_num_layers=(
                     6
-                    if self.recognition_objective in {"infonce", "batch_local_infonce"}
+                    if embedding_objective
                     else 2
                 ),
-                normalize_output=bool(self.recognition_objective in {"infonce", "batch_local_infonce"}),
+                normalize_output=bool(embedding_objective),
                 dropout=dropout,
                 use_subject_context=use_subject_context,
             )
@@ -174,18 +179,28 @@ class QwenGazeIntegratedModel(nn.Module):
         target_label_emb: torch.Tensor | None = None,
         target_label_valid: torch.Tensor | None = None,
         use_softargmax: bool | None = None,
+        compute_point_soft: bool = True,
+        compute_point_hard: bool = True,
         backbone_kwargs: dict[str, Any] | None = None,
         return_hidden: bool = False,
     ) -> dict[str, Any]:
-        scene_image, head_image = self.input_resizer(scene_image, head_image)
+        kwargs = dict(backbone_kwargs or {})
+        use_preprocessed_joint = ("joint_inputs" in kwargs) and (kwargs.get("joint_inputs") is not None)
+        if not use_preprocessed_joint:
+            scene_image, head_image = self.input_resizer(scene_image, head_image)
         h_s, h_h, h_t = self._encode_backbone(
             scene_image=scene_image,
             head_image=head_image,
             text_inputs=text_inputs,
-            backbone_kwargs=backbone_kwargs,
+            backbone_kwargs=kwargs,
         )
 
-        summary_out = self.summary(head_hidden=h_h, text_hidden=h_t)
+        text_token_mask = getattr(self.backbone, "last_text_token_mask", None)
+        summary_out = self.summary(
+            head_hidden=h_h,
+            text_hidden=h_t,
+            text_mask=text_token_mask,
+        )
         cond_out = self.conditioner(
             scene_hidden=h_s,
             subject_token=summary_out["z"],
@@ -197,6 +212,8 @@ class QwenGazeIntegratedModel(nn.Module):
             scene_hidden=cond_out["scene_hidden"],
             scene_grid_size=scene_grid_hw,
             use_softargmax=use_softargmax,
+            compute_point_soft=compute_point_soft,
+            compute_point_hard=compute_point_hard,
         )
 
         out: dict[str, Any] = {
@@ -223,7 +240,7 @@ class QwenGazeIntegratedModel(nn.Module):
             logits = cls_out.get("logits", None)
             pred_label = cls_out.get("pred", None)
             if (
-                self.recognition_objective in {"infonce", "batch_local_infonce"}
+                is_embedding_recognition_objective(self.recognition_objective)
                 and self.vocab_emb.numel() > 0
                 and pred_emb.dim() == 2
                 and self.vocab_emb.shape[1] == pred_emb.shape[1]

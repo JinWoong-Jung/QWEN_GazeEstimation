@@ -166,12 +166,18 @@ def build_arg_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     p.add_argument("--head_tokens", type=int, default=int(_default(defaults, "head_tokens", 64)))
     p.add_argument("--text_tokens", type=int, default=int(_default(defaults, "text_tokens", 64)))
     p.add_argument("--max_text_length", type=int, default=int(_default(defaults, "max_text_length", 128)))
+    p.add_argument("--backbone_hidden_mode", type=str, default=str(_default(defaults, "backbone_hidden_mode", "last")))
+    p.add_argument("--backbone_hidden_last_n", type=int, default=int(_default(defaults, "backbone_hidden_last_n", 4)))
     p.add_argument("--conditioning_mode", type=str, default=str(_default(defaults, "conditioning_mode", "film")))
     p.add_argument("--pool_mode", type=str, default=str(_default(defaults, "pool_mode", "mean")))
     p.add_argument("--num_conditioning_heads", type=int, default=int(_default(defaults, "num_conditioning_heads", 8)))
     p.add_argument("--num_conditioning_layers", type=int, default=int(_default(defaults, "num_conditioning_layers", 1)))
     p.add_argument("--dropout", type=float, default=float(_default(defaults, "dropout", 0.1)))
-    p.add_argument("--recognition_objective", type=str, default=str(_default(defaults, "recognition_objective", "infonce")))
+    p.add_argument(
+        "--recognition_objective",
+        type=str,
+        default=str(_default(defaults, "recognition_objective", "full_vocab_infonce")),
+    )
     p.add_argument("--label_emb_dim", type=int, default=int(_default(defaults, "label_emb_dim", 512)))
     p.add_argument("--logit_scale_init", type=float, default=float(_default(defaults, "logit_scale_init", 0.07)))
     p.add_argument("--label_embed_dir", type=str, default=str(_default(defaults, "label_embed_dir", "data/gazefollow/label-embeds")))
@@ -314,6 +320,8 @@ def main() -> None:
         text_tokens=args.text_tokens,
         max_text_length=args.max_text_length,
         head_text=args.head_text,
+        hidden_state_mode=args.backbone_hidden_mode,
+        hidden_state_last_n=args.backbone_hidden_last_n,
     )
     model = QwenGazeIntegratedModel(
         backbone=backbone,
@@ -385,6 +393,8 @@ def main() -> None:
                     head_image=[head],
                     text_inputs=[prompt],
                     use_softargmax=False,
+                    compute_point_soft=False,
+                    compute_point_hard=True,
                 )
 
             heatmap = out["heatmap"][0, 0].detach().cpu()

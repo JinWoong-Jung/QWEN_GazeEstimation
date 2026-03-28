@@ -49,3 +49,53 @@ def save_checkpoint(
         ckpt_dir / "trainer_state.pt",
     )
 
+
+def load_checkpoint_for_eval(
+    ckpt_dir: Path,
+    model: Any,
+    device: torch.device,
+) -> bool:
+    loaded_any = False
+    if not ckpt_dir.exists():
+        return False
+
+    adapter_dir = ckpt_dir / "lora_adapter"
+    qwen_model = model.backbone.qwen
+    if adapter_dir.exists() and hasattr(qwen_model, "load_adapter"):
+        adapter_name = "best_eval"
+        try:
+            qwen_model.load_adapter(
+                str(adapter_dir),
+                adapter_name=adapter_name,
+                is_trainable=False,
+            )
+        except Exception:
+            # Adapter may already exist (e.g., repeated reload in same process); try to switch to it.
+            pass
+        try:
+            if hasattr(qwen_model, "set_adapter"):
+                qwen_model.set_adapter(adapter_name)
+            loaded_any = True
+        except Exception:
+            pass
+
+    heads_path = ckpt_dir / "heads.pt"
+    if heads_path.exists():
+        aux_state = torch.load(heads_path, map_location=device)
+        if isinstance(aux_state, dict):
+            if "summary" in aux_state:
+                model.summary.load_state_dict(aux_state["summary"], strict=True)
+                loaded_any = True
+            if "conditioner" in aux_state:
+                model.conditioner.load_state_dict(aux_state["conditioner"], strict=True)
+                loaded_any = True
+            if "localizer" in aux_state:
+                model.localizer.load_state_dict(aux_state["localizer"], strict=True)
+                loaded_any = True
+            if model.classifier is not None and aux_state.get("classifier") is not None:
+                try:
+                    model.classifier.load_state_dict(aux_state["classifier"], strict=True)
+                except Exception:
+                    model.classifier.load_state_dict(aux_state["classifier"], strict=False)
+                loaded_any = True
+    return loaded_any

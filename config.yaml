@@ -27,6 +27,7 @@ train:
   epochs: 3
   num_workers: 4
   show_tqdm: true
+  train_log_soft_point_dist: false
   run_test: true
   lr: 1.0e-4
   weight_decay: 0.01
@@ -49,7 +50,7 @@ image:
 
 model:
   enable_recognition: true
-  recognition_objective: "infonce"
+  recognition_objective: "full_vocab_infonce"
   label_emb_dim: 512
   logit_scale_init: 0.07
   label_embed_dir: "data/gazefollow/label-embeds"
@@ -57,14 +58,16 @@ model:
   head_tokens: 64
   text_tokens: 64
   max_text_length: 128
-  conditioning_mode: "film"
+  backbone_hidden_mode: "last4_mean"
+  backbone_hidden_last_n: 4
+  conditioning_mode: "cross_attn"
   pool_mode: "mean"
   num_conditioning_heads: 8
   num_conditioning_layers: 1
   dropout: 0.1
 
 loss:
-  lambda_cls: 0.01
+  lambda_cls: 0.1
   label_smoothing: 0.0
   cls_ignore_index: -100
   acc_dist_threshold: 0.15
@@ -72,16 +75,8 @@ loss:
 prompt:
   prompt_template: ""
   prompt_text: |
-    Given the highlighted subject, estimate where the subject is looking(normalized gaze point).
-    Head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]
-    Important rules:
-    1) Predict where the person is looking AT in the scene (target object/location),
-    NOT the eye position, face center, or head center.
-    2) Coordinates must be in FULL SCENE coordinates, not head-crop coordinates.
-    3) Prefer a point on the likely attended object along the gaze direction.
-    4) Avoid points inside the head bbox unless no other plausible target is visible.
-    
-    Output format (one line only): x y
+    Given the highlighted subject, estimate where the subject is looking and identify the gazed object class.
+    Subject head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]
   head_text: "Target subject head crop."
 
 lora:
@@ -99,6 +94,6 @@ wandb:
   project: "gaze_mllm"
   entity: "semgaze"
   run_name: "baseline"
-  wandb_log_every_steps: 1
+  wandb_log_every_steps: 20
   tags: []
   notes: ""

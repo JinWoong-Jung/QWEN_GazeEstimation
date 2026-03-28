@@ -70,7 +70,7 @@ class GazeRecognitionClassifier(nn.Module):
             else None
         )
 
-    def _weighted_pool(self, scene_hidden: torch.Tensor, patch_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _weighted_pool(self, scene_hidden: torch.Tensor, patch_logits: torch.Tensor) -> torch.Tensor:
         if scene_hidden.dim() != 3:
             raise ValueError(f"scene_hidden must be [B, N, D], got shape={tuple(scene_hidden.shape)}")
         if patch_logits.dim() != 2:
@@ -80,7 +80,7 @@ class GazeRecognitionClassifier(nn.Module):
 
         weights = torch.softmax(patch_logits, dim=-1)  # [B, N]
         f_g = torch.sum(scene_hidden * weights.unsqueeze(-1), dim=1)  # [B, D]
-        return f_g, weights
+        return f_g
 
     def forward(
         self,
@@ -89,7 +89,7 @@ class GazeRecognitionClassifier(nn.Module):
         head_token: torch.Tensor | None = None,
         text_token: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        f_g, weights = self._weighted_pool(scene_hidden, patch_logits)
+        f_g = self._weighted_pool(scene_hidden, patch_logits)
 
         if self.use_subject_context:
             if head_token is None or text_token is None:
@@ -104,7 +104,6 @@ class GazeRecognitionClassifier(nn.Module):
         if self.normalize_output:
             emb = F.normalize(emb, p=2, dim=-1)
         out: dict[str, torch.Tensor] = {
-            "patch_weights": weights,
             "f_g": f_g,
             "f_r": emb,
         }

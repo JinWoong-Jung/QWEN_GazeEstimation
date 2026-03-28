@@ -22,7 +22,7 @@ from transformers import (
 
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
-from .utils.checkpoint import save_checkpoint
+from .utils.checkpoint import load_checkpoint_for_eval, save_checkpoint
 from .utils.config_parser import build_parser, load_yaml_config
 from .utils.data_utils import (
     build_vocab_embedding_matrix,
@@ -36,8 +36,6 @@ from .utils.data_utils import (
 from .datasets import (
     GazeDataset,
     GazeTestDataset,
-    collate_batch,
-    collate_test_batch,
 )
 from .utils.eval_utils import (
     print_test_metrics_table,
@@ -45,6 +43,12 @@ from .utils.eval_utils import (
     run_test_metrics,
 )
 from .model import QwenGazeIntegratedModel
+from .recognition_objectives import (
+    is_batch_local_infonce_objective,
+    is_embedding_recognition_objective,
+    normalize_recognition_objective,
+)
+from .utils.processor_collate import QwenTestCollator, QwenTrainCollator
 from .utils.wandb_utils import finish_wandb, init_wandb
 
 
@@ -74,6 +78,8 @@ class QwenBackboneAdapter(nn.Module):
         text_tokens: int,
         max_text_length: int = 128,
         head_text: str = "Target subject head crop.",
+        hidden_state_mode: str = "last",
+        hidden_state_last_n: int = 4,
     ) -> None:
         super().__init__()
         self.qwen = qwen_model
@@ -83,11 +89,31 @@ class QwenBackboneAdapter(nn.Module):
         self.text_tokens = int(text_tokens)
         self.max_text_length = int(max_text_length)
         self.head_text = str(head_text)
+        self.hidden_state_mode = str(hidden_state_mode).strip().lower()
+        self.hidden_state_last_n = max(1, int(hidden_state_last_n))
         self.image_token_id = self._infer_image_token_id()
         self.spatial_merge_size = self._infer_spatial_merge_size()
         self.last_scene_grid_hw: tuple[int, int] | None = None
         self.last_head_grid_hw: tuple[int, int] | None = None
+        self.last_text_token_mask: torch.Tensor | None = None
         self._scene_hint_warned = False
+        self._joint_encode_warned = False
+
+    def _select_hidden(self, out: Any) -> torch.Tensor:
+        hidden_states = getattr(out, "hidden_states", None)
+        if hidden_states is None or len(hidden_states) == 0:
+            raise RuntimeError("Qwen backbone did not return hidden_states.")
+        mode = self.hidden_state_mode
+        if mode in {"last4_mean", "last_4_mean"}:
+            n = 4
+        elif mode in {"lastn_mean", "last_n_mean", "mean_last_n"}:
+            n = self.hidden_state_last_n
+        else:
+            n = 1
+        n = max(1, min(int(n), len(hidden_states)))
+        if n == 1:
+            return hidden_states[-1]
+        return torch.stack(hidden_states[-n:], dim=0).mean(dim=0)
 
     def _infer_image_token_id(self) -> int:
         cands: list[int] = []
@@ -235,22 +261,15 @@ class QwenBackboneAdapter(nn.Module):
     def _encode(
         self,
         texts: list[str],
-        images: list[Any] | None,
-        *,
-        vision_only: bool = False,
+        images: list[Any],
     ) -> tuple[torch.Tensor, tuple[int, int] | None]:
-        use_image = images is not None
-        proc_texts = [self._build_chat_text(t, with_image=use_image) for t in texts]
+        proc_texts = [self._build_chat_text(t, with_image=True) for t in texts]
         proc_kwargs: dict[str, Any] = {
             "text": proc_texts,
+            "images": images,
             "return_tensors": "pt",
             "padding": True,
         }
-        if use_image:
-            proc_kwargs["images"] = images
-        else:
-            proc_kwargs["truncation"] = True
-            proc_kwargs["max_length"] = self.max_text_length
         inputs = self.processor(**proc_kwargs)
         inputs = self._move_to_device(inputs)
         out = self.qwen(
@@ -259,11 +278,7 @@ class QwenBackboneAdapter(nn.Module):
             use_cache=False,
             return_dict=True,
         )
-        if out.hidden_states is None or len(out.hidden_states) == 0:
-            raise RuntimeError("Qwen backbone did not return hidden_states.")
-        hidden = out.hidden_states[-1]  # [B, L, D]
-        if not vision_only:
-            return hidden, None
+        hidden = self._select_hidden(out)  # [B, L, D]
         if "input_ids" not in inputs:
             raise RuntimeError("input_ids are required to extract vision tokens.")
         input_ids = inputs["input_ids"]
@@ -291,6 +306,203 @@ class QwenBackboneAdapter(nn.Module):
         )
         return torch.stack(vis_tokens, dim=0), grid_hw
 
+    def _encode_text(
+        self,
+        texts: list[str],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        proc_texts = [self._build_chat_text(t, with_image=False) for t in texts]
+        inputs = self.processor(
+            text=proc_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_text_length,
+        )
+        inputs = self._move_to_device(inputs)
+        out = self.qwen(
+            **inputs,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = self._select_hidden(out)  # [B, L, D]
+        attn_mask = inputs.get("attention_mask", None)
+        if torch.is_tensor(attn_mask):
+            text_mask = attn_mask.to(device=hidden.device, dtype=torch.float32)
+        else:
+            text_mask = torch.ones(
+                hidden.shape[:2],
+                device=hidden.device,
+                dtype=torch.float32,
+            )
+        return hidden, text_mask
+
+    def _encode_scene_head_joint(
+        self,
+        texts: list[str],
+        scene_images: list[Any],
+        head_images: list[Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, int] | None, tuple[int, int] | None]:
+        bsz = len(texts)
+        if not (len(scene_images) == len(head_images) == bsz):
+            raise ValueError("scene/head/text batch sizes must match.")
+
+        head_texts = [self.head_text for _ in texts]
+        mixed_texts = list(texts) + head_texts
+        mixed_images = list(scene_images) + list(head_images)
+        proc_texts = [self._build_chat_text(t, with_image=True) for t in mixed_texts]
+        inputs = self.processor(
+            text=proc_texts,
+            images=mixed_images,
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs = self._move_to_device(inputs)
+        out = self.qwen(
+            **inputs,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = self._select_hidden(out)  # [2B, L, D]
+        if hidden.shape[0] != (2 * bsz):
+            raise RuntimeError(f"joint encode batch mismatch: hidden_batch={hidden.shape[0]} expected={2 * bsz}")
+
+        input_ids = inputs.get("input_ids", None)
+        if input_ids is None:
+            raise RuntimeError("input_ids are required to extract vision/text tokens.")
+        if input_ids.shape[:2] != hidden.shape[:2]:
+            raise RuntimeError(
+                f"input_ids/hidden shape mismatch: ids={tuple(input_ids.shape)} hidden={tuple(hidden.shape)}"
+            )
+        img_mask = input_ids.eq(int(self.image_token_id))
+        attn_mask = inputs.get("attention_mask", None)
+
+        vis_tokens: list[torch.Tensor] = []
+        vis_lengths: list[int] = []
+        for i in range(hidden.shape[0]):
+            tb = hidden[i][img_mask[i]]
+            vis_tokens.append(tb)
+            vis_lengths.append(int(tb.shape[0]))
+
+        scene_vis = vis_tokens[:bsz]
+        head_vis = vis_tokens[bsz:]
+        scene_lengths = vis_lengths[:bsz]
+        head_lengths = vis_lengths[bsz:]
+        if len(scene_lengths) == 0 or min(scene_lengths) <= 0:
+            raise RuntimeError("No scene vision tokens extracted from joint scene/head pass.")
+        if len(head_lengths) == 0 or min(head_lengths) <= 0:
+            raise RuntimeError("No head vision tokens extracted from joint scene/head pass.")
+        if min(scene_lengths) != max(scene_lengths):
+            raise RuntimeError(f"Scene vision token counts differ across batch: {scene_lengths}")
+
+        h_s = torch.stack(scene_vis, dim=0)
+
+        head_target = int(self.head_tokens) if int(self.head_tokens) > 0 else int(max(head_lengths))
+        h_h_list: list[torch.Tensor] = []
+        for hv in head_vis:
+            h_h_list.append(self._fix_tokens(hv.unsqueeze(0), head_target).squeeze(0))
+        h_h = torch.stack(h_h_list, dim=0)
+
+        text_target = int(self.text_tokens) if int(self.text_tokens) > 0 else int(self.max_text_length)
+        h_t_list: list[torch.Tensor] = []
+        for i in range(bsz):
+            txt_mask = ~img_mask[i]
+            if attn_mask is not None:
+                txt_mask = txt_mask & attn_mask[i].bool()
+            t_i = hidden[i][txt_mask]
+            if t_i.shape[0] <= 0:
+                t_i = hidden[i][:1]
+            h_t_list.append(self._fix_tokens(t_i.unsqueeze(0), text_target).squeeze(0))
+        h_t = torch.stack(h_t_list, dim=0)
+
+        image_grid_thw = inputs.get("image_grid_thw", None)
+        scene_grid_input = None
+        head_grid_input = None
+        if torch.is_tensor(image_grid_thw) and image_grid_thw.dim() == 2 and image_grid_thw.shape[0] >= (2 * bsz):
+            scene_grid_input = image_grid_thw[:bsz]
+            head_grid_input = image_grid_thw[bsz : 2 * bsz]
+
+        scene_grid_hw = self._infer_grid_hw_from_inputs(scene_grid_input, scene_lengths)
+        head_grid_hw = self._infer_grid_hw_from_inputs(head_grid_input, head_lengths)
+        return h_s, h_h, h_t, scene_grid_hw, head_grid_hw
+
+    def _encode_scene_head_from_joint_inputs(
+        self,
+        joint_inputs: dict[str, Any],
+        joint_bsz: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, int] | None, tuple[int, int] | None]:
+        inputs = self._move_to_device(dict(joint_inputs))
+        out = self.qwen(
+            **inputs,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = self._select_hidden(out)  # [2B, L, D]
+        bsz = int(joint_bsz)
+        if hidden.shape[0] != (2 * bsz):
+            raise RuntimeError(f"joint encode batch mismatch: hidden_batch={hidden.shape[0]} expected={2 * bsz}")
+
+        input_ids = inputs.get("input_ids", None)
+        if input_ids is None:
+            raise RuntimeError("input_ids are required to extract vision/text tokens.")
+        if input_ids.shape[:2] != hidden.shape[:2]:
+            raise RuntimeError(
+                f"input_ids/hidden shape mismatch: ids={tuple(input_ids.shape)} hidden={tuple(hidden.shape)}"
+            )
+        img_mask = input_ids.eq(int(self.image_token_id))
+        attn_mask = inputs.get("attention_mask", None)
+
+        vis_tokens: list[torch.Tensor] = []
+        vis_lengths: list[int] = []
+        for i in range(hidden.shape[0]):
+            tb = hidden[i][img_mask[i]]
+            vis_tokens.append(tb)
+            vis_lengths.append(int(tb.shape[0]))
+
+        scene_vis = vis_tokens[:bsz]
+        head_vis = vis_tokens[bsz:]
+        scene_lengths = vis_lengths[:bsz]
+        head_lengths = vis_lengths[bsz:]
+        if len(scene_lengths) == 0 or min(scene_lengths) <= 0:
+            raise RuntimeError("No scene vision tokens extracted from joint scene/head pass.")
+        if len(head_lengths) == 0 or min(head_lengths) <= 0:
+            raise RuntimeError("No head vision tokens extracted from joint scene/head pass.")
+        if min(scene_lengths) != max(scene_lengths):
+            raise RuntimeError(f"Scene vision token counts differ across batch: {scene_lengths}")
+
+        h_s = torch.stack(scene_vis, dim=0)
+
+        head_target = int(self.head_tokens) if int(self.head_tokens) > 0 else int(max(head_lengths))
+        h_h_list: list[torch.Tensor] = []
+        for hv in head_vis:
+            h_h_list.append(self._fix_tokens(hv.unsqueeze(0), head_target).squeeze(0))
+        h_h = torch.stack(h_h_list, dim=0)
+
+        text_target = int(self.text_tokens) if int(self.text_tokens) > 0 else int(self.max_text_length)
+        h_t_list: list[torch.Tensor] = []
+        for i in range(bsz):
+            txt_mask = ~img_mask[i]
+            if attn_mask is not None:
+                txt_mask = txt_mask & attn_mask[i].bool()
+            t_i = hidden[i][txt_mask]
+            if t_i.shape[0] <= 0:
+                t_i = hidden[i][:1]
+            h_t_list.append(self._fix_tokens(t_i.unsqueeze(0), text_target).squeeze(0))
+        h_t = torch.stack(h_t_list, dim=0)
+
+        image_grid_thw = inputs.get("image_grid_thw", None)
+        scene_grid_input = None
+        head_grid_input = None
+        if torch.is_tensor(image_grid_thw) and image_grid_thw.dim() == 2 and image_grid_thw.shape[0] >= (2 * bsz):
+            scene_grid_input = image_grid_thw[:bsz]
+            head_grid_input = image_grid_thw[bsz : 2 * bsz]
+
+        scene_grid_hw = self._infer_grid_hw_from_inputs(scene_grid_input, scene_lengths)
+        head_grid_hw = self._infer_grid_hw_from_inputs(head_grid_input, head_lengths)
+        return h_s, h_h, h_t, scene_grid_hw, head_grid_hw
+
     @staticmethod
     def _fix_tokens(hidden: torch.Tensor, target_tokens: int) -> torch.Tensor:
         if target_tokens <= 0 or hidden.shape[1] == target_tokens:
@@ -299,22 +511,100 @@ class QwenBackboneAdapter(nn.Module):
         x = F.adaptive_avg_pool1d(x, output_size=target_tokens)
         return x.transpose(1, 2)
 
+    @staticmethod
+    def _fix_token_mask(mask: torch.Tensor, target_tokens: int) -> torch.Tensor:
+        if mask.dim() != 2:
+            raise ValueError(f"mask must be [B, N], got shape={tuple(mask.shape)}")
+        if target_tokens <= 0 or mask.shape[1] == target_tokens:
+            return mask
+        x = mask.to(dtype=torch.float32).unsqueeze(1)
+        x = F.adaptive_avg_pool1d(x, output_size=target_tokens).squeeze(1)
+        return x.clamp(min=0.0, max=1.0)
+
     def forward(
         self,
         scene_image: Any,
         head_image: Any,
         text_inputs: Any,
+        *,
+        joint_inputs: dict[str, Any] | None = None,
+        joint_bsz: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        texts = [str(t) for t in text_inputs]
-        scene_images = list(scene_image)
-        head_images = list(head_image)
-        if not (len(scene_images) == len(head_images) == len(texts)):
-            raise ValueError("scene/head/text batch sizes must match.")
+        texts = [str(t) for t in (text_inputs or [])]
+        scene_images = list(scene_image) if scene_image is not None else []
+        head_images = list(head_image) if head_image is not None else []
+        text_mask: torch.Tensor | None = None
+        self.last_text_token_mask = None
 
-        head_texts = [self.head_text for _ in texts]
-        h_s, scene_grid_hw = self._encode(texts=texts, images=scene_images, vision_only=True)
-        h_h, head_grid_hw = self._encode(texts=head_texts, images=head_images, vision_only=True)
-        h_t, _ = self._encode(texts=texts, images=None)
+        used_joint_inputs = bool(joint_inputs is not None)
+        if used_joint_inputs:
+            inferred_bsz = int(joint_bsz) if (joint_bsz is not None) else 0
+            if inferred_bsz <= 0:
+                ids = (joint_inputs or {}).get("input_ids", None)
+                if torch.is_tensor(ids) and ids.dim() >= 1:
+                    inferred_bsz = int(ids.shape[0] // 2)
+                elif len(texts) > 0:
+                    inferred_bsz = len(texts)
+            if inferred_bsz <= 0:
+                raise ValueError("joint_bsz could not be inferred for preprocessed joint inputs.")
+            try:
+                h_s, h_h, h_t, scene_grid_hw, head_grid_hw = self._encode_scene_head_from_joint_inputs(
+                    joint_inputs=joint_inputs or {},
+                    joint_bsz=int(inferred_bsz),
+                )
+                text_mask = torch.ones(
+                    h_t.shape[:2],
+                    device=h_t.device,
+                    dtype=torch.float32,
+                )
+            except Exception as e:
+                if not self._joint_encode_warned:
+                    print(
+                        "[WARN] preprocessed joint encode failed; "
+                        "falling back to runtime joint encode. "
+                        f"reason={e}"
+                    )
+                    self._joint_encode_warned = True
+                if not (len(scene_images) == len(head_images) == len(texts) and len(texts) > 0):
+                    raise RuntimeError(
+                        "joint preprocessed path failed and raw scene/head/text inputs are unavailable."
+                    ) from e
+                h_s, h_h, h_t, scene_grid_hw, head_grid_hw = self._encode_scene_head_joint(
+                    texts=texts,
+                    scene_images=scene_images,
+                    head_images=head_images,
+                )
+                text_mask = torch.ones(
+                    h_t.shape[:2],
+                    device=h_t.device,
+                    dtype=torch.float32,
+                )
+        else:
+            if not (len(scene_images) == len(head_images) == len(texts)):
+                raise ValueError("scene/head/text batch sizes must match.")
+            try:
+                h_s, h_h, h_t, scene_grid_hw, head_grid_hw = self._encode_scene_head_joint(
+                    texts=texts,
+                    scene_images=scene_images,
+                    head_images=head_images,
+                )
+                text_mask = torch.ones(
+                    h_t.shape[:2],
+                    device=h_t.device,
+                    dtype=torch.float32,
+                )
+            except Exception as e:
+                if not self._joint_encode_warned:
+                    print(
+                        "[WARN] joint scene/head encode failed; "
+                        "falling back to legacy 3-pass encode. "
+                        f"reason={e}"
+                    )
+                    self._joint_encode_warned = True
+                head_texts = [self.head_text for _ in texts]
+                h_s, scene_grid_hw = self._encode(texts=texts, images=scene_images)
+                h_h, head_grid_hw = self._encode(texts=head_texts, images=head_images)
+                h_t, text_mask = self._encode_text(texts=texts)
 
         if self.scene_tokens > 0 and h_s.shape[1] != self.scene_tokens and (not self._scene_hint_warned):
             print(
@@ -327,11 +617,19 @@ class QwenBackboneAdapter(nn.Module):
         if self.head_tokens > 0:
             h_h = self._fix_tokens(h_h, self.head_tokens)
         h_t = self._fix_tokens(h_t, self.text_tokens)
+        if text_mask is None:
+            text_mask = torch.ones(
+                h_t.shape[:2],
+                device=h_t.device,
+                dtype=torch.float32,
+            )
+        text_mask = self._fix_token_mask(text_mask, int(h_t.shape[1]))
 
         if scene_grid_hw is None:
             scene_grid_hw = self._fallback_grid_hw(int(h_s.shape[1]))
         self.last_scene_grid_hw = scene_grid_hw
         self.last_head_grid_hw = head_grid_hw
+        self.last_text_token_mask = text_mask
         return h_s, h_h, h_t
 
 
@@ -462,9 +760,10 @@ def main() -> None:
     label_embed_dir = resolve_path(args.label_embed_dir)
 
     recognition_enabled = bool(args.enable_recognition)
-    recognition_objective = str(args.recognition_objective).strip().lower()
-    use_infonce = recognition_enabled and (recognition_objective in {"infonce", "batch_local_infonce"})
-    if use_infonce and (not label_embed_dir.exists()):
+    recognition_objective = normalize_recognition_objective(args.recognition_objective)
+    use_embedding_recognition = recognition_enabled and is_embedding_recognition_objective(recognition_objective)
+    use_batch_local_infonce = recognition_enabled and is_batch_local_infonce_objective(recognition_objective)
+    if use_embedding_recognition and (not label_embed_dir.exists()):
         print(f"[WARN] label_embed_dir does not exist: {label_embed_dir}")
     if recognition_enabled:
         vocab2id, vocab2id_lower = load_vocab2id(vocab2id_path)
@@ -503,7 +802,7 @@ def main() -> None:
             vocab2id_lower=vocab2id_lower,
         )
         num_classes = infer_num_classes(train_label_map, val_label_map, vocab2id_path)
-        if use_infonce and num_classes <= 0:
+        if use_embedding_recognition and num_classes <= 0:
             print("[WARN] num_classes <= 0. recognition logits/metrics may be unavailable.")
         print(f"[INFO] inferred num_classes={num_classes}")
         print(
@@ -522,10 +821,10 @@ def main() -> None:
             f"missing_text={test_label_stats['missing_text']} unknown_text={test_label_stats['unknown_text']} "
             f"conflicts={test_label_stats['conflicts']}"
         )
-        if use_infonce:
+        if use_batch_local_infonce:
             print(
-                "[INFO] recognition objective: InfoNCE (gaze_label_emb). "
-                "train/val CE label_id coverage is informational only."
+                "[INFO] recognition objective: batch_local_infonce. "
+                "Using batch-local negatives from per-sample label embeddings."
             )
             print(
                 "[INFO] train label text coverage: "
@@ -536,6 +835,11 @@ def main() -> None:
                 "[INFO] val label text coverage: "
                 f"rows={val_label_text_stats['rows']} with_text={val_label_text_stats['with_text']} "
                 f"missing_text={val_label_text_stats['missing_text']}"
+            )
+        elif use_embedding_recognition:
+            print(
+                f"[INFO] recognition objective: {recognition_objective}. "
+                "Using full-vocab prototype logits for CE (aligned with test-time prediction space)."
             )
         else:
             print("[INFO] recognition objective: CE (label_id)")
@@ -578,7 +882,7 @@ def main() -> None:
     train_text_valid = sum(1 for r in train_records if str(r.label_text).strip())
     val_text_valid = sum(1 for r in val_records if str(r.label_text).strip())
     if recognition_enabled:
-        if use_infonce:
+        if use_batch_local_infonce:
             print(
                 "[INFO] cls label coverage (text/emb): "
                 f"train={train_text_valid}/{len(train_records)} ({(train_text_valid / max(1, len(train_records))):.3f}) "
@@ -616,22 +920,6 @@ def main() -> None:
         label_emb_dim=int(args.label_emb_dim),
         normalize_label_emb=bool(args.normalize_label_emb),
     )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_batch,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_batch,
-    )
 
     load_dtype = parse_dtype(args.dtype)
     if device.type != "cuda" and load_dtype in {torch.bfloat16, torch.float16}:
@@ -648,6 +936,25 @@ def main() -> None:
     if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
         processor_path = checkpoint_dir / "processor"
     processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
+    train_collator = QwenTrainCollator(processor=processor, head_text=args.head_text)
+    val_collator = QwenTrainCollator(processor=processor, head_text=args.head_text)
+    test_collator = QwenTestCollator(processor=processor, head_text=args.head_text)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=train_collator,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=val_collator,
+    )
     base_qwen = AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
 
     if args.gradient_checkpointing and hasattr(base_qwen, "gradient_checkpointing_enable"):
@@ -694,6 +1001,8 @@ def main() -> None:
         text_tokens=args.text_tokens,
         max_text_length=args.max_text_length,
         head_text=args.head_text,
+        hidden_state_mode=args.backbone_hidden_mode,
+        hidden_state_last_n=args.backbone_hidden_last_n,
     )
     model = QwenGazeIntegratedModel(
         backbone=backbone,
@@ -756,7 +1065,9 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    updates_per_epoch = math.ceil(len(train_loader) / max(args.grad_accum_steps, 1))
+    accum_steps = max(int(args.grad_accum_steps), 1)
+    num_train_batches = len(train_loader)
+    updates_per_epoch = math.ceil(num_train_batches / accum_steps)
     total_updates = max(1, updates_per_epoch * args.epochs)
     warmup_steps = int(total_updates * args.warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(
@@ -770,12 +1081,23 @@ def main() -> None:
     global_step = 0
     start_time = time.time()
     effective_epochs = 0 if bool(args.eval_only) else int(args.epochs)
+    use_train_soft_point_dist = bool(getattr(args, "train_log_soft_point_dist", False))
+    if use_train_soft_point_dist:
+        print("[INFO] train soft point distance logging: enabled (computes softargmax point).")
+    else:
+        print("[INFO] train soft point distance logging: disabled (hard point only).")
     if bool(args.eval_only):
         print("[INFO] eval_only=True; skipping training loop.")
 
     for epoch in range(1, effective_epochs + 1):
         model.train()
-        sums: dict[str, float] = {"loss": 0.0, "l_hm": 0.0, "l_cls": 0.0, "dist": 0.0}
+        sums: dict[str, float] = {
+            "loss": 0.0,
+            "l_hm": 0.0,
+            "l_cls": 0.0,
+            "dist": 0.0,
+            "dist_hard": 0.0,
+        }
         cls_correct = 0
         cls_total = 0
         step_count = 0
@@ -789,6 +1111,7 @@ def main() -> None:
             dynamic_ncols=True,
             disable=not args.show_tqdm,
         )
+        remainder_steps = num_train_batches % accum_steps
         for step, batch in enumerate(train_iter, start=1):
             target_heatmap = batch["target_heatmap"].to(device)
             target_label = batch["target_label"].to(device)
@@ -798,6 +1121,18 @@ def main() -> None:
             use_cls_id = bool(torch.any(target_label >= 0).item())
             use_cls_emb = bool(torch.any(target_label_valid > 0).item())
             batch_cls_acc: float | None = None
+            backbone_kwargs = None
+            if "joint_inputs" in batch:
+                backbone_kwargs = {
+                    "joint_inputs": batch["joint_inputs"],
+                    "joint_bsz": int(batch.get("joint_bsz", len(batch.get("text_inputs", [])))),
+                }
+            is_last_batch = (step == num_train_batches)
+            current_accum_steps = (
+                int(remainder_steps)
+                if (is_last_batch and int(remainder_steps) > 0)
+                else int(accum_steps)
+            )
 
             with torch.autocast(
                 device_type=device.type,
@@ -805,22 +1140,30 @@ def main() -> None:
                 enabled=(device.type == "cuda"),
             ):
                 out = model(
-                    scene_image=batch["scene_images"],
-                    head_image=batch["head_images"],
-                    text_inputs=batch["text_inputs"],
+                    scene_image=batch.get("scene_images", None),
+                    head_image=batch.get("head_images", None),
+                    text_inputs=batch.get("text_inputs", None),
                     target_heatmap=target_heatmap,
                     target_label=target_label if use_cls_id else None,
                     target_label_emb=target_label_emb if use_cls_emb else None,
                     target_label_valid=target_label_valid if use_cls_emb else None,
-                    use_softargmax=True,
+                    use_softargmax=use_train_soft_point_dist,
+                    compute_point_soft=use_train_soft_point_dist,
+                    compute_point_hard=True,
+                    backbone_kwargs=backbone_kwargs,
                 )
-                loss = out["loss"] / max(args.grad_accum_steps, 1)
+                loss = out["loss"] / float(max(current_accum_steps, 1))
 
             loss.backward()
             loss_dict = out.get("loss_dict", {})
-            pred_point = out["point"].detach().to(dtype=torch.float32)
+            pred_point_hard = out["point_hard"].detach().to(dtype=torch.float32)
             tgt_point = target_point.detach().to(dtype=torch.float32)
-            batch_dist = torch.linalg.norm(pred_point - tgt_point, dim=-1).mean()
+            batch_dist_hard = torch.linalg.norm(pred_point_hard - tgt_point, dim=-1).mean()
+            if use_train_soft_point_dist:
+                pred_point = out["point"].detach().to(dtype=torch.float32)
+                batch_dist = torch.linalg.norm(pred_point - tgt_point, dim=-1).mean()
+            else:
+                batch_dist = batch_dist_hard
             if "logits" in out:
                 valid = target_label >= 0
                 if torch.any(valid):
@@ -830,7 +1173,8 @@ def main() -> None:
                     cls_correct += int((pred == gt).sum().item())
                     cls_total += int(valid.sum().item())
 
-            if step % max(args.grad_accum_steps, 1) == 0:
+            should_step = ((step % accum_steps) == 0) or is_last_batch
+            if should_step:
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.max_grad_norm)
                 optimizer.step()
                 if hasattr(model, "logit_scale"):
@@ -854,6 +1198,7 @@ def main() -> None:
                         "train/hm": float(loss_dict.get("l_hm", torch.tensor(0.0)).detach().item()),
                         "train/cls": float(loss_dict.get("l_cls", torch.tensor(0.0)).detach().item()),
                         "train/dist": float(batch_dist.item()),
+                        "train/dist_hard": float(batch_dist_hard.item()),
                         "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                         "train/grad_norm": grad_norm_value,
                         "train/global_step": float(global_step),
@@ -868,13 +1213,15 @@ def main() -> None:
             if "l_cls" in loss_dict:
                 sums["l_cls"] += float(loss_dict["l_cls"].detach().item())
             sums["dist"] += float(batch_dist.item())
+            sums["dist_hard"] += float(batch_dist_hard.item())
 
             step_count += 1
             if args.show_tqdm:
                 train_iter.set_postfix(
                     loss=f"{(sums['loss'] / max(step_count, 1)):.4f}",
                     hm=f"{(sums['l_hm'] / max(step_count, 1)):.4f}",
-                    dist=f"{(sums['dist'] / max(step_count, 1)):.4f}",
+                    dist_h=f"{(sums['dist_hard'] / max(step_count, 1)):.4f}",
+                    dist_s=f"{(sums['dist'] / max(step_count, 1)):.4f}",
                 )
 
         if step_count == 0:
@@ -895,13 +1242,14 @@ def main() -> None:
             if len(val_ds) > 0
             else {}
         )
-        val_dist = float(val_metrics.get("dist", train_metrics["dist"]))
+        val_dist = float(val_metrics.get("dist", train_metrics["dist_hard"]))
 
         print(
             f"[EPOCH {epoch}] "
             f"train_loss={train_metrics['loss']:.6f} "
             f"train_hm={train_metrics['l_hm']:.6f} "
-            f"train_dist={train_metrics['dist']:.6f} "
+            f"train_dist_hard={train_metrics['dist_hard']:.6f} "
+            f"train_dist_soft={train_metrics['dist']:.6f} "
             f"train_cls={train_metrics['l_cls']:.6f} "
             f"train_acc={train_metrics['cls_acc']:.4f}"
         )
@@ -921,6 +1269,7 @@ def main() -> None:
                 "epoch/train_loss": float(train_metrics["loss"]),
                 "epoch/train_hm": float(train_metrics["l_hm"]),
                 "epoch/train_dist": float(train_metrics["dist"]),
+                "epoch/train_dist_hard": float(train_metrics["dist_hard"]),
                 "epoch/train_cls": float(train_metrics["l_cls"]),
                 "epoch/train_acc": float(train_metrics["cls_acc"]),
             }
@@ -986,6 +1335,20 @@ def main() -> None:
     elapsed = time.time() - start_time
 
     if args.run_test:
+        best_dir = out_dir / "best"
+        if best_dir.exists():
+            loaded_best = load_checkpoint_for_eval(
+                ckpt_dir=best_dir,
+                model=model,
+                device=device,
+            )
+            if loaded_best:
+                print(f"[INFO] loaded best checkpoint for test: {best_dir}")
+            else:
+                print(f"[WARN] best checkpoint exists but could not be loaded fully: {best_dir}")
+        else:
+            print("[WARN] best checkpoint directory not found; testing current in-memory model.")
+
         test_groups = load_test_groups(
             annotation_file=test_ann,
             image_root=test_image_root,
@@ -1012,7 +1375,7 @@ def main() -> None:
                 shuffle=False,
                 num_workers=args.num_workers,
                 pin_memory=(device.type == "cuda"),
-                collate_fn=collate_test_batch,
+                collate_fn=test_collator,
             )
             test_metrics = run_test_metrics(
                 model=model,

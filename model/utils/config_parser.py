@@ -40,15 +40,6 @@ def _default(defaults: dict[str, Any], key: str, fallback: Any) -> Any:
     return defaults.get(key, fallback)
 
 
-def _parse_tags(raw: Any) -> list[str]:
-    if isinstance(raw, (list, tuple)):
-        return [str(x).strip() for x in raw if str(x).strip()]
-    s = str(raw).strip()
-    if not s:
-        return []
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-
 def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
     d = defaults or {}
     p = argparse.ArgumentParser("Qwen gaze LoRA trainer")
@@ -94,6 +85,9 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--show_tqdm", dest="show_tqdm", action="store_true")
     p.add_argument("--no_show_tqdm", dest="show_tqdm", action="store_false")
     p.set_defaults(show_tqdm=bool(_default(d, "show_tqdm", True)))
+    p.add_argument("--train_log_soft_point_dist", dest="train_log_soft_point_dist", action="store_true")
+    p.add_argument("--no_train_log_soft_point_dist", dest="train_log_soft_point_dist", action="store_false")
+    p.set_defaults(train_log_soft_point_dist=bool(_default(d, "train_log_soft_point_dist", False)))
     p.add_argument("--run_test", dest="run_test", action="store_true")
     p.add_argument("--no_run_test", dest="run_test", action="store_false")
     p.set_defaults(run_test=bool(_default(d, "run_test", True)))
@@ -115,6 +109,8 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--head_tokens", type=int, default=int(_default(d, "head_tokens", 64)))
     p.add_argument("--text_tokens", type=int, default=int(_default(d, "text_tokens", 64)))
     p.add_argument("--max_text_length", type=int, default=int(_default(d, "max_text_length", 128)))
+    p.add_argument("--backbone_hidden_mode", type=str, default=str(_default(d, "backbone_hidden_mode", "last")))
+    p.add_argument("--backbone_hidden_last_n", type=int, default=int(_default(d, "backbone_hidden_last_n", 4)))
     p.add_argument("--conditioning_mode", type=str, default=str(_default(d, "conditioning_mode", "film")))
     p.add_argument("--pool_mode", type=str, default=str(_default(d, "pool_mode", "mean")))
     p.add_argument("--num_conditioning_heads", type=int, default=int(_default(d, "num_conditioning_heads", 8)))
@@ -123,7 +119,11 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--enable_recognition", dest="enable_recognition", action="store_true")
     p.add_argument("--no_enable_recognition", dest="enable_recognition", action="store_false")
     p.set_defaults(enable_recognition=bool(_default(d, "enable_recognition", True)))
-    p.add_argument("--recognition_objective", type=str, default=str(_default(d, "recognition_objective", "infonce")))
+    p.add_argument(
+        "--recognition_objective",
+        type=str,
+        default=str(_default(d, "recognition_objective", "full_vocab_infonce")),
+    )
     p.add_argument("--label_emb_dim", type=int, default=int(_default(d, "label_emb_dim", 512)))
     p.add_argument("--logit_scale_init", type=float, default=float(_default(d, "logit_scale_init", 0.07)))
     p.add_argument(
@@ -164,4 +164,3 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--wandb_notes", type=str, default=str(_default(d, "wandb_notes", _default(d, "notes", ""))))
     p.add_argument("--wandb_log_every_steps", type=int, default=int(_default(d, "wandb_log_every_steps", 1)))
     return p
-

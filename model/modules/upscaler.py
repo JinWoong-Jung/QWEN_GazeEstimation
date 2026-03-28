@@ -108,7 +108,9 @@ class HeatmapUpscaler(nn.Module):
         *,
         scene_grid_size: tuple[int, int] | None = None,
         use_softargmax: bool | None = None,
-    ) -> dict[str, torch.Tensor]:
+        compute_point_soft: bool = True,
+        compute_point_hard: bool = True,
+    ) -> dict[str, torch.Tensor | None]:
         if scene_hidden.dim() != 3:
             raise ValueError(f"scene_hidden must be [B, N, D], got shape={tuple(scene_hidden.shape)}")
 
@@ -120,18 +122,18 @@ class HeatmapUpscaler(nn.Module):
         heatmap_logits = self._upsample(coarse_logits)  # [B,1,H,W]
         heatmap = torch.sigmoid(heatmap_logits) if self.apply_sigmoid else heatmap_logits
 
-        patch_weights = torch.softmax(patch_logits, dim=-1)
         map_for_point = heatmap[:, 0, :, :]
-        point_soft = softargmax2d(map_for_point)
-        point_hard = argmax2d(map_for_point)
-
         select_soft = self.training if use_softargmax is None else bool(use_softargmax)
+
+        need_soft = bool(compute_point_soft) or bool(select_soft)
+        need_hard = bool(compute_point_hard) or (not bool(select_soft))
+
+        point_soft = softargmax2d(map_for_point) if need_soft else None
+        point_hard = argmax2d(map_for_point) if need_hard else None
         point = point_soft if select_soft else point_hard
 
         return {
             "patch_logits": patch_logits,
-            "patch_weights": patch_weights,
-            "coarse_logits": coarse_logits,
             "heatmap_logits": heatmap_logits,
             "heatmap": heatmap,
             "point": point,

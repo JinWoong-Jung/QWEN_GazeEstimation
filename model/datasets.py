@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 
+from .recognition_objectives import is_embedding_recognition_objective
 from .utils.data_utils import (
     Record,
     TestGroup,
@@ -108,7 +109,7 @@ class GazeDataset(Dataset):
             size=self.heatmap_size,
             sigma=self.heatmap_sigma,
         )
-        if self.recognition_objective in {"infonce", "batch_local_infonce"}:
+        if is_embedding_recognition_objective(self.recognition_objective):
             target_label_emb = self._load_label_embedding(rec.label_text)
             target_label_valid = float((target_label_emb.abs().sum().item() > 0.0) and bool(rec.label_text.strip()))
         else:
@@ -161,44 +162,3 @@ class GazeTestDataset(Dataset):
             "target_label_ids": torch.tensor(g.label_ids, dtype=torch.long),
             "target_label_text": str(g.label_text),
         }
-
-
-def collate_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    scene_images = [x["scene_image"] for x in batch]
-    head_images = [x["head_image"] for x in batch]
-    text_inputs = [x["text_input"] for x in batch]
-    target_points = torch.stack([x["target_point"] for x in batch], dim=0)
-    target_heatmaps = torch.stack([x["target_heatmap"] for x in batch], dim=0)
-    target_labels = torch.tensor([x["target_label"] for x in batch], dtype=torch.long)
-    target_label_embs = torch.stack([x["target_label_emb"] for x in batch], dim=0)
-    target_label_valid = torch.stack([x["target_label_valid"] for x in batch], dim=0)
-    return {
-        "scene_images": scene_images,
-        "head_images": head_images,
-        "text_inputs": text_inputs,
-        "target_point": target_points,
-        "target_heatmap": target_heatmaps,
-        "target_label": target_labels,
-        "target_label_emb": target_label_embs,
-        "target_label_valid": target_label_valid,
-    }
-
-
-def collate_test_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    target_label_ids_raw = [x["target_label_ids"] for x in batch]
-    max_multi = max([int(t.numel()) for t in target_label_ids_raw] + [1])
-    target_label_ids = torch.full((len(batch), max_multi), fill_value=-100, dtype=torch.long)
-    for i, t in enumerate(target_label_ids_raw):
-        n = int(t.numel())
-        if n > 0:
-            target_label_ids[i, :n] = t.to(dtype=torch.long)
-
-    return {
-        "scene_images": [x["scene_image"] for x in batch],
-        "head_images": [x["head_image"] for x in batch],
-        "text_inputs": [x["text_input"] for x in batch],
-        "gt_points": [x["gt_points"] for x in batch],
-        "target_label": torch.tensor([x["target_label"] for x in batch], dtype=torch.long),
-        "target_label_ids": target_label_ids,
-        "target_label_text": [x["target_label_text"] for x in batch],
-    }
