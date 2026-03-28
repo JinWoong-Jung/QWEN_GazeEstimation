@@ -4,6 +4,8 @@ from typing import Any
 
 import torch
 
+from ..modules.preprocess import resize_scene_and_head
+
 
 def _build_chat_text(processor: Any, text: str, with_image: bool) -> str:
     txt = str(text)
@@ -50,13 +52,27 @@ def _build_joint_inputs(
 
 
 class QwenTrainCollator:
-    def __init__(self, processor: Any, head_text: str) -> None:
+    def __init__(
+        self,
+        processor: Any,
+        head_text: str,
+        scene_size: tuple[int, int] = (512, 512),
+        head_size: tuple[int, int] = (224, 224),
+    ) -> None:
         self.processor = processor
         self.head_text = str(head_text)
+        self.scene_size = (int(scene_size[0]), int(scene_size[1]))
+        self.head_size = (int(head_size[0]), int(head_size[1]))
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        scene_images = [x["scene_image"] for x in batch]
-        head_images = [x["head_image"] for x in batch]
+        scene_images_raw = [x["scene_image"] for x in batch]
+        head_images_raw = [x["head_image"] for x in batch]
+        scene_images, head_images = resize_scene_and_head(
+            scene_image=scene_images_raw,
+            head_image=head_images_raw,
+            scene_size=self.scene_size,
+            head_size=self.head_size,
+        )
         text_inputs = [x["text_input"] for x in batch]
         target_points = torch.stack([x["target_point"] for x in batch], dim=0)
         target_heatmaps = torch.stack([x["target_heatmap"] for x in batch], dim=0)
@@ -83,9 +99,17 @@ class QwenTrainCollator:
 
 
 class QwenTestCollator:
-    def __init__(self, processor: Any, head_text: str) -> None:
+    def __init__(
+        self,
+        processor: Any,
+        head_text: str,
+        scene_size: tuple[int, int] = (512, 512),
+        head_size: tuple[int, int] = (224, 224),
+    ) -> None:
         self.processor = processor
         self.head_text = str(head_text)
+        self.scene_size = (int(scene_size[0]), int(scene_size[1]))
+        self.head_size = (int(head_size[0]), int(head_size[1]))
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         target_label_ids_raw = [x["target_label_ids"] for x in batch]
@@ -96,8 +120,14 @@ class QwenTestCollator:
             if n > 0:
                 target_label_ids[i, :n] = t.to(dtype=torch.long)
 
-        scene_images = [x["scene_image"] for x in batch]
-        head_images = [x["head_image"] for x in batch]
+        scene_images_raw = [x["scene_image"] for x in batch]
+        head_images_raw = [x["head_image"] for x in batch]
+        scene_images, head_images = resize_scene_and_head(
+            scene_image=scene_images_raw,
+            head_image=head_images_raw,
+            scene_size=self.scene_size,
+            head_size=self.head_size,
+        )
         text_inputs = [x["text_input"] for x in batch]
         joint_inputs = _build_joint_inputs(
             processor=self.processor,

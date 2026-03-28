@@ -567,7 +567,9 @@ class QwenBackboneAdapter(nn.Module):
                     self._joint_encode_warned = True
                 if not (len(scene_images) == len(head_images) == len(texts) and len(texts) > 0):
                     raise RuntimeError(
-                        "joint preprocessed path failed and raw scene/head/text inputs are unavailable."
+                        "joint preprocessed path failed and raw scene/head/text inputs are unavailable. "
+                        "Check that collator pre-resizes scene/head to fixed sizes "
+                        "(scene_h/scene_w, head_h/head_w) before building joint_inputs."
                     ) from e
                 h_s, h_h, h_t, scene_grid_hw, head_grid_hw = self._encode_scene_head_joint(
                     texts=texts,
@@ -936,9 +938,24 @@ def main() -> None:
     if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
         processor_path = checkpoint_dir / "processor"
     processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
-    train_collator = QwenTrainCollator(processor=processor, head_text=args.head_text)
-    val_collator = QwenTrainCollator(processor=processor, head_text=args.head_text)
-    test_collator = QwenTestCollator(processor=processor, head_text=args.head_text)
+    train_collator = QwenTrainCollator(
+        processor=processor,
+        head_text=args.head_text,
+        scene_size=(int(args.scene_h), int(args.scene_w)),
+        head_size=(int(args.head_h), int(args.head_w)),
+    )
+    val_collator = QwenTrainCollator(
+        processor=processor,
+        head_text=args.head_text,
+        scene_size=(int(args.scene_h), int(args.scene_w)),
+        head_size=(int(args.head_h), int(args.head_w)),
+    )
+    test_collator = QwenTestCollator(
+        processor=processor,
+        head_text=args.head_text,
+        scene_size=(int(args.scene_h), int(args.scene_w)),
+        head_size=(int(args.head_h), int(args.head_w)),
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
