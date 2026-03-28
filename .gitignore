@@ -1,16 +1,12 @@
-# Python
-__pycache__/
-**/__pycache__/
-*.py[cod]
-
-# macOS / editor noise
-.DS_Store
-
-# Local generated artifacts
-100_imgs*/
-wandb/
+# existing
 checkpoints/
-model/
-
-# Local datasets
 data/
+wandb/
+__pycache__/
+
+# add
+outputs/
+model/Qwen3-VL-4B-Instruct/
+model/cache/
+*.py[cod]
+*.pyo

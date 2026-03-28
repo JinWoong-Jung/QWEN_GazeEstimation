@@ -1,0 +1,604 @@
+from __future__ import annotations
+
+import csv
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from PIL import Image, ImageEnhance, ImageOps
+
+
+def is_normalized_point(x: float, y: float) -> bool:
+    return 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
+
+
+def sanitize_bbox_pixels(
+    bbox: tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    xmin, ymin, xmax, ymax = bbox
+    x1, x2 = sorted((xmin, xmax))
+    y1, y2 = sorted((ymin, ymax))
+
+    x1 = max(0.0, min(x1, float(width)))
+    y1 = max(0.0, min(y1, float(height)))
+    x2 = max(0.0, min(x2, float(width)))
+    y2 = max(0.0, min(y2, float(height)))
+
+    if x2 <= x1:
+        x2 = min(float(width), x1 + 1.0)
+    if y2 <= y1:
+        y2 = min(float(height), y1 + 1.0)
+
+    x1i, y1i = int(round(x1)), int(round(y1))
+    x2i, y2i = int(round(x2)), int(round(y2))
+    x1i = max(0, min(x1i, width - 1))
+    y1i = max(0, min(y1i, height - 1))
+    x2i = max(x1i + 1, min(x2i, width))
+    y2i = max(y1i + 1, min(y2i, height))
+    return x1i, y1i, x2i, y2i
+
+
+def build_prompt(
+    bbox_norm: tuple[float, float, float, float],
+    prompt_template: str,
+    prompt_text: str = "",
+) -> str:
+    xmin, ymin, xmax, ymax = bbox_norm
+    if prompt_template.strip():
+        return prompt_template.format(xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
+    if prompt_text.strip():
+        try:
+            return prompt_text.format(xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
+        except Exception:
+            return prompt_text
+    raise ValueError(
+        "Prompt is empty. Set `prompt.prompt_text` or `prompt.prompt_template` in config.yaml."
+    )
+
+
+def gaussian_heatmap(
+    x_norm: float,
+    y_norm: float,
+    size: tuple[int, int],
+    sigma: float,
+) -> torch.Tensor:
+    h, w = int(size[0]), int(size[1])
+    cx = float(x_norm) * (w - 1)
+    cy = float(y_norm) * (h - 1)
+    ys = torch.arange(h, dtype=torch.float32).view(h, 1)
+    xs = torch.arange(w, dtype=torch.float32).view(1, w)
+    dist2 = (xs - cx) ** 2 + (ys - cy) ** 2
+    denom = max(float(sigma), 1e-6) ** 2 * 2.0
+    return torch.exp(-dist2 / denom)
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def _expand_px(
+    bbox_px: tuple[float, float, float, float],
+    width: int,
+    height: int,
+    scale: float,
+) -> tuple[float, float, float, float]:
+    x1, y1, x2, y2 = bbox_px
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    bw = max(1.0, (x2 - x1) * float(scale))
+    bh = max(1.0, (y2 - y1) * float(scale))
+    nx1 = max(0.0, cx - 0.5 * bw)
+    ny1 = max(0.0, cy - 0.5 * bh)
+    nx2 = min(float(width), cx + 0.5 * bw)
+    ny2 = min(float(height), cy + 0.5 * bh)
+    return nx1, ny1, nx2, ny2
+
+
+def _random_safe_crop(
+    scene: Image.Image,
+    gaze_x: float,
+    gaze_y: float,
+    bbox_px: tuple[float, float, float, float],
+    p: float = 0.5,
+) -> tuple[Image.Image, float, float, tuple[float, float, float, float]]:
+    if random.random() >= float(p):
+        return scene, gaze_x, gaze_y, bbox_px
+
+    w, h = scene.size
+    gx = _clamp01(gaze_x) * (w - 1)
+    gy = _clamp01(gaze_y) * (h - 1)
+    x1, y1, x2, y2 = bbox_px
+
+    min_x = max(0.0, min(gx, x1))
+    min_y = max(0.0, min(gy, y1))
+    max_x = min(float(w - 1), max(gx, x2))
+    max_y = min(float(h - 1), max(gy, y2))
+
+    left = random.uniform(0.0, float(min_x))
+    top = random.uniform(0.0, float(min_y))
+    right = random.uniform(float(max_x), float(w - 1))
+    bottom = random.uniform(float(max_y), float(h - 1))
+
+    crop_w = max(2.0, right - left)
+    crop_h = max(2.0, bottom - top)
+    if crop_w < 2.0 or crop_h < 2.0:
+        return scene, gaze_x, gaze_y, bbox_px
+
+    l = int(max(0, min(w - 2, round(left))))
+    t = int(max(0, min(h - 2, round(top))))
+    r = int(max(l + 2, min(w, round(right + 1))))
+    b = int(max(t + 2, min(h, round(bottom + 1))))
+    if r <= l + 1 or b <= t + 1:
+        return scene, gaze_x, gaze_y, bbox_px
+
+    cropped = scene.crop((l, t, r, b))
+    new_w, new_h = cropped.size
+
+    gx_new = (gx - l) / max(new_w - 1, 1)
+    gy_new = (gy - t) / max(new_h - 1, 1)
+    if (gx_new < 0.0) or (gx_new > 1.0) or (gy_new < 0.0) or (gy_new > 1.0):
+        return scene, gaze_x, gaze_y, bbox_px
+
+    nx1 = max(0.0, min(float(new_w), x1 - l))
+    ny1 = max(0.0, min(float(new_h), y1 - t))
+    nx2 = max(0.0, min(float(new_w), x2 - l))
+    ny2 = max(0.0, min(float(new_h), y2 - t))
+    if nx2 <= nx1:
+        nx2 = min(float(new_w), nx1 + 1.0)
+    if ny2 <= ny1:
+        ny2 = min(float(new_h), ny1 + 1.0)
+
+    return cropped, _clamp01(gx_new), _clamp01(gy_new), (nx1, ny1, nx2, ny2)
+
+
+def _maybe_hflip(
+    scene: Image.Image,
+    gaze_x: float,
+    bbox_px: tuple[float, float, float, float],
+    p: float = 0.5,
+) -> tuple[Image.Image, float, tuple[float, float, float, float]]:
+    if random.random() >= float(p):
+        return scene, gaze_x, bbox_px
+    w, _ = scene.size
+    flipped = ImageOps.mirror(scene)
+    x1, y1, x2, y2 = bbox_px
+    nx1 = float(w) - x2
+    nx2 = float(w) - x1
+    ngx = 1.0 - float(gaze_x)
+    return flipped, _clamp01(ngx), (nx1, y1, nx2, y2)
+
+
+def _maybe_color_jitter(scene: Image.Image, p: float = 0.8) -> Image.Image:
+    if random.random() >= float(p):
+        return scene
+    out = scene
+    b = random.uniform(0.5, 1.5)
+    c = random.uniform(0.5, 1.5)
+    s = random.uniform(0.0, 1.5)
+    out = ImageEnhance.Brightness(out).enhance(b)
+    out = ImageEnhance.Contrast(out).enhance(c)
+    out = ImageEnhance.Color(out).enhance(s)
+    return out
+
+
+def apply_train_augmentation(
+    scene: Image.Image,
+    gaze_x: float,
+    gaze_y: float,
+    bbox_px: tuple[float, float, float, float],
+) -> tuple[Image.Image, float, float, tuple[float, float, float, float]]:
+    w, h = scene.size
+    bx = sanitize_bbox_pixels(bbox_px, width=w, height=h)
+    bbox_f = (float(bx[0]), float(bx[1]), float(bx[2]), float(bx[3]))
+
+    if random.random() < 0.5:
+        scale = random.uniform(1.0, 1.2)
+        bbox_f = _expand_px(bbox_f, width=w, height=h, scale=scale)
+
+    scene, gaze_x, gaze_y, bbox_f = _random_safe_crop(
+        scene=scene,
+        gaze_x=gaze_x,
+        gaze_y=gaze_y,
+        bbox_px=bbox_f,
+        p=0.5,
+    )
+    scene, gaze_x, bbox_f = _maybe_hflip(
+        scene=scene,
+        gaze_x=gaze_x,
+        bbox_px=bbox_f,
+        p=0.5,
+    )
+    scene = _maybe_color_jitter(scene, p=0.8)
+
+    nw, nh = scene.size
+    x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_f, width=nw, height=nh)
+    gaze_x = _clamp01(gaze_x)
+    gaze_y = _clamp01(gaze_y)
+    return scene, gaze_x, gaze_y, (float(x1), float(y1), float(x2), float(y2))
+
+
+def load_vocab2id(vocab2id_path: Path | None) -> tuple[dict[str, int], dict[str, int]]:
+    if vocab2id_path is None or (not vocab2id_path.exists()):
+        return {}, {}
+    obj = torch.load(vocab2id_path) if str(vocab2id_path).endswith(".pt") else None
+    if obj is None:
+        import json
+        obj = json.loads(vocab2id_path.read_text(encoding="utf-8"))
+    if not isinstance(obj, dict):
+        return {}, {}
+
+    v: dict[str, int] = {}
+    for k, val in obj.items():
+        try:
+            idx = int(val)
+        except Exception:
+            continue
+        v[str(k)] = idx
+    vl = {k.lower(): i for k, i in v.items()}
+    return v, vl
+
+
+def _map_text_to_vocab_id(
+    label_text: str,
+    vocab2id: dict[str, int] | None = None,
+    vocab2id_lower: dict[str, int] | None = None,
+) -> int:
+    if not label_text:
+        return -100
+    txt = str(label_text).strip()
+    if not txt:
+        return -100
+    v = vocab2id or {}
+    vl = vocab2id_lower or {}
+    if txt in v:
+        return int(v[txt])
+    t2 = txt.lower()
+    if t2 in vl:
+        return int(vl[t2])
+    return -100
+
+
+def load_label_map(
+    labels_csv: Path | None,
+    vocab2id: dict[str, int] | None = None,
+    vocab2id_lower: dict[str, int] | None = None,
+    text_key: str = "gaze_pseudo_label",
+) -> tuple[dict[tuple[str, int], int], dict[str, int]]:
+    stats = {
+        "rows": 0,
+        "mapped": 0,
+        "missing_text": 0,
+        "unknown_text": 0,
+    }
+    if labels_csv is None or (not labels_csv.exists()):
+        return {}, stats
+
+    v = vocab2id or {}
+    vl = vocab2id_lower or {}
+    out: dict[tuple[str, int], int] = {}
+    with labels_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                path = str(row["path"]).strip()
+                sample_id = int(float(row["id"]))
+            except Exception:
+                continue
+            stats["rows"] += 1
+            label_text = str(row.get(text_key, "")).strip()
+            if not label_text:
+                stats["missing_text"] += 1
+                out[(path, sample_id)] = -100
+                continue
+            label_id = _map_text_to_vocab_id(label_text, v, vl)
+            if label_id >= 0:
+                stats["mapped"] += 1
+            else:
+                stats["unknown_text"] += 1
+            out[(path, sample_id)] = int(label_id)
+    return out, stats
+
+
+def load_label_text_map(
+    labels_csv: Path | None,
+    text_key: str = "gaze_pseudo_label",
+) -> tuple[dict[tuple[str, int], str], dict[str, int]]:
+    stats = {
+        "rows": 0,
+        "with_text": 0,
+        "missing_text": 0,
+    }
+    if labels_csv is None or (not labels_csv.exists()):
+        return {}, stats
+
+    out: dict[tuple[str, int], str] = {}
+    with labels_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                path = str(row["path"]).strip()
+                sample_id = int(float(row["id"]))
+            except Exception:
+                continue
+            stats["rows"] += 1
+            txt = str(row.get(text_key, "")).strip()
+            if txt:
+                stats["with_text"] += 1
+            else:
+                stats["missing_text"] += 1
+            out[(path, sample_id)] = txt
+    return out, stats
+
+
+def build_vocab_embedding_matrix(
+    vocab2id: dict[str, int],
+    label_embed_dir: Path | None,
+    label_emb_dim: int = 512,
+    normalize: bool = True,
+) -> torch.Tensor | None:
+    if not vocab2id:
+        return None
+    if label_embed_dir is None or (not label_embed_dir.exists()):
+        return None
+    vocab_size = max(int(x) for x in vocab2id.values()) + 1
+    dim = int(label_emb_dim)
+    out = torch.zeros((vocab_size, dim), dtype=torch.float32)
+    found = 0
+    for txt, idx in vocab2id.items():
+        if int(idx) < 0 or int(idx) >= vocab_size:
+            continue
+        p = label_embed_dir / f"{txt}-emb.pt"
+        if not p.exists():
+            continue
+        try:
+            vec = torch.load(p, map_location="cpu")
+            if not torch.is_tensor(vec):
+                continue
+            vec = vec.to(dtype=torch.float32).flatten()
+            if vec.numel() != dim:
+                continue
+            if normalize:
+                vec = F.normalize(vec.unsqueeze(0), p=2, dim=-1).squeeze(0)
+            out[int(idx)] = vec
+            found += 1
+        except Exception:
+            continue
+    if found <= 0:
+        return None
+    return out
+
+
+def load_test_label_map(
+    labels_csv: Path | None,
+    vocab2id: dict[str, int] | None = None,
+    vocab2id_lower: dict[str, int] | None = None,
+) -> tuple[dict[str, int], dict[str, str], dict[str, list[int]], dict[str, int]]:
+    stats = {
+        "rows": 0,
+        "mapped": 0,
+        "missing_text": 0,
+        "unknown_text": 0,
+        "conflicts": 0,
+    }
+    if labels_csv is None or (not labels_csv.exists()):
+        return {}, {}, {}, stats
+
+    v = vocab2id or {}
+    vl = vocab2id_lower or {}
+    id_map: dict[str, int] = {}
+    text_map: dict[str, str] = {}
+    multi_id_map: dict[str, list[int]] = {}
+    with labels_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                path = str(row["path"]).strip()
+            except Exception:
+                continue
+            if not path:
+                continue
+            stats["rows"] += 1
+
+            t_primary = str(row.get("gaze_gt_label", "")).strip()
+            t_multi = str(row.get("gaze_gt_labels", "")).strip()
+
+            chosen_text = t_primary
+            chosen_id = _map_text_to_vocab_id(t_primary, v, vl)
+            if not t_primary:
+                stats["missing_text"] += 1
+                chosen_id = -100
+            elif chosen_id < 0:
+                stats["unknown_text"] += 1
+            else:
+                stats["mapped"] += 1
+                chosen_id = int(chosen_id)
+
+            parsed_multi: list[int] = []
+            if chosen_id >= 0:
+                if t_multi:
+                    parsed = [_map_text_to_vocab_id(x.strip(), v, vl) for x in t_multi.split("-") if x.strip()]
+                    parsed_multi = sorted({int(x) for x in parsed if int(x) >= 0})
+                if not parsed_multi:
+                    parsed_multi = [int(chosen_id)]
+
+            prev = id_map.get(path, None)
+            if prev is None:
+                id_map[path] = int(chosen_id)
+            else:
+                if int(prev) >= 0 and int(chosen_id) >= 0 and int(prev) != int(chosen_id):
+                    stats["conflicts"] += 1
+                elif int(prev) < 0 and int(chosen_id) >= 0:
+                    id_map[path] = int(chosen_id)
+
+            if chosen_text and (path not in text_map):
+                text_map[path] = str(chosen_text)
+            elif path not in text_map:
+                flags: list[str] = []
+                for k in ("outside_frame", "uncertain", "eyes_closed"):
+                    vv = str(row.get(k, "")).strip().lower()
+                    if vv in {"true", "1", "yes"}:
+                        flags.append(k)
+                if flags:
+                    text_map[path] = ",".join(flags)
+
+            if path not in multi_id_map:
+                multi_id_map[path] = list(parsed_multi)
+            elif parsed_multi:
+                merged = sorted(set(multi_id_map[path]).union(set(parsed_multi)))
+                multi_id_map[path] = [int(x) for x in merged if int(x) >= 0]
+
+    return id_map, text_map, multi_id_map, stats
+
+
+@dataclass
+class Record:
+    sample_id: int
+    image_rel: str
+    image_path: Path
+    gaze_x: float
+    gaze_y: float
+    bbox_px: tuple[float, float, float, float]
+    label_id: int
+    label_text: str = ""
+
+
+@dataclass
+class TestGroup:
+    image_rel: str
+    image_path: Path
+    bbox_px: tuple[float, float, float, float]
+    gt_points: list[tuple[float, float]]
+    label_id: int = -100
+    label_text: str = ""
+    label_ids: list[int] = field(default_factory=list)
+
+
+def load_records(
+    annotation_file: Path,
+    image_root: Path,
+    label_map: dict[tuple[str, int], int] | None = None,
+    label_text_map: dict[tuple[str, int], str] | None = None,
+    split_prefix: str = "train/",
+    strip_split_prefix: bool = True,
+    skip_outside: bool = True,
+    max_samples: int = 0,
+) -> list[Record]:
+    rows: list[list[str]] = []
+    with annotation_file.open("r", encoding="utf-8", newline="") as f:
+        rows = [row for row in csv.reader(f) if row]
+
+    records: list[Record] = []
+    for row in rows:
+        image_rel = str(row[0]).strip()
+        if split_prefix and (not image_rel.startswith(split_prefix)):
+            continue
+        join_rel = image_rel[len(split_prefix) :] if (split_prefix and strip_split_prefix) else image_rel
+        image_path = image_root / join_rel
+        if not image_path.exists():
+            continue
+
+        try:
+            sample_id = int(float(row[1]))
+            gaze_x = float(row[8])
+            gaze_y = float(row[9])
+            bbox = (float(row[10]), float(row[11]), float(row[12]), float(row[13]))
+        except Exception:
+            continue
+
+        if skip_outside and (gaze_x < 0.0 or gaze_y < 0.0):
+            continue
+        if not is_normalized_point(gaze_x, gaze_y):
+            continue
+
+        label_id = -100
+        if label_map is not None:
+            label_id = int(label_map.get((image_rel, sample_id), -100))
+        label_text = ""
+        if label_text_map is not None:
+            label_text = str(label_text_map.get((image_rel, sample_id), "")).strip()
+
+        records.append(
+            Record(
+                sample_id=sample_id,
+                image_rel=image_rel,
+                image_path=image_path,
+                gaze_x=gaze_x,
+                gaze_y=gaze_y,
+                bbox_px=bbox,
+                label_id=label_id,
+                label_text=label_text,
+            )
+        )
+        if max_samples > 0 and len(records) >= max_samples:
+            break
+    return records
+
+
+def _rounded_bbox_key(
+    bbox: tuple[float, float, float, float],
+    decimals: int,
+) -> tuple[float, float, float, float]:
+    return tuple(round(float(v), int(decimals)) for v in bbox)
+
+
+def load_test_groups(
+    annotation_file: Path,
+    image_root: Path,
+    test_label_map: dict[str, int] | None = None,
+    test_label_text_map: dict[str, str] | None = None,
+    test_label_ids_map: dict[str, list[int]] | None = None,
+    split_prefix: str = "test2/",
+    strip_split_prefix: bool = True,
+    bbox_round_decimals: int = 3,
+    max_groups: int = 0,
+) -> list[TestGroup]:
+    rows: list[list[str]] = []
+    with annotation_file.open("r", encoding="utf-8", newline="") as f:
+        rows = [row for row in csv.reader(f) if row]
+
+    grouped: dict[tuple[str, tuple[float, float, float, float]], TestGroup] = {}
+    for row in rows:
+        image_rel = str(row[0]).strip()
+        if split_prefix and (not image_rel.startswith(split_prefix)):
+            continue
+
+        try:
+            gaze_x = float(row[8])
+            gaze_y = float(row[9])
+            bbox = (float(row[10]), float(row[11]), float(row[12]), float(row[13]))
+        except Exception:
+            continue
+        if not is_normalized_point(gaze_x, gaze_y):
+            continue
+
+        join_rel = image_rel[len(split_prefix) :] if (split_prefix and strip_split_prefix) else image_rel
+        image_path = image_root / join_rel
+        if not image_path.exists():
+            continue
+
+        key = (image_rel, _rounded_bbox_key(bbox, decimals=bbox_round_decimals))
+        if key not in grouped:
+            grouped[key] = TestGroup(
+                image_rel=image_rel,
+                image_path=image_path,
+                bbox_px=bbox,
+                gt_points=[],
+                label_id=int((test_label_map or {}).get(image_rel, -100)),
+                label_text=str((test_label_text_map or {}).get(image_rel, "")),
+                label_ids=list((test_label_ids_map or {}).get(image_rel, [])),
+            )
+        grouped[key].gt_points.append((gaze_x, gaze_y))
+
+    groups = [g for g in grouped.values() if g.gt_points]
+    for g in groups:
+        if not g.label_ids and int(g.label_id) >= 0:
+            g.label_ids = [int(g.label_id)]
+    if max_groups > 0:
+        groups = groups[: int(max_groups)]
+    return groups
+

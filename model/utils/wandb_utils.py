@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+
+def _parse_tags(raw: Any) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    s = str(raw).strip()
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def init_wandb(args: Any, root: Path):
+    if not bool(getattr(args, "wandb_enabled", False)):
+        return None
+
+    try:
+        import wandb as _wandb
+    except Exception:
+        _wandb = None
+    wandb = _wandb if (_wandb is not None and hasattr(_wandb, "init")) else None
+    if wandb is None:
+        print("[WARN] wandb is enabled in config, but package is not installed. W&B logging disabled.")
+        return None
+
+    os.environ.setdefault("WANDB_SILENT", "true")
+    os.environ.setdefault("WANDB_CONSOLE", "off")
+    wandb_dir = root / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    wb_kwargs: dict[str, Any] = {
+        "project": str(getattr(args, "wandb_project", "gaze_mllm")),
+        "config": vars(args),
+        "dir": str(wandb_dir),
+        "reinit": True,
+    }
+    if hasattr(wandb, "Settings"):
+        try:
+            wb_kwargs["settings"] = wandb.Settings(quiet=True, console="off")
+        except Exception:
+            pass
+    if str(getattr(args, "wandb_entity", "")).strip():
+        wb_kwargs["entity"] = str(args.wandb_entity).strip()
+    if str(getattr(args, "wandb_run_name", "")).strip():
+        wb_kwargs["name"] = str(args.wandb_run_name).strip()
+    tags = _parse_tags(getattr(args, "wandb_tags", []))
+    if tags:
+        wb_kwargs["tags"] = tags
+    if str(getattr(args, "wandb_notes", "")).strip():
+        wb_kwargs["notes"] = str(args.wandb_notes).strip()
+
+    try:
+        run = wandb.init(**wb_kwargs)
+        print(f"[INFO] wandb enabled (project={args.wandb_project}, run={run.name}).")
+        try:
+            wandb.define_metric("val/dist", summary="min")
+            wandb.define_metric("metric/val/dist", summary="min")
+        except Exception:
+            pass
+        return run
+    except Exception as e:
+        print(f"[WARN] failed to initialize wandb: {e}. W&B logging disabled.")
+        return None
+
+
+def finish_wandb(run: Any) -> None:
+    if run is None:
+        return
+    try:
+        run.finish()
+    except Exception:
+        pass
+
