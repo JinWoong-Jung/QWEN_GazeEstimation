@@ -938,23 +938,29 @@ def main() -> None:
     if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
         processor_path = checkpoint_dir / "processor"
     processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
+    collator_include_raw_inputs = bool(getattr(args, "collator_include_raw_inputs", False))
+    if collator_include_raw_inputs:
+        print("[INFO] collator raw input passthrough: enabled (scene_images/head_images/text_inputs).")
     train_collator = QwenTrainCollator(
         processor=processor,
         head_text=args.head_text,
         scene_size=(int(args.scene_h), int(args.scene_w)),
         head_size=(int(args.head_h), int(args.head_w)),
+        include_raw_inputs=collator_include_raw_inputs,
     )
     val_collator = QwenTrainCollator(
         processor=processor,
         head_text=args.head_text,
         scene_size=(int(args.scene_h), int(args.scene_w)),
         head_size=(int(args.head_h), int(args.head_w)),
+        include_raw_inputs=collator_include_raw_inputs,
     )
     test_collator = QwenTestCollator(
         processor=processor,
         head_text=args.head_text,
         scene_size=(int(args.scene_h), int(args.scene_w)),
         head_size=(int(args.head_h), int(args.head_w)),
+        include_raw_inputs=collator_include_raw_inputs,
     )
     train_loader = DataLoader(
         train_ds,
@@ -1042,6 +1048,14 @@ def main() -> None:
         cls_ignore_index=args.cls_ignore_index,
     ).to(device)
     if recognition_enabled and (num_classes > 0):
+        vocab_size = (max((int(x) for x in vocab2id.values()), default=-1) + 1) if vocab2id else 0
+        id2vocab: dict[int, str] = {}
+        for txt, idx in vocab2id.items():
+            idx_i = int(idx)
+            if idx_i >= 0 and idx_i not in id2vocab:
+                id2vocab[idx_i] = str(txt)
+        train_positive_label_ids = sorted({int(r.label_id) for r in train_records if int(r.label_id) >= 0})
+
         vocab_emb = build_vocab_embedding_matrix(
             vocab2id=vocab2id,
             label_embed_dir=label_embed_dir,
@@ -1049,12 +1063,67 @@ def main() -> None:
             normalize=bool(args.normalize_label_emb),
         )
         if vocab_emb is not None:
+            if use_embedding_recognition:
+                row_nonzero = (torch.linalg.norm(vocab_emb, dim=-1) > 0.0)
+                found = int(row_nonzero.sum().item())
+                print(f"[INFO] vocab embedding coverage: found={found}/{int(vocab_emb.shape[0])}")
+                missing_vocab_ids = [i for i in range(int(vocab_emb.shape[0])) if not bool(row_nonzero[i].item())]
+                if missing_vocab_ids:
+                    preview = ", ".join(
+                        f"{i}:{id2vocab.get(i, '<unknown>')}" for i in missing_vocab_ids[:10]
+                    )
+                    if len(missing_vocab_ids) > 10:
+                        preview += f", ...(+{len(missing_vocab_ids) - 10} more)"
+                    print(
+                        "[WARN] missing vocab embeddings detected: "
+                        f"{len(missing_vocab_ids)}/{int(vocab_emb.shape[0])} classes. sample=[{preview}]"
+                    )
+
+                missing_train_ids = [
+                    i
+                    for i in train_positive_label_ids
+                    if (i < 0) or (i >= int(vocab_emb.shape[0])) or (not bool(row_nonzero[i].item()))
+                ]
+                print(
+                    "[INFO] train-label embedding coverage: "
+                    f"missing_classes={len(missing_train_ids)} total_classes={len(train_positive_label_ids)}"
+                )
+                if missing_train_ids:
+                    preview = ", ".join(
+                        f"{i}:{id2vocab.get(i, '<unknown>')}" for i in missing_train_ids[:10]
+                    )
+                    if len(missing_train_ids) > 10:
+                        preview += f", ...(+{len(missing_train_ids) - 10} more)"
+                    msg = (
+                        "[ERROR] missing embeddings for training positive classes. "
+                        f"missing_classes={len(missing_train_ids)} sample=[{preview}] "
+                        f"(label_embed_dir={label_embed_dir})"
+                    )
+                    raise RuntimeError(msg)
+
             model.set_vocab_embeddings(vocab_emb.to(device))
             print(
                 "[INFO] loaded vocab embeddings: "
                 f"shape={tuple(vocab_emb.shape)} from={label_embed_dir}"
             )
         else:
+            if use_embedding_recognition:
+                print(f"[INFO] vocab embedding coverage: found=0/{vocab_size}")
+                print(
+                    "[INFO] train-label embedding coverage: "
+                    f"missing_classes={len(train_positive_label_ids)} total_classes={len(train_positive_label_ids)}"
+                )
+                if train_positive_label_ids:
+                    preview = ", ".join(
+                        f"{i}:{id2vocab.get(i, '<unknown>')}" for i in train_positive_label_ids[:10]
+                    )
+                    if len(train_positive_label_ids) > 10:
+                        preview += f", ...(+{len(train_positive_label_ids) - 10} more)"
+                    print(f"[WARN] missing train-label embeddings sample=[{preview}]")
+                    raise RuntimeError(
+                        "Failed to build vocab embeddings for full-vocab recognition objective "
+                        f"with mapped training labels. label_embed_dir={label_embed_dir}"
+                    )
             print(
                 "[WARN] failed to build vocab embedding matrix. "
                 "test recognition logits from embedding-space may be unavailable."
@@ -1118,6 +1187,7 @@ def main() -> None:
         cls_correct = 0
         cls_total = 0
         step_count = 0
+        sample_count = 0
         updates_done_in_epoch = 0
 
         optimizer.zero_grad(set_to_none=True)
@@ -1129,6 +1199,11 @@ def main() -> None:
             disable=not args.show_tqdm,
         )
         remainder_steps = num_train_batches % accum_steps
+        last_window_start = (
+            (num_train_batches - int(remainder_steps) + 1)
+            if int(remainder_steps) > 0
+            else (num_train_batches + 1)
+        )
         for step, batch in enumerate(train_iter, start=1):
             target_heatmap = batch["target_heatmap"].to(device)
             target_label = batch["target_label"].to(device)
@@ -1147,7 +1222,7 @@ def main() -> None:
             is_last_batch = (step == num_train_batches)
             current_accum_steps = (
                 int(remainder_steps)
-                if (is_last_batch and int(remainder_steps) > 0)
+                if (int(remainder_steps) > 0 and step >= int(last_window_start))
                 else int(accum_steps)
             )
 
@@ -1173,13 +1248,17 @@ def main() -> None:
 
             loss.backward()
             loss_dict = out.get("loss_dict", {})
+            batch_size = int(target_point.shape[0])
             pred_point_hard = out["point_hard"].detach().to(dtype=torch.float32)
             tgt_point = target_point.detach().to(dtype=torch.float32)
-            batch_dist_hard = torch.linalg.norm(pred_point_hard - tgt_point, dim=-1).mean()
+            dist_hard_per_sample = torch.linalg.norm(pred_point_hard - tgt_point, dim=-1)
+            batch_dist_hard = dist_hard_per_sample.mean()
             if use_train_soft_point_dist:
                 pred_point = out["point"].detach().to(dtype=torch.float32)
-                batch_dist = torch.linalg.norm(pred_point - tgt_point, dim=-1).mean()
+                dist_per_sample = torch.linalg.norm(pred_point - tgt_point, dim=-1)
+                batch_dist = dist_per_sample.mean()
             else:
+                dist_per_sample = dist_hard_per_sample
                 batch_dist = batch_dist_hard
             if "logits" in out:
                 valid = target_label >= 0
@@ -1225,26 +1304,27 @@ def main() -> None:
                         step_log["train/acc"] = batch_cls_acc
                     wandb_run.log(step_log, step=global_step)
 
-            sums["loss"] += float(loss_dict.get("loss", out["loss"]).detach().item())
-            sums["l_hm"] += float(loss_dict.get("l_hm", torch.tensor(0.0)).detach().item())
+            sums["loss"] += float(loss_dict.get("loss", out["loss"]).detach().item()) * float(batch_size)
+            sums["l_hm"] += float(loss_dict.get("l_hm", torch.tensor(0.0)).detach().item()) * float(batch_size)
             if "l_cls" in loss_dict:
-                sums["l_cls"] += float(loss_dict["l_cls"].detach().item())
-            sums["dist"] += float(batch_dist.item())
-            sums["dist_hard"] += float(batch_dist_hard.item())
+                sums["l_cls"] += float(loss_dict["l_cls"].detach().item()) * float(batch_size)
+            sums["dist"] += float(dist_per_sample.sum().item())
+            sums["dist_hard"] += float(dist_hard_per_sample.sum().item())
 
             step_count += 1
+            sample_count += batch_size
             if args.show_tqdm:
                 train_iter.set_postfix(
-                    loss=f"{(sums['loss'] / max(step_count, 1)):.4f}",
-                    hm=f"{(sums['l_hm'] / max(step_count, 1)):.4f}",
-                    dist_h=f"{(sums['dist_hard'] / max(step_count, 1)):.4f}",
-                    dist_s=f"{(sums['dist'] / max(step_count, 1)):.4f}",
+                    loss=f"{(sums['loss'] / max(sample_count, 1)):.4f}",
+                    hm=f"{(sums['l_hm'] / max(sample_count, 1)):.4f}",
+                    dist_h=f"{(sums['dist_hard'] / max(sample_count, 1)):.4f}",
+                    dist_s=f"{(sums['dist'] / max(sample_count, 1)):.4f}",
                 )
 
-        if step_count == 0:
+        if step_count == 0 or sample_count == 0:
             raise RuntimeError("No training batches were produced.")
 
-        train_metrics = {k: v / step_count for k, v in sums.items()}
+        train_metrics = {k: v / float(sample_count) for k, v in sums.items()}
         train_metrics["cls_acc"] = (cls_correct / cls_total) if cls_total > 0 else 0.0
 
         val_metrics = (
@@ -1411,6 +1491,8 @@ def main() -> None:
                         "test/AUC": float(test_metrics["AUC"]),
                         "test/AvgL2": float(test_metrics["Avg L2"]),
                         "test/MinL2": float(test_metrics["Min L2"]),
+                        "test/Acc@Dist": float(test_metrics.get("Acc@Dist", 0.0)),
+                        "test/AccDistThr": float(test_metrics.get("acc_dist_threshold", args.acc_dist_threshold)),
                         "test/Acc@1": float(test_metrics["Acc@1"]),
                         "test/Acc@3": float(test_metrics["Acc@3"]),
                         "test/multiAcc@1": float(test_metrics["multiAcc@1"]),

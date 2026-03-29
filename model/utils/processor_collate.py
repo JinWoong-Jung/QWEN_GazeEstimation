@@ -58,11 +58,13 @@ class QwenTrainCollator:
         head_text: str,
         scene_size: tuple[int, int] = (512, 512),
         head_size: tuple[int, int] = (224, 224),
+        include_raw_inputs: bool = False,
     ) -> None:
         self.processor = processor
         self.head_text = str(head_text)
         self.scene_size = (int(scene_size[0]), int(scene_size[1]))
         self.head_size = (int(head_size[0]), int(head_size[1]))
+        self.include_raw_inputs = bool(include_raw_inputs)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         scene_images_raw = [x["scene_image"] for x in batch]
@@ -87,7 +89,7 @@ class QwenTrainCollator:
             text_inputs=[str(t) for t in text_inputs],
             head_text=self.head_text,
         )
-        return {
+        out = {
             "joint_inputs": dict(joint_inputs),
             "joint_bsz": int(len(text_inputs)),
             "target_point": target_points,
@@ -96,6 +98,11 @@ class QwenTrainCollator:
             "target_label_emb": target_label_embs,
             "target_label_valid": target_label_valid,
         }
+        if self.include_raw_inputs:
+            out["scene_images"] = list(scene_images)
+            out["head_images"] = list(head_images)
+            out["text_inputs"] = [str(t) for t in text_inputs]
+        return out
 
 
 class QwenTestCollator:
@@ -105,11 +112,13 @@ class QwenTestCollator:
         head_text: str,
         scene_size: tuple[int, int] = (512, 512),
         head_size: tuple[int, int] = (224, 224),
+        include_raw_inputs: bool = False,
     ) -> None:
         self.processor = processor
         self.head_text = str(head_text)
         self.scene_size = (int(scene_size[0]), int(scene_size[1]))
         self.head_size = (int(head_size[0]), int(head_size[1]))
+        self.include_raw_inputs = bool(include_raw_inputs)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         target_label_ids_raw = [x["target_label_ids"] for x in batch]
@@ -136,7 +145,7 @@ class QwenTestCollator:
             text_inputs=[str(t) for t in text_inputs],
             head_text=self.head_text,
         )
-        return {
+        out = {
             "joint_inputs": dict(joint_inputs),
             "joint_bsz": int(len(text_inputs)),
             "gt_points": [x["gt_points"] for x in batch],
@@ -144,3 +153,8 @@ class QwenTestCollator:
             "target_label_ids": target_label_ids,
             "target_label_text": [x["target_label_text"] for x in batch],
         }
+        if self.include_raw_inputs:
+            out["scene_images"] = list(scene_images)
+            out["head_images"] = list(head_images)
+            out["text_inputs"] = [str(t) for t in text_inputs]
+        return out

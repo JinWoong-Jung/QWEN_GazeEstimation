@@ -28,6 +28,7 @@ train:
   num_workers: 4
   show_tqdm: true
   train_log_soft_point_dist: false
+  collator_include_raw_inputs: false
   run_test: true
   lr: 1.0e-4
   weight_decay: 0.01

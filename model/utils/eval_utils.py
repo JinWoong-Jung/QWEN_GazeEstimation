@@ -20,7 +20,7 @@ def run_eval(
     sums: dict[str, float] = {"loss": 0.0, "l_hm": 0.0, "l_cls": 0.0, "dist": 0.0}
     cls_correct = 0
     cls_total = 0
-    steps = 0
+    sample_count = 0
 
     with torch.no_grad():
         eval_iter = tqdm(
@@ -65,14 +65,15 @@ def run_eval(
                 )
 
             loss_dict = out.get("loss_dict", {})
-            sums["loss"] += float(loss_dict.get("loss", out["loss"]).detach().item())
-            sums["l_hm"] += float(loss_dict.get("l_hm", torch.tensor(0.0)).detach().item())
+            batch_size = int(target_point.shape[0])
+            sums["loss"] += float(loss_dict.get("loss", out["loss"]).detach().item()) * float(batch_size)
+            sums["l_hm"] += float(loss_dict.get("l_hm", torch.tensor(0.0)).detach().item()) * float(batch_size)
             if "l_cls" in loss_dict:
-                sums["l_cls"] += float(loss_dict["l_cls"].detach().item())
+                sums["l_cls"] += float(loss_dict["l_cls"].detach().item()) * float(batch_size)
             pred_point = out["point_hard"].detach().to(dtype=torch.float32)
             tgt_point = target_point.detach().to(dtype=torch.float32)
-            dist = torch.linalg.norm(pred_point - tgt_point, dim=-1).mean()
-            sums["dist"] += float(dist.item())
+            dist_per_sample = torch.linalg.norm(pred_point - tgt_point, dim=-1)
+            sums["dist"] += float(dist_per_sample.sum().item())
 
             if "logits" in out:
                 valid = target_label >= 0
@@ -81,13 +82,13 @@ def run_eval(
                     gt = target_label[valid]
                     cls_correct += int((pred == gt).sum().item())
                     cls_total += int(valid.sum().item())
-            steps += 1
+            sample_count += batch_size
             if show_tqdm:
-                eval_iter.set_postfix(loss=f"{(sums['loss'] / max(steps, 1)):.4f}")
+                eval_iter.set_postfix(loss=f"{(sums['loss'] / max(sample_count, 1)):.4f}")
 
-    if steps == 0:
+    if sample_count == 0:
         return {"loss": 0.0, "l_hm": 0.0, "l_cls": 0.0, "dist": 0.0, "cls_acc": 0.0}
-    out = {k: v / steps for k, v in sums.items()}
+    out = {k: v / float(sample_count) for k, v in sums.items()}
     out["cls_acc"] = (cls_correct / cls_total) if cls_total > 0 else 0.0
     return out
 
@@ -143,11 +144,13 @@ def run_test_metrics(
     desc: str = "Test",
     acc_dist_threshold: float = 0.15,
 ) -> dict[str, float]:
-    _ = float(acc_dist_threshold)  # kept for CLI compatibility
+    dist_thr = max(0.0, float(acc_dist_threshold))
     model.eval()
     aucs: list[float] = []
     avg_l2s: list[float] = []
     min_l2s: list[float] = []
+    dist_acc_correct = 0
+    dist_acc_total = 0
     cls_acc1_correct = 0
     cls_acc3_correct = 0
     cls_total = 0
@@ -205,7 +208,10 @@ def run_test_metrics(
                 if auc is not None:
                     aucs.append(auc)
                 avg_l2s.append(_avg_l2(pred, gt_list))
-                min_l2s.append(_min_l2(pred, gt_list))
+                min_l2 = _min_l2(pred, gt_list)
+                min_l2s.append(min_l2)
+                dist_acc_total += 1
+                dist_acc_correct += int(min_l2 <= dist_thr)
 
                 if logits_cpu is not None:
                     gt_single = int(target_label[i].item())
@@ -230,6 +236,7 @@ def run_test_metrics(
                 test_iter.set_postfix(
                     AUC=f"{(sum(aucs) / max(len(aucs), 1)):.4f}",
                     MinL2=f"{(sum(min_l2s) / max(len(min_l2s), 1)):.4f}",
+                    DistAcc=f"{(dist_acc_correct / max(dist_acc_total, 1)):.4f}",
                 )
 
     if n == 0:
@@ -237,9 +244,11 @@ def run_test_metrics(
             "AUC": 0.0,
             "Avg L2": 0.0,
             "Min L2": 0.0,
+            "Acc@Dist": 0.0,
             "Acc@1": 0.0,
             "Acc@3": 0.0,
             "multiAcc@1": 0.0,
+            "acc_dist_threshold": float(dist_thr),
             "num_samples": 0.0,
         }
 
@@ -247,18 +256,22 @@ def run_test_metrics(
         "AUC": float(sum(aucs) / max(len(aucs), 1)),
         "Avg L2": float(sum(avg_l2s) / len(avg_l2s)),
         "Min L2": float(sum(min_l2s) / len(min_l2s)),
+        "Acc@Dist": float(dist_acc_correct / dist_acc_total) if dist_acc_total > 0 else 0.0,
         "Acc@1": float(cls_acc1_correct / cls_total) if cls_total > 0 else 0.0,
         "Acc@3": float(cls_acc3_correct / cls_total) if cls_total > 0 else 0.0,
         "multiAcc@1": float(multi_acc1_correct / multi_total) if multi_total > 0 else 0.0,
+        "acc_dist_threshold": float(dist_thr),
         "num_samples": float(n),
     }
 
 
 def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
+    dist_thr = float(test_metrics.get("acc_dist_threshold", 0.15))
     rows = [
         ("AUC", float(test_metrics.get("AUC", 0.0))),
         ("Avg L2", float(test_metrics.get("Avg L2", 0.0))),
         ("Min L2", float(test_metrics.get("Min L2", 0.0))),
+        (f"Acc@Dist<= {dist_thr:.3f}", float(test_metrics.get("Acc@Dist", 0.0))),
         ("Acc@1", float(test_metrics.get("Acc@1", 0.0))),
         ("Acc@3", float(test_metrics.get("Acc@3", 0.0))),
         ("multiAcc@1", float(test_metrics.get("multiAcc@1", 0.0))),
