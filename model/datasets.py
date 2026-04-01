@@ -1,92 +1,140 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from torch.utils.data import Dataset
 
-from .recognition_objectives import is_embedding_recognition_objective
 from .utils.data_utils import (
     Record,
     TestGroup,
     apply_train_augmentation,
     build_prompt,
-    gaussian_heatmap,
     sanitize_bbox_pixels,
 )
+
+
+def _format_target_text(
+    label_text: str,
+    label_id: int,
+    id2label: dict[int, str] | None,
+    vocab2id: dict[str, int] | None,
+    vocab2id_lower: dict[str, int] | None,
+    num_classes: int,
+    answer_template: str,
+    fallback_target_text: str,
+    fallback_object_id: int,
+    point_x: float,
+    point_y: float,
+    point_decimals: int,
+) -> tuple[str, float]:
+    def _clamp01(x: float) -> float:
+        return max(0.0, min(1.0, float(x)))
+
+    raw = str(label_text or "").strip()
+    if not raw and (id2label is not None) and int(label_id) >= 0:
+        raw = str(id2label.get(int(label_id), "")).strip()
+    if not raw:
+        raw = str(fallback_target_text)
+
+    obj_id = int(label_id)
+    if obj_id < 0:
+        v = vocab2id or {}
+        vl = vocab2id_lower or {}
+        if raw in v:
+            obj_id = int(v[raw])
+        else:
+            obj_id = int(vl.get(raw.lower(), -1))
+
+    if int(num_classes) > 0:
+        is_valid_obj = 0 <= int(obj_id) < int(num_classes)
+    else:
+        is_valid_obj = int(obj_id) >= 0
+    is_valid = 1.0 if is_valid_obj else 0.0
+    if not is_valid_obj:
+        obj_id = int(fallback_object_id)
+
+    dec = max(0, int(point_decimals))
+    px = f"{_clamp01(point_x):.{dec}f}"
+    py = f"{_clamp01(point_y):.{dec}f}"
+    tpl = str(answer_template or "Point: {point_x} {point_y}\nObjectID: {object_id}")
+    try:
+        text = tpl.format(
+            label_text=raw,
+            label_id=int(label_id),
+            point_x=px,
+            point_y=py,
+            object_id=int(obj_id),
+        )
+    except Exception:
+        text = f"Point: {px} {py}\nObjectID: {int(obj_id)}"
+    return str(text), float(is_valid)
+
+
+def _draw_head_bbox_prompt(
+    scene: Image.Image,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+) -> Image.Image:
+    w, h = scene.size
+    # Draw inclusive rectangle coordinates, clamped to valid image extent.
+    rx1 = max(0, min(int(x1), max(w - 1, 0)))
+    ry1 = max(0, min(int(y1), max(h - 1, 0)))
+    rx2 = max(0, min(int(x2) - 1, max(w - 1, 0)))
+    ry2 = max(0, min(int(y2) - 1, max(h - 1, 0)))
+    if (rx2 <= rx1) or (ry2 <= ry1):
+        return scene
+
+    side = max(1, min(w, h))
+    line_w = max(2, int(round(float(side) * 0.006)))
+    out = scene.copy()
+    draw = ImageDraw.Draw(out)
+    draw.rectangle([rx1, ry1, rx2, ry2], outline=(255, 0, 0), width=line_w)
+    return out
 
 
 class GazeDataset(Dataset):
     def __init__(
         self,
         records: list[Record],
-        heatmap_size: tuple[int, int],
-        heatmap_sigma: float,
         prompt_template: str,
         prompt_text: str = "",
         apply_augmentation: bool = False,
-        recognition_objective: str = "ce",
-        label_embed_dir: Path | None = None,
-        label_emb_dim: int = 512,
-        normalize_label_emb: bool = True,
+        id2label: dict[int, str] | None = None,
+        vocab2id: dict[str, int] | None = None,
+        vocab2id_lower: dict[str, int] | None = None,
+        num_classes: int = 0,
+        answer_template: str = "Point: {point_x} {point_y}\nObjectID: {object_id}",
+        fallback_target_text: str = "unknown",
+        fallback_object_id: int = -1,
+        point_decimals: int = 4,
+        visual_prompting: bool = False,
     ) -> None:
         self.records = records
-        self.heatmap_size = (int(heatmap_size[0]), int(heatmap_size[1]))
-        self.heatmap_sigma = float(heatmap_sigma)
         self.prompt_template = str(prompt_template or "")
         self.prompt_text = str(prompt_text or "")
         self.apply_augmentation = bool(apply_augmentation)
-        self.recognition_objective = str(recognition_objective).strip().lower()
-        self.label_embed_dir = label_embed_dir
-        self.label_emb_dim = int(label_emb_dim)
-        self.normalize_label_emb = bool(normalize_label_emb)
-        self._label_emb_cache: dict[str, torch.Tensor] = {}
-        self._label_emb_warn_count = 0
+        self.id2label = id2label or {}
+        self.vocab2id = vocab2id or {}
+        self.vocab2id_lower = vocab2id_lower or {}
+        self.num_classes = int(num_classes)
+        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObjectID: {object_id}")
+        self.fallback_target_text = str(fallback_target_text)
+        self.fallback_object_id = int(fallback_object_id)
+        self.point_decimals = int(point_decimals)
+        self.visual_prompting = bool(visual_prompting)
 
     def __len__(self) -> int:
         return len(self.records)
-
-    def _warn_label_emb(self, msg: str) -> None:
-        if self._label_emb_warn_count < 20:
-            print(f"[GazeDataset][label_emb] {msg}")
-            self._label_emb_warn_count += 1
-            if self._label_emb_warn_count == 20:
-                print("[GazeDataset][label_emb] warning log limit reached; suppressing further messages.")
-
-    def _load_label_embedding(self, label_text: str) -> torch.Tensor:
-        txt = str(label_text).strip()
-        if not txt:
-            return torch.zeros((self.label_emb_dim,), dtype=torch.float32)
-        if txt in self._label_emb_cache:
-            return self._label_emb_cache[txt].clone()
-        if self.label_embed_dir is None:
-            return torch.zeros((self.label_emb_dim,), dtype=torch.float32)
-        p = self.label_embed_dir / f"{txt}-emb.pt"
-        if not p.exists():
-            self._warn_label_emb(f"missing embedding file: {p}")
-            return torch.zeros((self.label_emb_dim,), dtype=torch.float32)
-        try:
-            emb = torch.load(p, map_location="cpu")
-            if not torch.is_tensor(emb):
-                raise TypeError(f"not tensor: {type(emb)}")
-            emb = emb.to(dtype=torch.float32).flatten()
-            if emb.numel() != self.label_emb_dim:
-                raise ValueError(f"dim mismatch: got {emb.numel()}, expected {self.label_emb_dim}")
-            if self.normalize_label_emb:
-                emb = F.normalize(emb.unsqueeze(0), p=2, dim=-1).squeeze(0)
-            self._label_emb_cache[txt] = emb
-            return emb.clone()
-        except Exception as e:
-            self._warn_label_emb(f"failed to load {p}: {e}")
-            return torch.zeros((self.label_emb_dim,), dtype=torch.float32)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rec = self.records[idx]
         with Image.open(rec.image_path) as img:
             scene = img.convert("RGB")
+
         gaze_x = float(rec.gaze_x)
         gaze_y = float(rec.gaze_y)
         bbox_px = rec.bbox_px
@@ -100,31 +148,33 @@ class GazeDataset(Dataset):
 
         w, h = scene.size
         x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
-        head = scene.crop((x1, y1, x2, y2))
+        if self.visual_prompting:
+            scene = _draw_head_bbox_prompt(scene, x1=x1, y1=y1, x2=x2, y2=y2)
         bbox_norm = (x1 / w, y1 / h, x2 / w, y2 / h)
         prompt = build_prompt(bbox_norm, self.prompt_template, self.prompt_text)
-        heatmap = gaussian_heatmap(
-            x_norm=gaze_x,
-            y_norm=gaze_y,
-            size=self.heatmap_size,
-            sigma=self.heatmap_sigma,
+        target_text, target_valid = _format_target_text(
+            label_text=rec.label_text,
+            label_id=int(rec.label_id),
+            id2label=self.id2label,
+            vocab2id=self.vocab2id,
+            vocab2id_lower=self.vocab2id_lower,
+            num_classes=self.num_classes,
+            answer_template=self.answer_template,
+            fallback_target_text=self.fallback_target_text,
+            fallback_object_id=self.fallback_object_id,
+            point_x=float(gaze_x),
+            point_y=float(gaze_y),
+            point_decimals=self.point_decimals,
         )
-        if is_embedding_recognition_objective(self.recognition_objective):
-            target_label_emb = self._load_label_embedding(rec.label_text)
-            target_label_valid = float((target_label_emb.abs().sum().item() > 0.0) and bool(rec.label_text.strip()))
-        else:
-            target_label_emb = torch.zeros((self.label_emb_dim,), dtype=torch.float32)
-            target_label_valid = 0.0
 
         return {
             "scene_image": scene,
-            "head_image": head,
             "text_input": prompt,
-            "target_point": torch.tensor([gaze_x, gaze_y], dtype=torch.float32),
-            "target_heatmap": heatmap,
+            "target_text": target_text,
+            "target_text_valid": torch.tensor(target_valid, dtype=torch.float32),
+            "target_point_valid": torch.tensor(1.0, dtype=torch.float32),
+            "target_object_valid": torch.tensor(target_valid, dtype=torch.float32),
             "target_label": int(rec.label_id),
-            "target_label_emb": target_label_emb,
-            "target_label_valid": torch.tensor(target_label_valid, dtype=torch.float32),
         }
 
 
@@ -134,10 +184,28 @@ class GazeTestDataset(Dataset):
         groups: list[TestGroup],
         prompt_template: str,
         prompt_text: str,
+        id2label: dict[int, str] | None = None,
+        vocab2id: dict[str, int] | None = None,
+        vocab2id_lower: dict[str, int] | None = None,
+        num_classes: int = 0,
+        answer_template: str = "Point: {point_x} {point_y}\nObjectID: {object_id}",
+        fallback_target_text: str = "unknown",
+        fallback_object_id: int = -1,
+        point_decimals: int = 4,
+        visual_prompting: bool = False,
     ) -> None:
         self.groups = groups
         self.prompt_template = str(prompt_template or "")
         self.prompt_text = str(prompt_text or "")
+        self.id2label = id2label or {}
+        self.vocab2id = vocab2id or {}
+        self.vocab2id_lower = vocab2id_lower or {}
+        self.num_classes = int(num_classes)
+        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObjectID: {object_id}")
+        self.fallback_target_text = str(fallback_target_text)
+        self.fallback_object_id = int(fallback_object_id)
+        self.point_decimals = int(point_decimals)
+        self.visual_prompting = bool(visual_prompting)
 
     def __len__(self) -> int:
         return len(self.groups)
@@ -149,16 +217,41 @@ class GazeTestDataset(Dataset):
         w, h = scene.size
 
         x1, y1, x2, y2 = sanitize_bbox_pixels(g.bbox_px, width=w, height=h)
-        head = scene.crop((x1, y1, x2, y2))
+        if self.visual_prompting:
+            scene = _draw_head_bbox_prompt(scene, x1=x1, y1=y1, x2=x2, y2=y2)
         bbox_norm = (x1 / w, y1 / h, x2 / w, y2 / h)
         prompt = build_prompt(bbox_norm, self.prompt_template, self.prompt_text)
+        if g.gt_points:
+            px = sum(float(x) for x, _ in g.gt_points) / float(len(g.gt_points))
+            py = sum(float(y) for _, y in g.gt_points) / float(len(g.gt_points))
+        else:
+            px, py = 0.5, 0.5
+        target_text, target_valid = _format_target_text(
+            label_text=g.label_text,
+            label_id=int(g.label_id),
+            id2label=self.id2label,
+            vocab2id=self.vocab2id,
+            vocab2id_lower=self.vocab2id_lower,
+            num_classes=self.num_classes,
+            answer_template=self.answer_template,
+            fallback_target_text=self.fallback_target_text,
+            fallback_object_id=self.fallback_object_id,
+            point_x=px,
+            point_y=py,
+            point_decimals=self.point_decimals,
+        )
 
         return {
             "scene_image": scene,
-            "head_image": head,
             "text_input": prompt,
-            "gt_points": torch.tensor(g.gt_points, dtype=torch.float32),
+            "target_text": target_text,
+            "target_text_valid": torch.tensor(target_valid, dtype=torch.float32),
+            "target_point_valid": torch.tensor(1.0, dtype=torch.float32),
+            "target_object_valid": torch.tensor(target_valid, dtype=torch.float32),
             "target_label": int(g.label_id),
-            "target_label_ids": torch.tensor(g.label_ids, dtype=torch.long),
+            "target_label_ids": [int(x) for x in (g.label_ids or []) if int(x) >= 0],
+            "target_point": torch.tensor([float(px), float(py)], dtype=torch.float32),
+            "gt_points": torch.tensor(g.gt_points, dtype=torch.float32),
             "target_label_text": str(g.label_text),
+            "image_rel": str(g.image_rel),
         }

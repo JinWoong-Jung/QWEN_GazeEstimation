@@ -1,11 +1,98 @@
 from __future__ import annotations
 
+import math
+import re
 from typing import Any
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+
+from .loss_utils import compute_structured_losses
+
+
+def _move_joint_inputs_to_device(joint_inputs: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in joint_inputs.items():
+        out[k] = v.to(device) if hasattr(v, "to") else v
+    return out
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _decode_generated_text(
+    processor: Any,
+    generated_ids: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    num_return_sequences: int = 1,
+) -> list[str]:
+    preds: list[str] = []
+    tok = getattr(processor, "tokenizer", None)
+    nrs = max(1, int(num_return_sequences))
+    bsz = int(input_ids.shape[0]) if torch.is_tensor(input_ids) and input_ids.dim() >= 2 else 0
+    for i in range(generated_ids.shape[0]):
+        src_i = (i // nrs) if bsz > 0 else i
+        if bsz > 0:
+            src_i = min(max(0, int(src_i)), bsz - 1)
+        if attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dim() >= 2 and bsz > 0:
+            start = int(attention_mask[src_i].sum().item())
+        else:
+            start = int(input_ids.shape[1])
+        new_tokens = generated_ids[i, start:]
+        if tok is not None:
+            txt = tok.decode(new_tokens, skip_special_tokens=True)
+        else:
+            txt = str(new_tokens.tolist())
+        preds.append(str(txt).strip())
+    return preds
+
+
+def _parse_object_id(text: str) -> int | None:
+    m = re.search(r"(?im)^\s*objectid\s*:\s*(-?\d+)\s*$", str(text or ""))
+    if m is None:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _parse_point_xy(text: str) -> tuple[float, float] | None:
+    num = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    m = re.search(rf"(?im)^\s*point\s*:\s*({num})\s*[,\s]+\s*({num})\b", str(text or ""))
+    if m is None:
+        return None
+    try:
+        return float(m.group(1)), float(m.group(2))
+    except Exception:
+        return None
+
+
+def _avg_min_l2_to_gt_points(
+    pred_xy: tuple[float, float],
+    gt_points: torch.Tensor,
+) -> tuple[float, float] | None:
+    if (not torch.is_tensor(gt_points)) or gt_points.numel() < 2:
+        return None
+    if int(gt_points.numel()) % 2 != 0:
+        return None
+    pts = gt_points.to(dtype=torch.float32).view(-1, 2)
+    if int(pts.shape[0]) <= 0:
+        return None
+
+    px = float(pred_xy[0])
+    py = float(pred_xy[1])
+    dists: list[float] = []
+    for j in range(int(pts.shape[0])):
+        dx = px - float(pts[j, 0].item())
+        dy = py - float(pts[j, 1].item())
+        dists.append(math.sqrt(dx * dx + dy * dy))
+    if not dists:
+        return None
+    return float(sum(dists) / len(dists)), float(min(dists))
 
 
 def run_eval(
@@ -13,13 +100,18 @@ def run_eval(
     loader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype,
+    loss_answer_weight: float = 0.0,
+    loss_localization_weight: float = 1.0,
+    loss_recognition_weight: float = 1.0,
+    loss_use_lm_fallback: bool = False,
     show_tqdm: bool = True,
     desc: str = "Eval",
 ) -> dict[str, float]:
     model.eval()
-    sums: dict[str, float] = {"loss": 0.0, "l_hm": 0.0, "l_cls": 0.0, "dist": 0.0}
-    cls_correct = 0
-    cls_total = 0
+    loss_sum = 0.0
+    answer_loss_sum = 0.0
+    loc_loss_sum = 0.0
+    rec_loss_sum = 0.0
     sample_count = 0
 
     with torch.no_grad():
@@ -31,19 +123,11 @@ def run_eval(
             disable=not show_tqdm,
         )
         for batch in eval_iter:
-            target_heatmap = batch["target_heatmap"].to(device)
-            target_label = batch["target_label"].to(device)
-            target_label_emb = batch["target_label_emb"].to(device)
-            target_label_valid = batch["target_label_valid"].to(device)
-            target_point = batch["target_point"].to(device)
-            use_cls_id = bool(torch.any(target_label >= 0).item())
-            use_cls_emb = bool(torch.any(target_label_valid > 0).item())
-            backbone_kwargs = None
-            if "joint_inputs" in batch:
-                backbone_kwargs = {
-                    "joint_inputs": batch["joint_inputs"],
-                    "joint_bsz": int(batch.get("joint_bsz", len(batch.get("text_inputs", [])))),
-                }
+            joint_inputs = _move_joint_inputs_to_device(batch["joint_inputs"], device=device)
+            labels = batch["labels"].to(device)
+            bsz = int(labels.shape[0])
+            if torch.all(labels.eq(-100)):
+                continue
 
             with torch.autocast(
                 device_type=device.type,
@@ -51,88 +135,43 @@ def run_eval(
                 enabled=(device.type == "cuda"),
             ):
                 out = model(
-                    scene_image=batch.get("scene_images", None),
-                    head_image=batch.get("head_images", None),
-                    text_inputs=batch.get("text_inputs", None),
-                    target_heatmap=target_heatmap,
-                    target_label=target_label if use_cls_id else None,
-                    target_label_emb=target_label_emb if use_cls_emb else None,
-                    target_label_valid=target_label_valid if use_cls_emb else None,
-                    use_softargmax=False,
-                    compute_point_soft=False,
-                    compute_point_hard=True,
-                    backbone_kwargs=backbone_kwargs,
+                    joint_inputs=joint_inputs,
+                    labels=labels,
+                    use_cache=False,
                 )
+            loss = out.get("loss", None)
+            if loss is None:
+                raise RuntimeError("Model forward must return loss during evaluation.")
+            structured = compute_structured_losses(
+                logits=out.get("logits", None),
+                labels=labels,
+                loss_mask_answer=batch.get("loss_mask_answer", None),
+                loss_mask_point=batch.get("loss_mask_point", None),
+                loss_mask_objectid=batch.get("loss_mask_objectid", None),
+                weight_answer=float(loss_answer_weight),
+                weight_point=float(loss_localization_weight),
+                weight_objectid=float(loss_recognition_weight),
+                fallback_loss=(loss if bool(loss_use_lm_fallback) else None),
+            )
+            eval_loss = structured["loss"]
 
-            loss_dict = out.get("loss_dict", {})
-            batch_size = int(target_point.shape[0])
-            sums["loss"] += float(loss_dict.get("loss", out["loss"]).detach().item()) * float(batch_size)
-            sums["l_hm"] += float(loss_dict.get("l_hm", torch.tensor(0.0)).detach().item()) * float(batch_size)
-            if "l_cls" in loss_dict:
-                sums["l_cls"] += float(loss_dict["l_cls"].detach().item()) * float(batch_size)
-            pred_point = out["point_hard"].detach().to(dtype=torch.float32)
-            tgt_point = target_point.detach().to(dtype=torch.float32)
-            dist_per_sample = torch.linalg.norm(pred_point - tgt_point, dim=-1)
-            sums["dist"] += float(dist_per_sample.sum().item())
-
-            if "logits" in out:
-                valid = target_label >= 0
-                if torch.any(valid):
-                    pred = out["pred_label"][valid]
-                    gt = target_label[valid]
-                    cls_correct += int((pred == gt).sum().item())
-                    cls_total += int(valid.sum().item())
-            sample_count += batch_size
+            loss_sum += float(eval_loss.detach().item()) * float(bsz)
+            answer_loss_sum += float(structured["loss_answer"].detach().item()) * float(bsz)
+            loc_loss_sum += float(structured["loss_localization"].detach().item()) * float(bsz)
+            rec_loss_sum += float(structured["loss_recognition"].detach().item()) * float(bsz)
+            sample_count += bsz
             if show_tqdm:
-                eval_iter.set_postfix(loss=f"{(sums['loss'] / max(sample_count, 1)):.4f}")
+                eval_iter.set_postfix(loss=f"{(loss_sum / max(sample_count, 1)):.4f}")
 
-    if sample_count == 0:
-        return {"loss": 0.0, "l_hm": 0.0, "l_cls": 0.0, "dist": 0.0, "cls_acc": 0.0}
-    out = {k: v / float(sample_count) for k, v in sums.items()}
-    out["cls_acc"] = (cls_correct / cls_total) if cls_total > 0 else 0.0
-    return out
-
-
-def _auc_from_heatmap(
-    heatmap_2d: torch.Tensor,
-    gt_points: torch.Tensor,
-) -> float | None:
-    h, w = int(heatmap_2d.shape[0]), int(heatmap_2d.shape[1])
-    gt = np.zeros((h, w), dtype=np.uint8)
-    for p in gt_points:
-        x = float(p[0].item())
-        y = float(p[1].item())
-        ix = int(round(max(0.0, min(1.0, x)) * (w - 1)))
-        iy = int(round(max(0.0, min(1.0, y)) * (h - 1)))
-        gt[iy, ix] = 1
-
-    labels = gt.reshape(-1)
-    n_pos = int(labels.sum())
-    n_neg = int(labels.shape[0] - n_pos)
-    if n_pos <= 0 or n_neg <= 0:
-        return None
-
-    scores = heatmap_2d.detach().float().cpu().numpy().reshape(-1)
-    order = np.argsort(scores)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(scores) + 1, dtype=np.float64)
-    pos_ranks = float(ranks[labels == 1].sum())
-    auc = (pos_ranks - (n_pos * (n_pos + 1) / 2.0)) / float(n_pos * n_neg)
-    return float(max(0.0, min(1.0, auc)))
-
-
-def _l2(a: tuple[float, float], b: tuple[float, float]) -> float:
-    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
-
-
-def _min_l2(pred: tuple[float, float], gt_points: list[tuple[float, float]]) -> float:
-    return min(_l2(pred, gt) for gt in gt_points)
-
-
-def _avg_l2(pred: tuple[float, float], gt_points: list[tuple[float, float]]) -> float:
-    mx = sum(x for x, _ in gt_points) / len(gt_points)
-    my = sum(y for _, y in gt_points) / len(gt_points)
-    return _l2(pred, (mx, my))
+    if sample_count <= 0:
+        return {"loss": 0.0, "loss_answer": 0.0, "loss_localization": 0.0, "loss_recognition": 0.0}
+    denom = float(sample_count)
+    return {
+        "loss": float(loss_sum / denom),
+        "loss_answer": float(answer_loss_sum / denom),
+        "loss_localization": float(loc_loss_sum / denom),
+        "loss_recognition": float(rec_loss_sum / denom),
+    }
 
 
 def run_test_metrics(
@@ -140,23 +179,29 @@ def run_test_metrics(
     loader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype,
+    processor: Any,
     show_tqdm: bool = True,
     desc: str = "Test",
-    acc_dist_threshold: float = 0.15,
+    max_new_tokens: int = 16,
+    num_beams: int = 3,
 ) -> dict[str, float]:
-    dist_thr = max(0.0, float(acc_dist_threshold))
     model.eval()
-    aucs: list[float] = []
-    avg_l2s: list[float] = []
-    min_l2s: list[float] = []
-    dist_acc_correct = 0
-    dist_acc_total = 0
-    cls_acc1_correct = 0
-    cls_acc3_correct = 0
-    cls_total = 0
-    multi_acc1_correct = 0
-    multi_total = 0
-    n = 0
+
+    total = 0
+    valid_total = 0
+    exact_match = 0
+    contains_match = 0
+    acc1_num = 0
+    acc1_den = 0
+    acc3_num = 0
+    acc3_den = 0
+    multiacc1_num = 0
+    multiacc1_den = 0
+    object_id_valid_num = 0
+    avg_l2_sum = 0.0
+    min_l2_sum = 0.0
+    l2_den = 0
+    beam_k = max(1, int(num_beams))
 
     with torch.no_grad():
         test_iter = tqdm(
@@ -167,122 +212,170 @@ def run_test_metrics(
             disable=not show_tqdm,
         )
         for batch in test_iter:
-            backbone_kwargs = None
-            if "joint_inputs" in batch:
-                backbone_kwargs = {
-                    "joint_inputs": batch["joint_inputs"],
-                    "joint_bsz": int(batch.get("joint_bsz", len(batch.get("text_inputs", [])))),
-                }
+            joint_inputs = _move_joint_inputs_to_device(batch["joint_inputs"], device=device)
+            target_texts = [str(x) for x in batch.get("target_text", [])]
+            target_valid = batch.get("target_text_valid", None)
+            target_label = batch.get("target_label", None)
+            target_label_ids_batch = batch.get("target_label_ids", None)
+            gt_points_batch = batch.get("gt_points", None)
+            if target_valid is None:
+                target_valid = torch.ones((len(target_texts),), dtype=torch.float32)
+            target_valid = target_valid.to(dtype=torch.float32)
+            if torch.is_tensor(target_label):
+                target_label = target_label.to(dtype=torch.long)
+
             with torch.autocast(
                 device_type=device.type,
                 dtype=amp_dtype,
                 enabled=(device.type == "cuda"),
             ):
-                out = model(
-                    scene_image=batch.get("scene_images", None),
-                    head_image=batch.get("head_images", None),
-                    text_inputs=batch.get("text_inputs", None),
-                    use_softargmax=False,
-                    compute_point_soft=False,
-                    compute_point_hard=True,
-                    backbone_kwargs=backbone_kwargs,
+                generated_ids = model.generate(
+                    joint_inputs=joint_inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    num_beams=beam_k,
+                    num_return_sequences=beam_k,
                 )
 
-            heatmaps = out["heatmap"][:, 0, :, :].detach().cpu()
-            points = out["point_hard"].detach().cpu()
-            gt_points_batch: list[torch.Tensor] = batch["gt_points"]
-            target_label = batch["target_label"].detach().cpu()
-            target_label_ids = batch["target_label_ids"].detach().cpu()
-            logits = out.get("logits", None)
-            logits_cpu = logits.detach().float().cpu() if logits is not None else None
+            preds_flat = _decode_generated_text(
+                processor=processor,
+                generated_ids=generated_ids.detach().cpu(),
+                input_ids=joint_inputs["input_ids"].detach().cpu(),
+                attention_mask=joint_inputs.get("attention_mask", None).detach().cpu()
+                if torch.is_tensor(joint_inputs.get("attention_mask", None))
+                else None,
+                num_return_sequences=beam_k,
+            )
 
-            for i in range(len(gt_points_batch)):
-                gt_t = gt_points_batch[i]
-                if gt_t.numel() == 0:
+            bsz = len(target_texts)
+            preds_by_sample: list[list[str]] = []
+            for i in range(bsz):
+                s = i * beam_k
+                e = s + beam_k
+                cand = preds_flat[s:e]
+                if not cand:
+                    cand = [""]
+                preds_by_sample.append(cand)
+
+            for i, pred_list in enumerate(preds_by_sample):
+                total += 1
+                if i >= len(target_texts):
                     continue
-                gt_list = [(float(p[0].item()), float(p[1].item())) for p in gt_t]
-                pred = (float(points[i, 0].item()), float(points[i, 1].item()))
-                hm = heatmaps[i]
+                pred_top1 = str(pred_list[0]) if pred_list else ""
+                top3_obj: list[int] = []
+                for pred in pred_list:
+                    obj = _parse_object_id(pred)
+                    if (obj is None) or (int(obj) < 0):
+                        continue
+                    obj_i = int(obj)
+                    if obj_i in top3_obj:
+                        continue
+                    top3_obj.append(obj_i)
+                    if len(top3_obj) >= 3:
+                        break
+                pred_obj = int(top3_obj[0]) if top3_obj else None
+                pred_point = _parse_point_xy(pred_top1)
+                if (
+                    pred_point is not None
+                    and isinstance(gt_points_batch, list)
+                    and i < len(gt_points_batch)
+                ):
+                    l2_pair = _avg_min_l2_to_gt_points(pred_point, gt_points_batch[i])
+                    if l2_pair is not None:
+                        avg_l2_sum += float(l2_pair[0])
+                        min_l2_sum += float(l2_pair[1])
+                        l2_den += 1
+                if float(target_valid[i].item()) <= 0.0:
+                    continue
 
-                auc = _auc_from_heatmap(hm, gt_t)
-                if auc is not None:
-                    aucs.append(auc)
-                avg_l2s.append(_avg_l2(pred, gt_list))
-                min_l2 = _min_l2(pred, gt_list)
-                min_l2s.append(min_l2)
-                dist_acc_total += 1
-                dist_acc_correct += int(min_l2 <= dist_thr)
+                tgt_n = _normalize_text(target_texts[i])
+                pred_n = _normalize_text(pred_top1)
+                valid_total += 1
+                exact_match += int(pred_n == tgt_n)
+                contains_match += int((tgt_n != "") and (tgt_n in pred_n))
+                if (pred_obj is not None) and (pred_obj >= 0):
+                    object_id_valid_num += 1
 
-                if logits_cpu is not None:
-                    gt_single = int(target_label[i].item())
-                    logits_i = logits_cpu[i]
-                    k3 = int(min(3, logits_i.numel()))
-                    topk_idx = torch.topk(logits_i, k=max(1, k3), dim=-1).indices
-                    pred_top1 = int(topk_idx[0].item())
+                gt_obj = -1
+                if torch.is_tensor(target_label):
+                    gt_obj = int(target_label[i].item())
+                    if gt_obj >= 0:
+                        acc1_den += 1
+                        acc3_den += 1
+                        acc1_num += int((pred_obj is not None) and (int(pred_obj) == gt_obj))
+                        acc3_num += int(gt_obj in top3_obj)
 
-                    if gt_single >= 0:
-                        cls_total += 1
-                        cls_acc1_correct += int(pred_top1 == gt_single)
-                        cls_acc3_correct += int(bool((topk_idx == gt_single).any().item()))
+                gt_multi: list[int] = []
+                if isinstance(target_label_ids_batch, list) and i < len(target_label_ids_batch):
+                    raw_multi = target_label_ids_batch[i]
+                    if isinstance(raw_multi, list):
+                        gt_multi = [int(x) for x in raw_multi if int(x) >= 0]
+                if (not gt_multi) and (gt_obj >= 0):
+                    gt_multi = [int(gt_obj)]
+                if gt_multi:
+                    multiacc1_den += 1
+                    multiacc1_num += int((pred_obj is not None) and (int(pred_obj) in set(gt_multi)))
 
-                    gt_multi = target_label_ids[i]
-                    valid_multi = gt_multi[gt_multi >= 0]
-                    if valid_multi.numel() > 0:
-                        multi_total += 1
-                        multi_acc1_correct += int(bool((valid_multi == pred_top1).any().item()))
-                n += 1
-
-            if show_tqdm and n > 0:
+            if show_tqdm and valid_total > 0:
                 test_iter.set_postfix(
-                    AUC=f"{(sum(aucs) / max(len(aucs), 1)):.4f}",
-                    MinL2=f"{(sum(min_l2s) / max(len(min_l2s), 1)):.4f}",
-                    DistAcc=f"{(dist_acc_correct / max(dist_acc_total, 1)):.4f}",
+                    l2=f"{(avg_l2_sum / max(l2_den, 1)):.4f}",
+                    acc1=f"{(acc1_num / max(acc1_den, 1)):.4f}",
+                    acc3=f"{(acc3_num / max(acc3_den, 1)):.4f}",
                 )
 
-    if n == 0:
+    if total <= 0:
         return {
-            "AUC": 0.0,
+            "ExactMatch": 0.0,
+            "Contains": 0.0,
             "Avg L2": 0.0,
             "Min L2": 0.0,
-            "Acc@Dist": 0.0,
-            "Acc@1": 0.0,
-            "Acc@3": 0.0,
-            "multiAcc@1": 0.0,
-            "acc_dist_threshold": float(dist_thr),
+            "PointL2": 0.0,
+            "acc@1": 0.0,
+            "acc@3": 0.0,
+            "multiacc@1": 0.0,
+            "ObjectIDValidRate": 0.0,
             "num_samples": 0.0,
+            "num_valid_targets": 0.0,
         }
 
     return {
-        "AUC": float(sum(aucs) / max(len(aucs), 1)),
-        "Avg L2": float(sum(avg_l2s) / len(avg_l2s)),
-        "Min L2": float(sum(min_l2s) / len(min_l2s)),
-        "Acc@Dist": float(dist_acc_correct / dist_acc_total) if dist_acc_total > 0 else 0.0,
-        "Acc@1": float(cls_acc1_correct / cls_total) if cls_total > 0 else 0.0,
-        "Acc@3": float(cls_acc3_correct / cls_total) if cls_total > 0 else 0.0,
-        "multiAcc@1": float(multi_acc1_correct / multi_total) if multi_total > 0 else 0.0,
-        "acc_dist_threshold": float(dist_thr),
-        "num_samples": float(n),
+        "ExactMatch": float(exact_match / max(valid_total, 1)),
+        "Contains": float(contains_match / max(valid_total, 1)),
+        "Avg L2": float(avg_l2_sum / max(l2_den, 1)),
+        "Min L2": float(min_l2_sum / max(l2_den, 1)),
+        "PointL2": float(avg_l2_sum / max(l2_den, 1)),
+        "acc@1": float(acc1_num / max(acc1_den, 1)),
+        "acc@3": float(acc3_num / max(acc3_den, 1)),
+        "multiacc@1": float(multiacc1_num / max(multiacc1_den, 1)),
+        "ObjectIDValidRate": float(object_id_valid_num / max(valid_total, 1)),
+        "num_samples": float(total),
+        "num_valid_targets": float(valid_total),
     }
 
 
 def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
-    dist_thr = float(test_metrics.get("acc_dist_threshold", 0.15))
     rows = [
-        ("AUC", float(test_metrics.get("AUC", 0.0))),
-        ("Avg L2", float(test_metrics.get("Avg L2", 0.0))),
+        ("ExactMatch", float(test_metrics.get("ExactMatch", 0.0))),
+        ("Contains", float(test_metrics.get("Contains", 0.0))),
+        ("Avg L2", float(test_metrics.get("Avg L2", test_metrics.get("PointL2", 0.0)))),
         ("Min L2", float(test_metrics.get("Min L2", 0.0))),
-        (f"Acc@Dist<= {dist_thr:.3f}", float(test_metrics.get("Acc@Dist", 0.0))),
-        ("Acc@1", float(test_metrics.get("Acc@1", 0.0))),
-        ("Acc@3", float(test_metrics.get("Acc@3", 0.0))),
-        ("multiAcc@1", float(test_metrics.get("multiAcc@1", 0.0))),
+        ("acc@1", float(test_metrics.get("acc@1", 0.0))),
+        ("acc@3", float(test_metrics.get("acc@3", 0.0))),
+        ("multiacc@1", float(test_metrics.get("multiacc@1", 0.0))),
+        ("ObjectIDValidRate", float(test_metrics.get("ObjectIDValidRate", 0.0))),
+        ("num_samples", float(test_metrics.get("num_samples", 0.0))),
+        ("num_valid_targets", float(test_metrics.get("num_valid_targets", 0.0))),
     ]
     key_w = max(len(k) for k, _ in rows)
-    val_w = 10
+    val_w = 12
     line = "+" + "-" * (key_w + 2) + "+" + "-" * (val_w + 2) + "+"
-    print("[TEST] metrics")
+    print("[TEST] text metrics")
     print(line)
     print(f"| {'Metric'.ljust(key_w)} | {'Value'.rjust(val_w)} |")
     print(line)
     for k, v in rows:
-        print(f"| {k.ljust(key_w)} | {v:>{val_w}.6f} |")
+        if k.startswith("num_"):
+            print(f"| {k.ljust(key_w)} | {v:>{val_w}.0f} |")
+        else:
+            print(f"| {k.ljust(key_w)} | {v:>{val_w}.6f} |")
     print(line)

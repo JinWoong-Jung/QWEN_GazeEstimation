@@ -7,6 +7,14 @@ from typing import Any
 import torch
 
 
+def _resolve_qwen_model(model: Any) -> Any:
+    if hasattr(model, "qwen"):
+        return model.qwen
+    if hasattr(model, "backbone") and hasattr(model.backbone, "qwen"):
+        return model.backbone.qwen
+    raise AttributeError("Could not resolve qwen model from checkpoint target.")
+
+
 def save_checkpoint(
     ckpt_dir: Path,
     epoch: int,
@@ -27,22 +35,15 @@ def save_checkpoint(
                     pass
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    qwen_model = model.backbone.qwen
+    qwen_model = _resolve_qwen_model(model)
     if hasattr(qwen_model, "save_pretrained"):
         qwen_model.save_pretrained(str(ckpt_dir / "lora_adapter"))
     if hasattr(processor, "save_pretrained"):
         processor.save_pretrained(str(ckpt_dir / "processor"))
 
-    aux_state = {
-        "summary": model.summary.state_dict(),
-        "conditioner": model.conditioner.state_dict(),
-        "localizer": model.localizer.state_dict(),
-        "classifier": model.classifier.state_dict() if model.classifier is not None else None,
-    }
-    torch.save(aux_state, ckpt_dir / "heads.pt")
     torch.save(
         {
-            "epoch": epoch,
+            "epoch": int(epoch),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
         },
@@ -60,42 +61,27 @@ def load_checkpoint_for_eval(
         return False
 
     adapter_dir = ckpt_dir / "lora_adapter"
-    qwen_model = model.backbone.qwen
-    if adapter_dir.exists() and hasattr(qwen_model, "load_adapter"):
-        adapter_name = "best_eval"
-        try:
-            qwen_model.load_adapter(
-                str(adapter_dir),
-                adapter_name=adapter_name,
-                is_trainable=False,
-            )
-        except Exception:
-            # Adapter may already exist (e.g., repeated reload in same process); try to switch to it.
-            pass
-        try:
-            if hasattr(qwen_model, "set_adapter"):
-                qwen_model.set_adapter(adapter_name)
-            loaded_any = True
-        except Exception:
-            pass
+    if adapter_dir.exists():
+        qwen_model = _resolve_qwen_model(model)
+        if hasattr(qwen_model, "load_adapter"):
+            adapter_name = "best_eval"
+            try:
+                qwen_model.load_adapter(
+                    str(adapter_dir),
+                    adapter_name=adapter_name,
+                    is_trainable=False,
+                )
+            except Exception:
+                pass
+            try:
+                if hasattr(qwen_model, "set_adapter"):
+                    qwen_model.set_adapter(adapter_name)
+                loaded_any = True
+            except Exception:
+                pass
 
-    heads_path = ckpt_dir / "heads.pt"
-    if heads_path.exists():
-        aux_state = torch.load(heads_path, map_location=device)
-        if isinstance(aux_state, dict):
-            if "summary" in aux_state:
-                model.summary.load_state_dict(aux_state["summary"], strict=True)
-                loaded_any = True
-            if "conditioner" in aux_state:
-                model.conditioner.load_state_dict(aux_state["conditioner"], strict=True)
-                loaded_any = True
-            if "localizer" in aux_state:
-                model.localizer.load_state_dict(aux_state["localizer"], strict=True)
-                loaded_any = True
-            if model.classifier is not None and aux_state.get("classifier") is not None:
-                try:
-                    model.classifier.load_state_dict(aux_state["classifier"], strict=True)
-                except Exception:
-                    model.classifier.load_state_dict(aux_state["classifier"], strict=False)
-                loaded_any = True
+    trainer_state_path = ckpt_dir / "trainer_state.pt"
+    if trainer_state_path.exists():
+        _ = torch.load(trainer_state_path, map_location=device)
+        loaded_any = True
     return loaded_any

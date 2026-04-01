@@ -1,3 +1,6 @@
-from .model import QwenGazeIntegratedModel
+from .model import QwenTextGenerationModel
 
-__all__ = ["QwenGazeIntegratedModel"]
+# Backward-compatible export name.
+QwenGazeIntegratedModel = QwenTextGenerationModel
+
+__all__ = ["QwenTextGenerationModel", "QwenGazeIntegratedModel"]

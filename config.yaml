@@ -8,8 +8,10 @@ paths:
   train_labels: "data/gazefollow/gaze-labels-train.csv"
   val_labels: "data/gazefollow/gaze-labels-val.csv"
   test_labels: "data/gazefollow/gaze-labels-test.csv"
+  labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
+  labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
-  output_dir: "checkpoints/gaze_lora"
+  output_dir: "checkpoints/qwen_text_only"
 
 data:
   split_prefix: "train/"
@@ -17,6 +19,9 @@ data:
   max_train_samples: 0
   max_val_samples: 0
   max_test_samples: 0
+  test_start_index: 0
+  test_num_samples: 0
+  test_only: false
   test_split_prefix: "test2/"
   test_strip_split_prefix: true
   test_bbox_round_decimals: 3
@@ -24,15 +29,15 @@ data:
 train:
   batch_size: 8
   test_batch_size: 8
-  epochs: 3
+  epochs: 10
   num_workers: 4
   show_tqdm: true
-  train_log_soft_point_dist: false
   collator_include_raw_inputs: false
   run_test: true
-  lr: 1.0e-4
+  eval_only: false
+  lr: 3e-5
   weight_decay: 0.01
-  warmup_ratio: 0.01
+  warmup_ratio: 0.1
   grad_accum_steps: 8
   max_grad_norm: 1.0
   seed: 42
@@ -43,42 +48,34 @@ train:
 image:
   scene_h: 512
   scene_w: 512
-  head_h: 224
-  head_w: 224
-  heatmap_h: 64
-  heatmap_w: 64
-  heatmap_sigma: 7.0
 
-model:
-  enable_recognition: true
-  recognition_objective: "full_vocab_infonce"
-  label_emb_dim: 512
-  logit_scale_init: 0.07
-  label_embed_dir: "data/gazefollow/label-embeds"
-  normalize_label_emb: true
-  head_tokens: 64
-  text_tokens: 64
-  max_text_length: 128
-  backbone_hidden_mode: "last4_mean"
-  backbone_hidden_last_n: 4
-  conditioning_mode: "cross_attn"
-  pool_mode: "mean"
-  num_conditioning_heads: 8
-  num_conditioning_layers: 1
-  dropout: 0.1
+text:
+  # NOTE: currently not applied because collator tokenization uses truncation=False.
+  max_text_length: 256
+  generation_max_new_tokens: 24
+  point_decimals: 4
 
 loss:
-  lambda_cls: 0.1
-  label_smoothing: 0.0
-  cls_ignore_index: -100
-  acc_dist_threshold: 0.15
+  loss_answer_weight: 0.1
+  loss_localization_weight: 1.0
+  loss_recognition_weight: 1.0
+  loss_use_lm_fallback: false
 
 prompt:
   prompt_template: ""
+  visual_prompting: true
   prompt_text: |
-    Given the highlighted subject, estimate where the subject is looking and identify the gazed object class.
+    Given the highlighted subject, estimate gaze point and identify the gazed object class ID.
     Subject head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]
-  head_text: "Target subject head crop."
+    You must output exactly two lines in this format:
+    Point: x y
+    ObjectID: id
+    Do not output any extra text.
+  answer_template: |
+    Point: {point_x} {point_y}
+    ObjectID: {object_id}
+  fallback_target_text: "unknown"
+  fallback_object_id: -1
 
 lora:
   lora_r: 16
@@ -94,7 +91,7 @@ wandb:
   enabled: true
   project: "gaze_mllm"
   entity: "semgaze"
-  run_name: "baseline"
+  run_name: "qwen_gaze"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

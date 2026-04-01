@@ -1,107 +1,369 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import torch
 
-from ..modules.preprocess import resize_scene_and_head
+from ..modules.preprocess import resize_scene
 
 
-def _build_chat_text(processor: Any, text: str, with_image: bool) -> str:
-    txt = str(text)
+def _build_chat_text(
+    processor: Any,
+    user_text: str,
+    assistant_text: str | None,
+    *,
+    with_image: bool,
+    add_generation_prompt: bool,
+) -> str:
+    user_txt = str(user_text)
     if hasattr(processor, "apply_chat_template"):
         content: list[dict[str, str]] = []
         if with_image:
             content.append({"type": "image"})
-        content.append({"type": "text", "text": txt})
-        messages = [{"role": "user", "content": content}]
+        content.append({"type": "text", "text": user_txt})
+        messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
+        if assistant_text is not None:
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": str(assistant_text)}]})
         try:
             return processor.apply_chat_template(
                 messages,
                 tokenize=False,
-                add_generation_prompt=False,
+                add_generation_prompt=bool(add_generation_prompt),
             )
         except TypeError:
             return processor.apply_chat_template(messages, tokenize=False)
-    if with_image:
-        return f"<|vision_start|><|image_pad|><|vision_end|>\n{txt}"
-    return txt
+
+    prefix = f"<|vision_start|><|image_pad|><|vision_end|>\n{user_txt}" if with_image else user_txt
+    if assistant_text is None:
+        return prefix
+    return f"{prefix}\n{str(assistant_text)}"
 
 
-def _build_joint_inputs(
+def _move_labels_to_ignore_padding(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    pad_token_id: int | None,
+) -> torch.Tensor:
+    labels = input_ids.clone()
+    if attention_mask is not None:
+        labels[attention_mask == 0] = -100
+    if pad_token_id is not None and int(pad_token_id) >= 0:
+        labels[labels == int(pad_token_id)] = -100
+    return labels
+
+
+def _find_subseq(seq: list[int], sub: list[int], *, start: int = 0, from_right: bool = False) -> int:
+    if len(sub) <= 0:
+        return -1
+    n = len(seq)
+    m = len(sub)
+    if m > n:
+        return -1
+    if from_right:
+        lo = max(0, int(start))
+        for i in range(n - m, lo - 1, -1):
+            if seq[i : i + m] == sub:
+                return i
+        return -1
+    for i in range(max(0, int(start)), n - m + 1):
+        if seq[i : i + m] == sub:
+            return i
+    return -1
+
+
+def _tokenize_with_offsets(tokenizer: Any, text: str) -> tuple[list[int], list[tuple[int, int]] | None]:
+    txt = str(text)
+    try:
+        out = tokenizer(
+            txt,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_offsets_mapping=True,
+        )
+        ids = out.get("input_ids", [])
+        offs = out.get("offset_mapping", None)
+        if isinstance(ids, list) and ids and isinstance(ids[0], list):
+            ids = ids[0]
+        ids = [int(x) for x in ids]
+        if offs is None:
+            return ids, None
+        if isinstance(offs, list) and offs and isinstance(offs[0], list) and offs and isinstance(offs[0][0], tuple):
+            offs = offs[0]
+        offsets: list[tuple[int, int]] = []
+        for ab in offs:
+            if not isinstance(ab, (list, tuple)) or len(ab) != 2:
+                offsets.append((0, 0))
+            else:
+                offsets.append((int(ab[0]), int(ab[1])))
+        if len(offsets) != len(ids):
+            return ids, None
+        return ids, offsets
+    except Exception:
+        out = tokenizer(
+            txt,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )
+        ids = out.get("input_ids", [])
+        if isinstance(ids, list) and ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return [int(x) for x in ids], None
+
+
+def _parse_target_numeric_spans(text: str) -> tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[int, int] | None]:
+    txt = str(text or "")
+    num = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    m_point = re.search(rf"(?im)^\s*point\s*:\s*({num})\s*[,\s]+\s*({num})\s*$", txt)
+    m_obj = re.search(r"(?im)^\s*objectid\s*:\s*(-?\d+)\s*$", txt)
+    x_span = (int(m_point.start(1)), int(m_point.end(1))) if m_point is not None else None
+    y_span = (int(m_point.start(2)), int(m_point.end(2))) if m_point is not None else None
+    o_span = (int(m_obj.start(1)), int(m_obj.end(1))) if m_obj is not None else None
+    return x_span, y_span, o_span
+
+
+def _build_component_loss_masks(
+    processor: Any,
+    joint_inputs: dict[str, Any],
+    target_texts: list[str],
+    target_valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_ids = joint_inputs["input_ids"]
+    attention_mask = joint_inputs.get("attention_mask", None)
+    if not torch.is_tensor(input_ids):
+        raise ValueError("joint_inputs['input_ids'] must be a tensor.")
+    bsz, seqlen = int(input_ids.shape[0]), int(input_ids.shape[1])
+
+    answer_mask = torch.zeros((bsz, seqlen), dtype=torch.bool)
+    point_mask = torch.zeros((bsz, seqlen), dtype=torch.bool)
+    object_mask = torch.zeros((bsz, seqlen), dtype=torch.bool)
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return answer_mask, point_mask, object_mask
+
+    for i in range(bsz):
+        if i >= len(target_texts):
+            continue
+        if i < int(target_valid.numel()) and float(target_valid[i].item()) <= 0.0:
+            continue
+
+        valid_len = int(attention_mask[i].sum().item()) if torch.is_tensor(attention_mask) else seqlen
+        if valid_len <= 0:
+            continue
+
+        seq_ids = [int(x) for x in input_ids[i, :valid_len].tolist()]
+        ans_txt = str(target_texts[i])
+        ans_ids, ans_offsets = _tokenize_with_offsets(tokenizer, ans_txt)
+        if len(ans_ids) <= 0:
+            continue
+
+        ans_start = _find_subseq(seq_ids, ans_ids, from_right=True)
+        if ans_start < 0:
+            continue
+        ans_end = min(valid_len, ans_start + len(ans_ids))
+        answer_mask[i, ans_start:ans_end] = True
+
+        if ans_offsets is None or len(ans_offsets) != len(ans_ids):
+            continue
+
+        x_span, y_span, o_span = _parse_target_numeric_spans(ans_txt)
+        for j, (a, b) in enumerate(ans_offsets):
+            if b <= a:
+                continue
+            gj = ans_start + j
+            if gj < 0 or gj >= seqlen:
+                continue
+            if x_span is not None and not (b <= x_span[0] or a >= x_span[1]):
+                point_mask[i, gj] = True
+            if y_span is not None and not (b <= y_span[0] or a >= y_span[1]):
+                point_mask[i, gj] = True
+            if o_span is not None and not (b <= o_span[0] or a >= o_span[1]):
+                object_mask[i, gj] = True
+
+    return answer_mask, point_mask, object_mask
+
+
+def _build_train_inputs(
     processor: Any,
     scene_images: list[Any],
-    head_images: list[Any],
     text_inputs: list[str],
-    head_text: str,
-) -> dict[str, Any]:
-    bsz = len(text_inputs)
-    if not (len(scene_images) == len(head_images) == bsz):
-        raise ValueError("scene/head/text batch sizes must match for joint processor inputs.")
+    target_texts: list[str],
+    target_valid: torch.Tensor,
+    target_point_valid: torch.Tensor | None,
+    target_object_valid: torch.Tensor | None,
+    max_text_length: int,
+) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not (len(scene_images) == len(text_inputs) == len(target_texts)):
+        raise ValueError("scene/text/target batch sizes must match.")
 
-    head_texts = [str(head_text) for _ in range(bsz)]
-    mixed_texts = list(text_inputs) + head_texts
-    mixed_images = list(scene_images) + list(head_images)
-    proc_texts = [_build_chat_text(processor, t, with_image=True) for t in mixed_texts]
-    return processor(
-        text=proc_texts,
-        images=mixed_images,
+    chat_texts = [
+        _build_chat_text(
+            processor=processor,
+            user_text=text_inputs[i],
+            assistant_text=target_texts[i],
+            with_image=True,
+            add_generation_prompt=False,
+        )
+        for i in range(len(text_inputs))
+    ]
+    # For VLM processors (e.g., Qwen3-VL), truncation can break image-token alignment
+    # between raw chat text and tokenized input_ids. Keep truncation disabled here.
+    joint_inputs = processor(
+        text=chat_texts,
+        images=scene_images,
         return_tensors="pt",
         padding=True,
+        truncation=False,
     )
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    attention_mask = joint_inputs.get("attention_mask", None)
+    labels = _move_labels_to_ignore_padding(
+        input_ids=joint_inputs["input_ids"],
+        attention_mask=attention_mask,
+        pad_token_id=pad_token_id,
+    )
+    answer_mask, point_mask, object_mask = _build_component_loss_masks(
+        processor=processor,
+        joint_inputs=dict(joint_inputs),
+        target_texts=target_texts,
+        target_valid=target_valid,
+    )
+
+    bsz = int(labels.shape[0])
+    point_valid = target_point_valid
+    object_valid = target_object_valid
+    if point_valid is None:
+        point_valid = torch.ones((bsz,), dtype=torch.float32)
+    if object_valid is None:
+        object_valid = target_valid
+    point_valid = point_valid.to(dtype=torch.float32).flatten()
+    object_valid = object_valid.to(dtype=torch.float32).flatten()
+
+    if point_valid.numel() == bsz:
+        invalid_point = point_valid <= 0
+        if torch.any(invalid_point):
+            point_mask[invalid_point] = False
+    if object_valid.numel() == bsz:
+        invalid_object = object_valid <= 0
+        if torch.any(invalid_object):
+            object_mask[invalid_object] = False
+
+    invalid_answer = torch.zeros((bsz,), dtype=torch.bool)
+    if point_valid.numel() == bsz:
+        invalid_answer = invalid_answer | point_valid.le(0)
+    if object_valid.numel() == bsz:
+        invalid_answer = invalid_answer | object_valid.le(0)
+    if torch.any(invalid_answer):
+        answer_mask[invalid_answer] = False
+
+    supervised = answer_mask.any(dim=1) | point_mask.any(dim=1) | object_mask.any(dim=1)
+    if torch.any(~supervised):
+        labels[~supervised] = -100
+    return dict(joint_inputs), labels, answer_mask, point_mask, object_mask
+
+
+def _build_infer_inputs(
+    processor: Any,
+    scene_images: list[Any],
+    text_inputs: list[str],
+    max_text_length: int,
+) -> dict[str, Any]:
+    if len(scene_images) != len(text_inputs):
+        raise ValueError("scene/text batch sizes must match for inference inputs.")
+    chat_texts = [
+        _build_chat_text(
+            processor=processor,
+            user_text=t,
+            assistant_text=None,
+            with_image=True,
+            add_generation_prompt=True,
+        )
+        for t in text_inputs
+    ]
+    # For VLM processors (e.g., Qwen3-VL), truncation can break image-token alignment
+    # between raw chat text and tokenized input_ids. Keep truncation disabled here.
+    joint_inputs = processor(
+        text=chat_texts,
+        images=scene_images,
+        return_tensors="pt",
+        padding=True,
+        truncation=False,
+    )
+    return dict(joint_inputs)
 
 
 class QwenTrainCollator:
     def __init__(
         self,
         processor: Any,
-        head_text: str,
         scene_size: tuple[int, int] = (512, 512),
-        head_size: tuple[int, int] = (224, 224),
+        max_text_length: int = 256,
         include_raw_inputs: bool = False,
     ) -> None:
         self.processor = processor
-        self.head_text = str(head_text)
         self.scene_size = (int(scene_size[0]), int(scene_size[1]))
-        self.head_size = (int(head_size[0]), int(head_size[1]))
+        self.max_text_length = int(max_text_length)
         self.include_raw_inputs = bool(include_raw_inputs)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         scene_images_raw = [x["scene_image"] for x in batch]
-        head_images_raw = [x["head_image"] for x in batch]
-        scene_images, head_images = resize_scene_and_head(
+        scene_images = resize_scene(
             scene_image=scene_images_raw,
-            head_image=head_images_raw,
             scene_size=self.scene_size,
-            head_size=self.head_size,
         )
-        text_inputs = [x["text_input"] for x in batch]
-        target_points = torch.stack([x["target_point"] for x in batch], dim=0)
-        target_heatmaps = torch.stack([x["target_heatmap"] for x in batch], dim=0)
-        target_labels = torch.tensor([x["target_label"] for x in batch], dtype=torch.long)
-        target_label_embs = torch.stack([x["target_label_emb"] for x in batch], dim=0)
-        target_label_valid = torch.stack([x["target_label_valid"] for x in batch], dim=0)
+        text_inputs = [str(x["text_input"]) for x in batch]
+        target_texts = [str(x["target_text"]) for x in batch]
+        target_valid = torch.stack([x["target_text_valid"] for x in batch], dim=0).to(dtype=torch.float32).flatten()
+        target_point_valid = torch.stack(
+            [
+                x.get("target_point_valid", torch.tensor(1.0, dtype=torch.float32))
+                if torch.is_tensor(x.get("target_point_valid", None))
+                else torch.tensor(float(x.get("target_point_valid", 1.0)), dtype=torch.float32)
+                for x in batch
+            ],
+            dim=0,
+        ).to(dtype=torch.float32).flatten()
+        target_object_valid = torch.stack(
+            [
+                x.get("target_object_valid", x.get("target_text_valid", torch.tensor(1.0, dtype=torch.float32)))
+                if torch.is_tensor(x.get("target_object_valid", x.get("target_text_valid", None)))
+                else torch.tensor(
+                    float(x.get("target_object_valid", x.get("target_text_valid", 1.0))),
+                    dtype=torch.float32,
+                )
+                for x in batch
+            ],
+            dim=0,
+        ).to(dtype=torch.float32).flatten()
 
-        joint_inputs = _build_joint_inputs(
+        joint_inputs, labels, loss_mask_answer, loss_mask_point, loss_mask_objectid = _build_train_inputs(
             processor=self.processor,
             scene_images=scene_images,
-            head_images=head_images,
-            text_inputs=[str(t) for t in text_inputs],
-            head_text=self.head_text,
+            text_inputs=text_inputs,
+            target_texts=target_texts,
+            target_valid=target_valid,
+            target_point_valid=target_point_valid,
+            target_object_valid=target_object_valid,
+            max_text_length=self.max_text_length,
         )
         out = {
-            "joint_inputs": dict(joint_inputs),
-            "joint_bsz": int(len(text_inputs)),
-            "target_point": target_points,
-            "target_heatmap": target_heatmaps,
-            "target_label": target_labels,
-            "target_label_emb": target_label_embs,
-            "target_label_valid": target_label_valid,
+            "joint_inputs": joint_inputs,
+            "labels": labels,
+            "target_text": target_texts,
+            "target_text_valid": target_valid,
+            "target_point_valid": target_point_valid,
+            "target_object_valid": target_object_valid,
+            "target_label": torch.tensor([int(x["target_label"]) for x in batch], dtype=torch.long),
+            "loss_mask_answer": loss_mask_answer,
+            "loss_mask_point": loss_mask_point,
+            "loss_mask_objectid": loss_mask_objectid,
         }
         if self.include_raw_inputs:
             out["scene_images"] = list(scene_images)
-            out["head_images"] = list(head_images)
-            out["text_inputs"] = [str(t) for t in text_inputs]
+            out["text_inputs"] = text_inputs
         return out
 
 
@@ -109,52 +371,44 @@ class QwenTestCollator:
     def __init__(
         self,
         processor: Any,
-        head_text: str,
         scene_size: tuple[int, int] = (512, 512),
-        head_size: tuple[int, int] = (224, 224),
+        max_text_length: int = 256,
         include_raw_inputs: bool = False,
     ) -> None:
         self.processor = processor
-        self.head_text = str(head_text)
         self.scene_size = (int(scene_size[0]), int(scene_size[1]))
-        self.head_size = (int(head_size[0]), int(head_size[1]))
+        self.max_text_length = int(max_text_length)
         self.include_raw_inputs = bool(include_raw_inputs)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        target_label_ids_raw = [x["target_label_ids"] for x in batch]
-        max_multi = max([int(t.numel()) for t in target_label_ids_raw] + [1])
-        target_label_ids = torch.full((len(batch), max_multi), fill_value=-100, dtype=torch.long)
-        for i, t in enumerate(target_label_ids_raw):
-            n = int(t.numel())
-            if n > 0:
-                target_label_ids[i, :n] = t.to(dtype=torch.long)
-
         scene_images_raw = [x["scene_image"] for x in batch]
-        head_images_raw = [x["head_image"] for x in batch]
-        scene_images, head_images = resize_scene_and_head(
+        scene_images = resize_scene(
             scene_image=scene_images_raw,
-            head_image=head_images_raw,
             scene_size=self.scene_size,
-            head_size=self.head_size,
         )
-        text_inputs = [x["text_input"] for x in batch]
-        joint_inputs = _build_joint_inputs(
+        text_inputs = [str(x["text_input"]) for x in batch]
+        joint_inputs = _build_infer_inputs(
             processor=self.processor,
             scene_images=scene_images,
-            head_images=head_images,
-            text_inputs=[str(t) for t in text_inputs],
-            head_text=self.head_text,
+            text_inputs=text_inputs,
+            max_text_length=self.max_text_length,
         )
+
         out = {
-            "joint_inputs": dict(joint_inputs),
-            "joint_bsz": int(len(text_inputs)),
+            "joint_inputs": joint_inputs,
+            "target_text": [str(x["target_text"]) for x in batch],
+            "target_text_valid": torch.stack([x["target_text_valid"] for x in batch], dim=0).to(dtype=torch.float32).flatten(),
+            "target_label": torch.tensor([int(x["target_label"]) for x in batch], dtype=torch.long),
+            "target_label_ids": [
+                [int(v) for v in x.get("target_label_ids", []) if int(v) >= 0]
+                for x in batch
+            ],
+            "target_point": torch.stack([x["target_point"] for x in batch], dim=0).to(dtype=torch.float32),
             "gt_points": [x["gt_points"] for x in batch],
-            "target_label": torch.tensor([x["target_label"] for x in batch], dtype=torch.long),
-            "target_label_ids": target_label_ids,
-            "target_label_text": [x["target_label_text"] for x in batch],
+            "target_label_text": [str(x["target_label_text"]) for x in batch],
+            "image_rel": [str(x["image_rel"]) for x in batch],
         }
         if self.include_raw_inputs:
             out["scene_images"] = list(scene_images)
-            out["head_images"] = list(head_images)
-            out["text_inputs"] = [str(t) for t in text_inputs]
+            out["text_inputs"] = text_inputs
         return out

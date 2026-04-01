@@ -73,6 +73,14 @@ def resize_scene_and_head(
     return _resize_any(scene_image, scene_hw), _resize_any(head_image, head_hw)
 
 
+def resize_scene(
+    scene_image: Any,
+    scene_size: int | tuple[int, int] = (512, 512),
+) -> Any:
+    scene_hw = _to_size_tuple(scene_size)
+    return _resize_any(scene_image, scene_hw)
+
+
 class GazeInputResizer(nn.Module):
     def __init__(
         self,

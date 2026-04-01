@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -263,23 +264,127 @@ def _map_text_to_vocab_id(
     return -100
 
 
+def _normalize_label_text(txt: str) -> str:
+    return " ".join(str(txt or "").strip().split())
+
+
+def _annotation_text_candidates(raw: str) -> list[str]:
+    base = _normalize_label_text(raw)
+    if not base:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(v: str) -> None:
+        t = _normalize_label_text(v)
+        if not t:
+            return
+        key = t.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(t)
+        tl = t.lower()
+        for pref in ("a ", "an ", "the "):
+            if tl.startswith(pref):
+                t2 = _normalize_label_text(t[len(pref) :])
+                if t2:
+                    k2 = t2.lower()
+                    if k2 not in seen:
+                        seen.add(k2)
+                        out.append(t2)
+
+    _push(base)
+    parts = re.split(r"[|/;,]+", base)
+    for part in parts:
+        _push(part)
+        if "-" in part:
+            for sub in part.split("-"):
+                _push(sub)
+    return out
+
+
+def _normalize_split_name(split_name: str | None) -> set[str]:
+    if split_name is None:
+        return set()
+    s = str(split_name).strip().lower()
+    if not s:
+        return set()
+    if s in {"val", "validation"}:
+        return {"val", "validation"}
+    return {s}
+
+
+def _build_fallback_annotation_map(
+    fallback_csvs: list[Path | None] | None,
+    fallback_text_key: str = "annotation",
+    split_name: str | None = None,
+) -> dict[tuple[str, int], list[str]]:
+    out: dict[tuple[str, int], list[str]] = {}
+    if not fallback_csvs:
+        return out
+
+    split_filter = _normalize_split_name(split_name)
+    for csv_path in fallback_csvs:
+        if csv_path is None or (not csv_path.exists()):
+            continue
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    path = str(row["path"]).strip()
+                    sample_id = int(float(row["id"]))
+                except Exception:
+                    continue
+                if not path:
+                    continue
+                if split_filter:
+                    row_split = str(row.get("split", "")).strip().lower()
+                    if row_split not in split_filter:
+                        continue
+                text_raw = str(row.get(fallback_text_key, "")).strip()
+                cands = _annotation_text_candidates(text_raw)
+                if not cands:
+                    continue
+                key = (path, sample_id)
+                if key not in out:
+                    out[key] = []
+                for cand in cands:
+                    if cand not in out[key]:
+                        out[key].append(cand)
+    return out
+
+
 def load_label_map(
     labels_csv: Path | None,
     vocab2id: dict[str, int] | None = None,
     vocab2id_lower: dict[str, int] | None = None,
     text_key: str = "gaze_pseudo_label",
+    fallback_csvs: list[Path | None] | None = None,
+    fallback_text_key: str = "annotation",
+    split_name: str | None = None,
 ) -> tuple[dict[tuple[str, int], int], dict[str, int]]:
     stats = {
         "rows": 0,
         "mapped": 0,
         "missing_text": 0,
         "unknown_text": 0,
+        "primary_mapped": 0,
+        "primary_unknown": 0,
+        "fallback_considered": 0,
+        "fallback_mapped": 0,
     }
     if labels_csv is None or (not labels_csv.exists()):
         return {}, stats
 
     v = vocab2id or {}
     vl = vocab2id_lower or {}
+    fallback_map = _build_fallback_annotation_map(
+        fallback_csvs=fallback_csvs,
+        fallback_text_key=fallback_text_key,
+        split_name=split_name,
+    )
     out: dict[tuple[str, int], int] = {}
     with labels_csv.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -290,17 +395,34 @@ def load_label_map(
             except Exception:
                 continue
             stats["rows"] += 1
-            label_text = str(row.get(text_key, "")).strip()
+            key = (path, sample_id)
+            label_text = _normalize_label_text(str(row.get(text_key, "")))
+            label_id = -100
             if not label_text:
                 stats["missing_text"] += 1
-                out[(path, sample_id)] = -100
-                continue
-            label_id = _map_text_to_vocab_id(label_text, v, vl)
+            else:
+                label_id = _map_text_to_vocab_id(label_text, v, vl)
+                if label_id >= 0:
+                    stats["primary_mapped"] += 1
+                else:
+                    stats["primary_unknown"] += 1
+
+            if label_id < 0:
+                cands = fallback_map.get(key, [])
+                if cands:
+                    stats["fallback_considered"] += 1
+                    for cand in cands:
+                        cand_id = _map_text_to_vocab_id(cand, v, vl)
+                        if cand_id >= 0:
+                            label_id = int(cand_id)
+                            stats["fallback_mapped"] += 1
+                            break
+
             if label_id >= 0:
                 stats["mapped"] += 1
             else:
                 stats["unknown_text"] += 1
-            out[(path, sample_id)] = int(label_id)
+            out[key] = int(label_id)
     return out, stats
 
 
@@ -601,4 +723,3 @@ def load_test_groups(
     if max_groups > 0:
         groups = groups[: int(max_groups)]
     return groups
-
