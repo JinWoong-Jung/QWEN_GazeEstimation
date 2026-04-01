@@ -135,7 +135,7 @@ class TestSpecialTokenPipeline(unittest.TestCase):
         )
 
         self.assertTrue(bool(answer_mask.any().item()), "Answer mask should contain supervised tokens.")
-        self.assertGreaterEqual(int(point_mask.sum().item()), 2, "Point mask should cover x and y numeric tokens.")
+        self.assertGreaterEqual(int(point_mask.sum().item()), 2, "Point mask should cover x and y coordinate tokens.")
         self.assertEqual(int(object_mask.sum().item()), 1, "Object mask should cover exactly one object token.")
 
         obj_id = tok.get_vocab()["<obj_127>"]
@@ -149,7 +149,15 @@ class TestSpecialTokenPipeline(unittest.TestCase):
             object_token_id_to_label={},
         )
         self.assertEqual(obj, 127, "Text fallback should parse object label id from Object line.")
-        self.assertEqual(src, "text_fallback", "Expected text_fallback source when token-id path is unavailable.")
+        self.assertEqual(src, "object_line", "Expected object_line source when token-id path is unavailable.")
+
+        obj_any, src_any = _parse_object_id_with_fallback(
+            pred_text="random prefix <obj_009> random suffix",
+            generated_token_ids=[],
+            object_token_id_to_label={},
+        )
+        self.assertEqual(obj_any, 9, "Regex fallback should parse object token when Object line is missing.")
+        self.assertEqual(src_any, "text_regex", "Expected text_regex source for fallback regex parsing.")
 
         obj2, src2 = _parse_object_id_with_fallback(
             pred_text="Point: 0.1 0.2\nObject: ???",
@@ -158,6 +166,16 @@ class TestSpecialTokenPipeline(unittest.TestCase):
         )
         self.assertIsNone(obj2, "Malformed object output should not map to any class id.")
         self.assertEqual(src2, "failed", "Malformed output should be marked as parse failure.")
+
+    def test_evaluation_parse_priority_token_ids_first(self) -> None:
+        # Token-level path should win even if decoded text also contains an object token.
+        obj, src = _parse_object_id_with_fallback(
+            pred_text="Point: 0.1 0.2\nObject: <obj_007>",
+            generated_token_ids=[101, 202, 303],
+            object_token_id_to_label={202: 123},
+        )
+        self.assertEqual(obj, 123, "Token-level object parsing should take priority over text parsing.")
+        self.assertEqual(src, "token_ids", "Expected token_ids source when token-level parsing is available.")
 
     def test_bonus_token_level_extraction_from_generated_ids(self) -> None:
         token_map = {77: 127}
@@ -177,4 +195,3 @@ class TestSpecialTokenPipeline(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

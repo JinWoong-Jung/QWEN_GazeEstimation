@@ -72,10 +72,8 @@ def _format_target_text(
     try:
         text = tpl.format(
             label_text=raw,
-            label_id=int(label_id),
             point_x=px,
             point_y=py,
-            object_id=int(obj_id),
             object_token=str(obj_token),
         )
     except Exception:

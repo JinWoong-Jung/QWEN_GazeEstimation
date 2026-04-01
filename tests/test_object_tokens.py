@@ -7,7 +7,10 @@ from model.utils.object_tokens import (
     build_object_token,
     format_answer,
     is_object_token,
+    parse_object_id_from_object_line,
     parse_object_id_from_text,
+    parse_object_id_from_text_regex,
+    parse_object_id_from_text_with_source,
     parse_object_token,
     parse_object_token_span,
 )
@@ -34,6 +37,21 @@ class TestObjectTokens(unittest.TestCase):
         self.assertEqual(parse_object_id_from_text("foo <obj_009> bar"), 9)
         self.assertIsNone(parse_object_id_from_text("Object: 127"))
 
+    def test_parse_object_id_with_source_order(self) -> None:
+        txt_line = "Point: 0.1000 0.2000\nObject: <obj_127>"
+        self.assertEqual(parse_object_id_from_object_line(txt_line), 127)
+        self.assertEqual(parse_object_id_from_text_regex(txt_line), 127)
+        obj, src = parse_object_id_from_text_with_source(txt_line)
+        self.assertEqual(obj, 127)
+        self.assertEqual(src, "object_line")
+
+        txt_any = "noise <obj_009> trailing"
+        self.assertIsNone(parse_object_id_from_object_line(txt_any))
+        self.assertEqual(parse_object_id_from_text_regex(txt_any), 9)
+        obj2, src2 = parse_object_id_from_text_with_source(txt_any)
+        self.assertEqual(obj2, 9)
+        self.assertEqual(src2, "text_regex")
+
     def test_parse_object_token_span(self) -> None:
         txt = "Point: 0.1000 0.2000\nObject: <obj_042>"
         span = parse_object_token_span(txt)
@@ -48,4 +66,3 @@ class TestObjectTokens(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

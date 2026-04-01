@@ -99,16 +99,35 @@ def register_object_special_tokens(
     return added, w, required_tokens
 
 
-def parse_object_id_from_text(text: str) -> int | None:
+def parse_object_id_from_object_line(text: str) -> int | None:
     txt = str(text or "")
     m_line = re.search(OBJECT_LINE_PATTERN, txt)
     if m_line is not None:
         return parse_object_token(m_line.group(1))
+    return None
 
+
+def parse_object_id_from_text_regex(text: str) -> int | None:
+    txt = str(text or "")
     m_any = re.search(OBJECT_TOKEN_PATTERN, txt)
     if m_any is None:
         return None
     return parse_object_token(m_any.group(0))
+
+
+def parse_object_id_from_text_with_source(text: str) -> tuple[int | None, str]:
+    obj_line = parse_object_id_from_object_line(text)
+    if obj_line is not None and int(obj_line) >= 0:
+        return int(obj_line), "object_line"
+    obj_any = parse_object_id_from_text_regex(text)
+    if obj_any is not None and int(obj_any) >= 0:
+        return int(obj_any), "text_regex"
+    return None, "failed"
+
+
+def parse_object_id_from_text(text: str) -> int | None:
+    obj, _src = parse_object_id_from_text_with_source(text)
+    return obj
 
 
 def parse_object_token_span(text: str) -> tuple[int, int] | None:

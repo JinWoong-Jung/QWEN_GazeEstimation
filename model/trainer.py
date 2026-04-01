@@ -202,9 +202,51 @@ def _resize_model_embeddings_to_tokenizer(model: Any, processor: Any) -> bool:
         return False
     try:
         model.resize_token_embeddings(target_vocab)
-        return True
-    except Exception:
-        return False
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to resize model token embeddings to tokenizer size={target_vocab}: {e}"
+        ) from e
+    try:
+        new_vocab = int(getattr(model.get_input_embeddings(), "num_embeddings", -1))
+    except Exception as e:
+        raise RuntimeError(f"Could not verify resized embedding size after resize_token_embeddings: {e}") from e
+    if new_vocab != target_vocab:
+        raise RuntimeError(
+            f"Embedding resize mismatch: tokenizer_vocab={target_vocab} model_vocab={new_vocab}."
+        )
+    return True
+
+
+def _init_processor_with_object_tokens(
+    *,
+    model_path: Path,
+    checkpoint_dir: Path | None,
+    num_classes: int,
+) -> Any:
+    processor_path = model_path
+    if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
+        processor_path = checkpoint_dir / "processor"
+    processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
+    n_added_obj_tokens, obj_token_w = _ensure_object_special_tokens(processor, int(num_classes))
+    if int(num_classes) > 0:
+        print(
+            "[INFO] object class tokens: "
+            f"added={int(n_added_obj_tokens)} width={int(obj_token_w)} "
+            f"total={int(num_classes)} source={processor_path}"
+        )
+    return processor
+
+
+def _init_base_model_with_tokenizer_vocab(
+    *,
+    model_path: Path,
+    model_kwargs: dict[str, Any],
+    processor: Any,
+) -> Any:
+    base_qwen = AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
+    if _resize_model_embeddings_to_tokenizer(base_qwen, processor):
+        print(f"[INFO] resized model token embeddings to tokenizer size={len(processor.tokenizer)}")
+    return base_qwen
 
 
 def main() -> None:
@@ -294,17 +336,11 @@ def main() -> None:
         if load_dtype != "auto":
             model_kwargs["dtype"] = load_dtype
 
-        processor_path = model_path
-        if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
-            processor_path = checkpoint_dir / "processor"
-        processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
-        n_added_obj_tokens, obj_token_w = _ensure_object_special_tokens(processor, int(num_classes))
-        if int(num_classes) > 0:
-            print(
-                "[INFO] object class tokens: "
-                f"added={int(n_added_obj_tokens)} width={int(obj_token_w)} "
-                f"total={int(num_classes)}"
-            )
+        processor = _init_processor_with_object_tokens(
+            model_path=model_path,
+            checkpoint_dir=checkpoint_dir,
+            num_classes=int(num_classes),
+        )
 
         collator_include_raw_inputs = bool(getattr(args, "collator_include_raw_inputs", False))
         if collator_include_raw_inputs:
@@ -317,9 +353,11 @@ def main() -> None:
             include_raw_inputs=collator_include_raw_inputs,
         )
 
-        base_qwen = AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
-        if _resize_model_embeddings_to_tokenizer(base_qwen, processor):
-            print(f"[INFO] resized model token embeddings to tokenizer size={len(processor.tokenizer)}")
+        base_qwen = _init_base_model_with_tokenizer_vocab(
+            model_path=model_path,
+            model_kwargs=model_kwargs,
+            processor=processor,
+        )
         adapter_dir = (checkpoint_dir / "lora_adapter") if checkpoint_dir is not None else None
         if adapter_dir is not None and adapter_dir.exists():
             qwen_model = PeftModel.from_pretrained(
@@ -410,14 +448,22 @@ def main() -> None:
                         "test/ObjectParseFailTop1Rate": float(test_metrics.get("ObjectParseFailTop1Rate", 0.0)),
                         "test/ObjectParseFailBeamRate": float(test_metrics.get("ObjectParseFailBeamRate", 0.0)),
                         "test/ObjectParseTop1FromTokenRate": float(test_metrics.get("ObjectParseTop1FromTokenRate", 0.0)),
+                        "test/ObjectParseTop1FromObjectLineRate": float(test_metrics.get("ObjectParseTop1FromObjectLineRate", 0.0)),
+                        "test/ObjectParseTop1FromTextRegexRate": float(test_metrics.get("ObjectParseTop1FromTextRegexRate", 0.0)),
                         "test/ObjectParseTop1FromTextRate": float(test_metrics.get("ObjectParseTop1FromTextRate", 0.0)),
                         "test/ObjectParseBeamFromTokenRate": float(test_metrics.get("ObjectParseBeamFromTokenRate", 0.0)),
+                        "test/ObjectParseBeamFromObjectLineRate": float(test_metrics.get("ObjectParseBeamFromObjectLineRate", 0.0)),
+                        "test/ObjectParseBeamFromTextRegexRate": float(test_metrics.get("ObjectParseBeamFromTextRegexRate", 0.0)),
                         "test/ObjectParseBeamFromTextRate": float(test_metrics.get("ObjectParseBeamFromTextRate", 0.0)),
                         "test/ObjectParseFailTop1Count": float(test_metrics.get("ObjectParseFailTop1Count", 0.0)),
                         "test/ObjectParseFailBeamCount": float(test_metrics.get("ObjectParseFailBeamCount", 0.0)),
                         "test/ObjectParseTop1FromTokenCount": float(test_metrics.get("ObjectParseTop1FromTokenCount", 0.0)),
+                        "test/ObjectParseTop1FromObjectLineCount": float(test_metrics.get("ObjectParseTop1FromObjectLineCount", 0.0)),
+                        "test/ObjectParseTop1FromTextRegexCount": float(test_metrics.get("ObjectParseTop1FromTextRegexCount", 0.0)),
                         "test/ObjectParseTop1FromTextCount": float(test_metrics.get("ObjectParseTop1FromTextCount", 0.0)),
                         "test/ObjectParseBeamFromTokenCount": float(test_metrics.get("ObjectParseBeamFromTokenCount", 0.0)),
+                        "test/ObjectParseBeamFromObjectLineCount": float(test_metrics.get("ObjectParseBeamFromObjectLineCount", 0.0)),
+                        "test/ObjectParseBeamFromTextRegexCount": float(test_metrics.get("ObjectParseBeamFromTextRegexCount", 0.0)),
                         "test/ObjectParseBeamFromTextCount": float(test_metrics.get("ObjectParseBeamFromTextCount", 0.0)),
                         "test/num_samples": float(test_metrics["num_samples"]),
                         "test/num_valid_targets": float(test_metrics["num_valid_targets"]),
@@ -569,17 +615,11 @@ def main() -> None:
     if load_dtype != "auto":
         model_kwargs["dtype"] = load_dtype
 
-    processor_path = model_path
-    if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
-        processor_path = checkpoint_dir / "processor"
-    processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
-    n_added_obj_tokens, obj_token_w = _ensure_object_special_tokens(processor, int(num_classes))
-    if int(num_classes) > 0:
-        print(
-            "[INFO] object class tokens: "
-            f"added={int(n_added_obj_tokens)} width={int(obj_token_w)} "
-            f"total={int(num_classes)}"
-        )
+    processor = _init_processor_with_object_tokens(
+        model_path=model_path,
+        checkpoint_dir=checkpoint_dir,
+        num_classes=int(num_classes),
+    )
 
     collator_include_raw_inputs = bool(getattr(args, "collator_include_raw_inputs", False))
     if collator_include_raw_inputs:
@@ -621,9 +661,11 @@ def main() -> None:
         collate_fn=val_collator,
     )
 
-    base_qwen = AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
-    if _resize_model_embeddings_to_tokenizer(base_qwen, processor):
-        print(f"[INFO] resized model token embeddings to tokenizer size={len(processor.tokenizer)}")
+    base_qwen = _init_base_model_with_tokenizer_vocab(
+        model_path=model_path,
+        model_kwargs=model_kwargs,
+        processor=processor,
+    )
     if args.gradient_checkpointing and hasattr(base_qwen, "gradient_checkpointing_enable"):
         base_qwen.gradient_checkpointing_enable()
     if args.gradient_checkpointing and hasattr(base_qwen, "enable_input_require_grads"):
@@ -989,14 +1031,22 @@ def main() -> None:
                         "test/ObjectParseFailTop1Rate": float(test_metrics.get("ObjectParseFailTop1Rate", 0.0)),
                         "test/ObjectParseFailBeamRate": float(test_metrics.get("ObjectParseFailBeamRate", 0.0)),
                         "test/ObjectParseTop1FromTokenRate": float(test_metrics.get("ObjectParseTop1FromTokenRate", 0.0)),
+                        "test/ObjectParseTop1FromObjectLineRate": float(test_metrics.get("ObjectParseTop1FromObjectLineRate", 0.0)),
+                        "test/ObjectParseTop1FromTextRegexRate": float(test_metrics.get("ObjectParseTop1FromTextRegexRate", 0.0)),
                         "test/ObjectParseTop1FromTextRate": float(test_metrics.get("ObjectParseTop1FromTextRate", 0.0)),
                         "test/ObjectParseBeamFromTokenRate": float(test_metrics.get("ObjectParseBeamFromTokenRate", 0.0)),
+                        "test/ObjectParseBeamFromObjectLineRate": float(test_metrics.get("ObjectParseBeamFromObjectLineRate", 0.0)),
+                        "test/ObjectParseBeamFromTextRegexRate": float(test_metrics.get("ObjectParseBeamFromTextRegexRate", 0.0)),
                         "test/ObjectParseBeamFromTextRate": float(test_metrics.get("ObjectParseBeamFromTextRate", 0.0)),
                         "test/ObjectParseFailTop1Count": float(test_metrics.get("ObjectParseFailTop1Count", 0.0)),
                         "test/ObjectParseFailBeamCount": float(test_metrics.get("ObjectParseFailBeamCount", 0.0)),
                         "test/ObjectParseTop1FromTokenCount": float(test_metrics.get("ObjectParseTop1FromTokenCount", 0.0)),
+                        "test/ObjectParseTop1FromObjectLineCount": float(test_metrics.get("ObjectParseTop1FromObjectLineCount", 0.0)),
+                        "test/ObjectParseTop1FromTextRegexCount": float(test_metrics.get("ObjectParseTop1FromTextRegexCount", 0.0)),
                         "test/ObjectParseTop1FromTextCount": float(test_metrics.get("ObjectParseTop1FromTextCount", 0.0)),
                         "test/ObjectParseBeamFromTokenCount": float(test_metrics.get("ObjectParseBeamFromTokenCount", 0.0)),
+                        "test/ObjectParseBeamFromObjectLineCount": float(test_metrics.get("ObjectParseBeamFromObjectLineCount", 0.0)),
+                        "test/ObjectParseBeamFromTextRegexCount": float(test_metrics.get("ObjectParseBeamFromTextRegexCount", 0.0)),
                         "test/ObjectParseBeamFromTextCount": float(test_metrics.get("ObjectParseBeamFromTextCount", 0.0)),
                         "test/num_samples": float(test_metrics["num_samples"]),
                         "test/num_valid_targets": float(test_metrics["num_valid_targets"]),

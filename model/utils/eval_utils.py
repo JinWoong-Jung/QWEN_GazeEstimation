@@ -9,7 +9,10 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from .loss_utils import compute_structured_losses
-from .object_tokens import parse_object_id_from_text, parse_object_token
+from .object_tokens import (
+    parse_object_id_from_text_with_source,
+    parse_object_token,
+)
 
 INVALID_OBJECT_LABEL_ID = -100
 
@@ -126,14 +129,10 @@ def _parse_object_id_with_fallback(
     obj_tok = _parse_object_id_from_token_ids(generated_token_ids, object_token_id_to_label)
     if obj_tok is not None and int(obj_tok) >= 0:
         return int(obj_tok), "token_ids"
-    obj_txt = _parse_object_id(str(pred_text))
+    obj_txt, txt_src = parse_object_id_from_text_with_source(str(pred_text))
     if obj_txt is not None and int(obj_txt) >= 0:
-        return int(obj_txt), "text_fallback"
+        return int(obj_txt), str(txt_src)
     return None, "failed"
-
-
-def _parse_object_id(text: str) -> int | None:
-    return parse_object_id_from_text(str(text or ""))
 
 
 def _parse_point_xy(text: str) -> tuple[float, float] | None:
@@ -290,8 +289,12 @@ def run_test_metrics(
     object_parse_fail_top1_num = 0
     object_parse_fail_beam_num = 0
     object_parse_top1_from_token_num = 0
+    object_parse_top1_from_object_line_num = 0
+    object_parse_top1_from_text_regex_num = 0
     object_parse_top1_from_text_num = 0
     object_parse_beam_from_token_num = 0
+    object_parse_beam_from_object_line_num = 0
+    object_parse_beam_from_text_regex_num = 0
     object_parse_beam_from_text_num = 0
     avg_l2_sum = 0.0
     min_l2_sum = 0.0
@@ -422,7 +425,11 @@ def run_test_metrics(
                     object_token_valid_num += 1
                 if str(top1_src) == "token_ids":
                     object_parse_top1_from_token_num += 1
-                elif str(top1_src) == "text_fallback":
+                elif str(top1_src) == "object_line":
+                    object_parse_top1_from_object_line_num += 1
+                    object_parse_top1_from_text_num += 1
+                elif str(top1_src) == "text_regex":
+                    object_parse_top1_from_text_regex_num += 1
                     object_parse_top1_from_text_num += 1
                 else:
                     object_parse_fail_top1_num += 1
@@ -430,7 +437,11 @@ def run_test_metrics(
                     object_parse_fail_beam_num += 1
                 elif any(str(x) == "token_ids" for x in top3_sources):
                     object_parse_beam_from_token_num += 1
-                elif any(str(x) == "text_fallback" for x in top3_sources):
+                elif any(str(x) == "object_line" for x in top3_sources):
+                    object_parse_beam_from_object_line_num += 1
+                    object_parse_beam_from_text_num += 1
+                elif any(str(x) == "text_regex" for x in top3_sources):
+                    object_parse_beam_from_text_regex_num += 1
                     object_parse_beam_from_text_num += 1
                 else:
                     object_parse_fail_beam_num += 1
@@ -476,14 +487,22 @@ def run_test_metrics(
             "ObjectParseFailTop1Rate": 0.0,
             "ObjectParseFailBeamRate": 0.0,
             "ObjectParseTop1FromTokenRate": 0.0,
+            "ObjectParseTop1FromObjectLineRate": 0.0,
+            "ObjectParseTop1FromTextRegexRate": 0.0,
             "ObjectParseTop1FromTextRate": 0.0,
             "ObjectParseBeamFromTokenRate": 0.0,
+            "ObjectParseBeamFromObjectLineRate": 0.0,
+            "ObjectParseBeamFromTextRegexRate": 0.0,
             "ObjectParseBeamFromTextRate": 0.0,
             "ObjectParseFailTop1Count": 0.0,
             "ObjectParseFailBeamCount": 0.0,
             "ObjectParseTop1FromTokenCount": 0.0,
+            "ObjectParseTop1FromObjectLineCount": 0.0,
+            "ObjectParseTop1FromTextRegexCount": 0.0,
             "ObjectParseTop1FromTextCount": 0.0,
             "ObjectParseBeamFromTokenCount": 0.0,
+            "ObjectParseBeamFromObjectLineCount": 0.0,
+            "ObjectParseBeamFromTextRegexCount": 0.0,
             "ObjectParseBeamFromTextCount": 0.0,
             "num_samples": 0.0,
             "num_valid_targets": 0.0,
@@ -502,14 +521,22 @@ def run_test_metrics(
         "ObjectParseFailTop1Rate": float(object_parse_fail_top1_num / max(valid_total, 1)),
         "ObjectParseFailBeamRate": float(object_parse_fail_beam_num / max(valid_total, 1)),
         "ObjectParseTop1FromTokenRate": float(object_parse_top1_from_token_num / max(valid_total, 1)),
+        "ObjectParseTop1FromObjectLineRate": float(object_parse_top1_from_object_line_num / max(valid_total, 1)),
+        "ObjectParseTop1FromTextRegexRate": float(object_parse_top1_from_text_regex_num / max(valid_total, 1)),
         "ObjectParseTop1FromTextRate": float(object_parse_top1_from_text_num / max(valid_total, 1)),
         "ObjectParseBeamFromTokenRate": float(object_parse_beam_from_token_num / max(valid_total, 1)),
+        "ObjectParseBeamFromObjectLineRate": float(object_parse_beam_from_object_line_num / max(valid_total, 1)),
+        "ObjectParseBeamFromTextRegexRate": float(object_parse_beam_from_text_regex_num / max(valid_total, 1)),
         "ObjectParseBeamFromTextRate": float(object_parse_beam_from_text_num / max(valid_total, 1)),
         "ObjectParseFailTop1Count": float(object_parse_fail_top1_num),
         "ObjectParseFailBeamCount": float(object_parse_fail_beam_num),
         "ObjectParseTop1FromTokenCount": float(object_parse_top1_from_token_num),
+        "ObjectParseTop1FromObjectLineCount": float(object_parse_top1_from_object_line_num),
+        "ObjectParseTop1FromTextRegexCount": float(object_parse_top1_from_text_regex_num),
         "ObjectParseTop1FromTextCount": float(object_parse_top1_from_text_num),
         "ObjectParseBeamFromTokenCount": float(object_parse_beam_from_token_num),
+        "ObjectParseBeamFromObjectLineCount": float(object_parse_beam_from_object_line_num),
+        "ObjectParseBeamFromTextRegexCount": float(object_parse_beam_from_text_regex_num),
         "ObjectParseBeamFromTextCount": float(object_parse_beam_from_text_num),
         "num_samples": float(total),
         "num_valid_targets": float(valid_total),
@@ -529,14 +556,22 @@ def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
         ("ObjectParseFailTop1Rate", float(test_metrics.get("ObjectParseFailTop1Rate", 0.0))),
         ("ObjectParseFailBeamRate", float(test_metrics.get("ObjectParseFailBeamRate", 0.0))),
         ("ObjectParseTop1FromTokenRate", float(test_metrics.get("ObjectParseTop1FromTokenRate", 0.0))),
+        ("ObjectParseTop1FromObjectLineRate", float(test_metrics.get("ObjectParseTop1FromObjectLineRate", 0.0))),
+        ("ObjectParseTop1FromTextRegexRate", float(test_metrics.get("ObjectParseTop1FromTextRegexRate", 0.0))),
         ("ObjectParseTop1FromTextRate", float(test_metrics.get("ObjectParseTop1FromTextRate", 0.0))),
         ("ObjectParseBeamFromTokenRate", float(test_metrics.get("ObjectParseBeamFromTokenRate", 0.0))),
+        ("ObjectParseBeamFromObjectLineRate", float(test_metrics.get("ObjectParseBeamFromObjectLineRate", 0.0))),
+        ("ObjectParseBeamFromTextRegexRate", float(test_metrics.get("ObjectParseBeamFromTextRegexRate", 0.0))),
         ("ObjectParseBeamFromTextRate", float(test_metrics.get("ObjectParseBeamFromTextRate", 0.0))),
         ("ObjectParseFailTop1Count", float(test_metrics.get("ObjectParseFailTop1Count", 0.0))),
         ("ObjectParseFailBeamCount", float(test_metrics.get("ObjectParseFailBeamCount", 0.0))),
         ("ObjectParseTop1FromTokenCount", float(test_metrics.get("ObjectParseTop1FromTokenCount", 0.0))),
+        ("ObjectParseTop1FromObjectLineCount", float(test_metrics.get("ObjectParseTop1FromObjectLineCount", 0.0))),
+        ("ObjectParseTop1FromTextRegexCount", float(test_metrics.get("ObjectParseTop1FromTextRegexCount", 0.0))),
         ("ObjectParseTop1FromTextCount", float(test_metrics.get("ObjectParseTop1FromTextCount", 0.0))),
         ("ObjectParseBeamFromTokenCount", float(test_metrics.get("ObjectParseBeamFromTokenCount", 0.0))),
+        ("ObjectParseBeamFromObjectLineCount", float(test_metrics.get("ObjectParseBeamFromObjectLineCount", 0.0))),
+        ("ObjectParseBeamFromTextRegexCount", float(test_metrics.get("ObjectParseBeamFromTextRegexCount", 0.0))),
         ("ObjectParseBeamFromTextCount", float(test_metrics.get("ObjectParseBeamFromTextCount", 0.0))),
         ("num_samples", float(test_metrics.get("num_samples", 0.0))),
         ("num_valid_targets", float(test_metrics.get("num_valid_targets", 0.0))),
