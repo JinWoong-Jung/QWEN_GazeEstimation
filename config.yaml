@@ -61,7 +61,7 @@ loss:
   # Keep answer low (format regularization), point baseline, object moderately higher.
   loss_answer_weight: 0.1
   loss_point_weight: 1.0
-  loss_object_weight: 1.5
+  loss_object_weight: 1.0
   loss_use_lm_fallback: false
 
 prompt:

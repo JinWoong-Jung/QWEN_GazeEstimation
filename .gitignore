@@ -1,12 +1,48 @@
-# existing
-checkpoints/
+# =========================
+# Dataset / Large Artifacts
+# =========================
 data/
-wandb/
-__pycache__/
-
-# add
+checkpoints/
 outputs/
+wandb/
+
+# Qwen / HuggingFace local model snapshots and caches
 model/Qwen3-VL-4B-Instruct/
+model/Qwen3-VL-*/
 model/cache/
+.cache/
+huggingface/
+
+# Common heavyweight model files
+*.safetensors
+*.bin
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.h5
+
+# =========================
+# Python Cache / Build
+# =========================
+__pycache__/
+**/__pycache__/
 *.py[cod]
 *.pyo
+*.so
+
+# Virtual env / tooling
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# =========================
+# OS / Editor noise
+# =========================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
