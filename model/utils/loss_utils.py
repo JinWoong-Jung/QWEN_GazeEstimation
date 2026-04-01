@@ -47,10 +47,10 @@ def compute_structured_losses(
     labels: torch.Tensor,
     loss_mask_answer: torch.Tensor | None,
     loss_mask_point: torch.Tensor | None,
-    loss_mask_objectid: torch.Tensor | None,
+    loss_mask_object: torch.Tensor | None,
     weight_answer: float,
     weight_point: float,
-    weight_objectid: float,
+    weight_object: float,
     fallback_loss: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     device = labels.device
@@ -64,22 +64,23 @@ def compute_structured_losses(
         out_loss = fallback_loss if torch.is_tensor(fallback_loss) else z
         return {
             "loss": out_loss,
+            "loss_total": out_loss,
             "loss_answer": z,
-            "loss_localization": z,
-            "loss_recognition": z,
+            "loss_point": z,
+            "loss_object": z,
             "n_answer_tokens": 0,
             "n_point_tokens": 0,
-            "n_objectid_tokens": 0,
+            "n_object_tokens": 0,
             "used_fallback": True,
         }
 
     l_answer, n_answer = _masked_token_ce(logits, labels, loss_mask_answer)
     l_point, n_point = _masked_token_ce(logits, labels, loss_mask_point)
-    l_obj, n_obj = _masked_token_ce(logits, labels, loss_mask_objectid)
+    l_obj, n_obj = _masked_token_ce(logits, labels, loss_mask_object)
 
     w_answer = float(weight_answer)
     w_point = float(weight_point)
-    w_obj = float(weight_objectid)
+    w_obj = float(weight_object)
     total = (w_answer * l_answer) + (w_point * l_point) + (w_obj * l_obj)
 
     used_fallback = False
@@ -92,12 +93,12 @@ def compute_structured_losses(
 
     return {
         "loss": total,
+        "loss_total": total,
         "loss_answer": l_answer,
-        "loss_localization": l_point,
-        "loss_recognition": l_obj,
+        "loss_point": l_point,
+        "loss_object": l_obj,
         "n_answer_tokens": int(n_answer),
         "n_point_tokens": int(n_point),
-        "n_objectid_tokens": int(n_obj),
+        "n_object_tokens": int(n_obj),
         "used_fallback": bool(used_fallback),
     }
-

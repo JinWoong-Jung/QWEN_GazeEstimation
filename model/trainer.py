@@ -44,6 +44,11 @@ from .utils.data_utils import (
 )
 from .utils.eval_utils import print_test_metrics_table, run_eval, run_test_metrics
 from .utils.loss_utils import compute_structured_losses
+from .utils.object_tokens import (
+    build_object_token,
+    object_token_width,
+    register_object_special_tokens,
+)
 from .utils.processor_collate import QwenTestCollator, QwenTrainCollator
 from .utils.wandb_utils import finish_wandb, init_wandb
 
@@ -116,6 +121,92 @@ def _count_valid_targets(records: list[Any], id2label: dict[int, str]) -> int:
     return n
 
 
+def _env_flag_true(name: str) -> bool:
+    v = str(os.environ.get(name, "")).strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _maybe_log_target_example(tag: str, dataset: Any) -> None:
+    if not _env_flag_true("QWEN_DEBUG_TARGET_EXAMPLE"):
+        return
+    try:
+        n = len(dataset)
+        if int(n) <= 0:
+            print(f"[DEBUG] {tag} target example: dataset is empty.")
+            return
+        sample = dataset[0]
+        tgt = str(sample.get("target_text", ""))
+        print(f"[DEBUG] {tag} target example:\n{tgt}")
+    except Exception as e:
+        print(f"[DEBUG] {tag} target example unavailable: {e}")
+
+
+def _infer_num_classes_from_vocab2id(vocab2id: dict[str, int], vocab2id_path: Path) -> int:
+    if (not isinstance(vocab2id, dict)) or (len(vocab2id) <= 0):
+        raise RuntimeError(
+            f"vocab2id is missing/empty: {vocab2id_path}. "
+            "Object special tokens require a valid vocab2id mapping."
+        )
+    n = int(len(vocab2id))
+    ids: list[int] = []
+    for k, v in vocab2id.items():
+        try:
+            idx = int(v)
+        except Exception as e:
+            raise RuntimeError(
+                f"vocab2id is malformed at key={k!r}, value={v!r}: {e}"
+            ) from e
+        ids.append(idx)
+    expected = list(range(n))
+    got = sorted(ids)
+    if got != expected:
+        first = got[:10]
+        last = got[-10:] if len(got) > 10 else got
+        raise RuntimeError(
+            "vocab2id ids must be exactly contiguous 0..N-1 for object token migration. "
+            f"path={vocab2id_path} N={n} got_min={min(got)} got_max={max(got)} "
+            f"head={first} tail={last}"
+        )
+    return n
+
+
+def _ensure_object_special_tokens(
+    processor: Any,
+    num_classes: int,
+) -> tuple[int, int]:
+    n = max(0, int(num_classes))
+    w = object_token_width(n)
+    if n <= 0:
+        return 0, w
+    tok = getattr(processor, "tokenizer", None)
+    if tok is None:
+        raise RuntimeError("processor.tokenizer is missing; cannot register object special tokens.")
+    added, _w2, _ = register_object_special_tokens(tok, num_classes=n, width=w)
+    return int(added), int(_w2)
+
+
+def _resize_model_embeddings_to_tokenizer(model: Any, processor: Any) -> bool:
+    tok = getattr(processor, "tokenizer", None)
+    if tok is None:
+        return False
+    if not hasattr(model, "resize_token_embeddings"):
+        return False
+    target_vocab = int(len(tok))
+    current_vocab = None
+    try:
+        emb = model.get_input_embeddings()
+        current_vocab = int(getattr(emb, "num_embeddings", -1))
+    except Exception:
+        current_vocab = None
+    if current_vocab is not None and current_vocab == target_vocab:
+        return False
+    try:
+        model.resize_token_embeddings(target_vocab)
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=str, default="config.yaml")
@@ -155,19 +246,23 @@ def main() -> None:
     vocab2id_path = resolve_path(args.vocab2id)
 
     vocab2id, vocab2id_lower = load_vocab2id(vocab2id_path)
+    num_classes = _infer_num_classes_from_vocab2id(vocab2id, vocab2id_path)
     id2label = _build_id2label(vocab2id)
-    num_classes = (max((int(x) for x in vocab2id.values()), default=-1) + 1) if vocab2id else 0
-    if vocab2id:
-        print(f"[INFO] loaded vocab2id classes: {len(vocab2id)} (id_range=0..{max(num_classes - 1, 0)})")
-    else:
-        print("[WARN] vocab2id is missing/empty. target text will rely on csv label text only.")
+    print(f"[INFO] loaded vocab2id classes: {len(vocab2id)} (id_range=0..{max(num_classes - 1, 0)})")
 
     prompt_text_for_run = str(args.prompt_text or "")
-    if int(num_classes) > 0 and ("ObjectID must be an integer in the closed-set class range" not in prompt_text_for_run):
+    if int(num_classes) > 0 and (
+        "The object must be exactly one object token from the predefined vocabulary range"
+        not in prompt_text_for_run
+    ):
+        obj_w = object_token_width(int(num_classes))
+        obj_min = build_object_token(0, width=obj_w)
+        obj_max = build_object_token(int(num_classes) - 1, width=obj_w)
         if prompt_text_for_run and (not prompt_text_for_run.endswith("\n")):
             prompt_text_for_run += "\n"
         prompt_text_for_run += (
-            f"ObjectID must be an integer in the closed-set class range [0, {int(num_classes) - 1}]."
+            "The object must be exactly one object token from the predefined vocabulary range "
+            f"[{obj_min}, {obj_max}]."
         )
 
     if bool(getattr(args, "test_only", False)):
@@ -203,6 +298,13 @@ def main() -> None:
         if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
             processor_path = checkpoint_dir / "processor"
         processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
+        n_added_obj_tokens, obj_token_w = _ensure_object_special_tokens(processor, int(num_classes))
+        if int(num_classes) > 0:
+            print(
+                "[INFO] object class tokens: "
+                f"added={int(n_added_obj_tokens)} width={int(obj_token_w)} "
+                f"total={int(num_classes)}"
+            )
 
         collator_include_raw_inputs = bool(getattr(args, "collator_include_raw_inputs", False))
         if collator_include_raw_inputs:
@@ -216,6 +318,8 @@ def main() -> None:
         )
 
         base_qwen = AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
+        if _resize_model_embeddings_to_tokenizer(base_qwen, processor):
+            print(f"[INFO] resized model token embeddings to tokenizer size={len(processor.tokenizer)}")
         adapter_dir = (checkpoint_dir / "lora_adapter") if checkpoint_dir is not None else None
         if adapter_dir is not None and adapter_dir.exists():
             qwen_model = PeftModel.from_pretrained(
@@ -270,6 +374,7 @@ def main() -> None:
                 point_decimals=int(args.point_decimals),
                 visual_prompting=bool(args.visual_prompting),
             )
+            _maybe_log_target_example("test_only", test_ds)
             test_loader = DataLoader(
                 test_ds,
                 batch_size=max(1, int(args.test_batch_size)),
@@ -301,7 +406,19 @@ def main() -> None:
                         "test/acc@1": float(test_metrics.get("acc@1", 0.0)),
                         "test/acc@3": float(test_metrics.get("acc@3", 0.0)),
                         "test/multiacc@1": float(test_metrics.get("multiacc@1", 0.0)),
-                        "test/ObjectIDValidRate": float(test_metrics.get("ObjectIDValidRate", 0.0)),
+                        "test/ObjectTokenValidRate": float(test_metrics.get("ObjectTokenValidRate", 0.0)),
+                        "test/ObjectParseFailTop1Rate": float(test_metrics.get("ObjectParseFailTop1Rate", 0.0)),
+                        "test/ObjectParseFailBeamRate": float(test_metrics.get("ObjectParseFailBeamRate", 0.0)),
+                        "test/ObjectParseTop1FromTokenRate": float(test_metrics.get("ObjectParseTop1FromTokenRate", 0.0)),
+                        "test/ObjectParseTop1FromTextRate": float(test_metrics.get("ObjectParseTop1FromTextRate", 0.0)),
+                        "test/ObjectParseBeamFromTokenRate": float(test_metrics.get("ObjectParseBeamFromTokenRate", 0.0)),
+                        "test/ObjectParseBeamFromTextRate": float(test_metrics.get("ObjectParseBeamFromTextRate", 0.0)),
+                        "test/ObjectParseFailTop1Count": float(test_metrics.get("ObjectParseFailTop1Count", 0.0)),
+                        "test/ObjectParseFailBeamCount": float(test_metrics.get("ObjectParseFailBeamCount", 0.0)),
+                        "test/ObjectParseTop1FromTokenCount": float(test_metrics.get("ObjectParseTop1FromTokenCount", 0.0)),
+                        "test/ObjectParseTop1FromTextCount": float(test_metrics.get("ObjectParseTop1FromTextCount", 0.0)),
+                        "test/ObjectParseBeamFromTokenCount": float(test_metrics.get("ObjectParseBeamFromTokenCount", 0.0)),
+                        "test/ObjectParseBeamFromTextCount": float(test_metrics.get("ObjectParseBeamFromTextCount", 0.0)),
                         "test/num_samples": float(test_metrics["num_samples"]),
                         "test/num_valid_targets": float(test_metrics["num_valid_targets"]),
                     },
@@ -437,6 +554,8 @@ def main() -> None:
         point_decimals=int(args.point_decimals),
         visual_prompting=bool(args.visual_prompting),
     )
+    _maybe_log_target_example("train", train_ds)
+    _maybe_log_target_example("val", val_ds)
 
     load_dtype = parse_dtype(args.dtype)
     if device.type != "cuda" and load_dtype in {torch.bfloat16, torch.float16}:
@@ -454,6 +573,13 @@ def main() -> None:
     if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
         processor_path = checkpoint_dir / "processor"
     processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
+    n_added_obj_tokens, obj_token_w = _ensure_object_special_tokens(processor, int(num_classes))
+    if int(num_classes) > 0:
+        print(
+            "[INFO] object class tokens: "
+            f"added={int(n_added_obj_tokens)} width={int(obj_token_w)} "
+            f"total={int(num_classes)}"
+        )
 
     collator_include_raw_inputs = bool(getattr(args, "collator_include_raw_inputs", False))
     if collator_include_raw_inputs:
@@ -496,6 +622,8 @@ def main() -> None:
     )
 
     base_qwen = AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
+    if _resize_model_embeddings_to_tokenizer(base_qwen, processor):
+        print(f"[INFO] resized model token embeddings to tokenizer size={len(processor.tokenizer)}")
     if args.gradient_checkpointing and hasattr(base_qwen, "gradient_checkpointing_enable"):
         base_qwen.gradient_checkpointing_enable()
     if args.gradient_checkpointing and hasattr(base_qwen, "enable_input_require_grads"):
@@ -543,15 +671,15 @@ def main() -> None:
     )
 
     amp_dtype = to_autocast_dtype(load_dtype)
-    loss_answer_weight = float(getattr(args, "loss_answer_weight", 0.0))
-    loss_localization_weight = float(getattr(args, "loss_localization_weight", 1.0))
-    loss_recognition_weight = float(getattr(args, "loss_recognition_weight", 1.0))
+    loss_answer_weight = float(getattr(args, "loss_answer_weight", 0.1))
+    loss_point_weight = float(getattr(args, "loss_point_weight", 1.0))
+    loss_object_weight = float(getattr(args, "loss_object_weight", 1.5))
     loss_use_lm_fallback = bool(getattr(args, "loss_use_lm_fallback", False))
     print(
         "[INFO] structured loss weights: "
         f"answer={loss_answer_weight:.4f} "
-        f"localization={loss_localization_weight:.4f} "
-        f"recognition={loss_recognition_weight:.4f} "
+        f"point={loss_point_weight:.4f} "
+        f"object={loss_object_weight:.4f} "
         f"lm_fallback={str(loss_use_lm_fallback).lower()}"
     )
     best_val_loss = float("inf")
@@ -619,10 +747,10 @@ def main() -> None:
                     labels=labels,
                     loss_mask_answer=batch.get("loss_mask_answer", None),
                     loss_mask_point=batch.get("loss_mask_point", None),
-                    loss_mask_objectid=batch.get("loss_mask_objectid", None),
+                    loss_mask_object=batch.get("loss_mask_object", None),
                     weight_answer=loss_answer_weight,
-                    weight_point=loss_localization_weight,
-                    weight_objectid=loss_recognition_weight,
+                    weight_point=loss_point_weight,
+                    weight_object=loss_object_weight,
                     fallback_loss=(lm_loss if loss_use_lm_fallback else None),
                 )
                 raw_loss = structured["loss"]
@@ -650,10 +778,13 @@ def main() -> None:
                     )
                     wandb_run.log(
                         {
+                            "train/loss/total": float(structured["loss_total"].detach().item()),
+                            "train/loss/answer": float(structured["loss_answer"].detach().item()),
+                            "train/loss/point": float(structured["loss_point"].detach().item()),
+                            "train/loss/object": float(structured["loss_object"].detach().item()),
+                            "train/loss/lm_fallback": float(lm_loss.detach().item()),
                             "train/loss": float(raw_loss.detach().item()),
                             "train/loss_answer": float(structured["loss_answer"].detach().item()),
-                            "train/loss_localization": float(structured["loss_localization"].detach().item()),
-                            "train/loss_recognition": float(structured["loss_recognition"].detach().item()),
                             "train/loss_lm_fallback": float(lm_loss.detach().item()),
                             "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                             "train/grad_norm": grad_norm_value,
@@ -686,8 +817,8 @@ def main() -> None:
                 device,
                 amp_dtype,
                 loss_answer_weight=loss_answer_weight,
-                loss_localization_weight=loss_localization_weight,
-                loss_recognition_weight=loss_recognition_weight,
+                loss_point_weight=loss_point_weight,
+                loss_object_weight=loss_object_weight,
                 loss_use_lm_fallback=loss_use_lm_fallback,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"Eval {epoch}/{args.epochs}",
@@ -701,8 +832,8 @@ def main() -> None:
             f"[EPOCH {epoch}] "
             f"train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} "
-            f"val_loc={float(val_metrics.get('loss_localization', 0.0)):.6f} "
-            f"val_rec={float(val_metrics.get('loss_recognition', 0.0)):.6f}"
+            f"val_point={float(val_metrics.get('loss_point', 0.0)):.6f} "
+            f"val_object={float(val_metrics.get('loss_object', 0.0)):.6f}"
         )
 
         if wandb_run is not None:
@@ -713,9 +844,10 @@ def main() -> None:
                     "epoch/train_loss": float(train_loss),
                     "val/epoch": float(epoch),
                     "val/loss": float(val_loss),
-                    "val/loss_answer": float(val_metrics.get("loss_answer", 0.0)),
-                    "val/loss_localization": float(val_metrics.get("loss_localization", 0.0)),
-                    "val/loss_recognition": float(val_metrics.get("loss_recognition", 0.0)),
+                    "val/loss/total": float(val_metrics.get("loss_total", val_loss)),
+                    "val/loss/answer": float(val_metrics.get("loss_answer", 0.0)),
+                    "val/loss/point": float(val_metrics.get("loss_point", 0.0)),
+                    "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
                     "metric/val/loss": float(val_loss),
                 },
                 step=global_step,
@@ -741,8 +873,8 @@ def main() -> None:
             device,
             amp_dtype,
             loss_answer_weight=loss_answer_weight,
-            loss_localization_weight=loss_localization_weight,
-            loss_recognition_weight=loss_recognition_weight,
+            loss_point_weight=loss_point_weight,
+            loss_object_weight=loss_object_weight,
             loss_use_lm_fallback=loss_use_lm_fallback,
             show_tqdm=bool(args.show_tqdm),
             desc="Eval (checkpoint)",
@@ -757,9 +889,10 @@ def main() -> None:
                 {
                     "val/epoch": 0.0,
                     "val/loss": float(best_val_loss),
-                    "val/loss_answer": float(val_metrics.get("loss_answer", 0.0)),
-                    "val/loss_localization": float(val_metrics.get("loss_localization", 0.0)),
-                    "val/loss_recognition": float(val_metrics.get("loss_recognition", 0.0)),
+                    "val/loss/total": float(val_metrics.get("loss_total", best_val_loss)),
+                    "val/loss/answer": float(val_metrics.get("loss_answer", 0.0)),
+                    "val/loss/point": float(val_metrics.get("loss_point", 0.0)),
+                    "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
                     "metric/val/loss": float(best_val_loss),
                 },
                 step=global_step,
@@ -820,6 +953,7 @@ def main() -> None:
                 point_decimals=int(args.point_decimals),
                 visual_prompting=bool(args.visual_prompting),
             )
+            _maybe_log_target_example("test", test_ds)
             test_loader = DataLoader(
                 test_ds,
                 batch_size=max(1, int(args.test_batch_size)),
@@ -851,7 +985,19 @@ def main() -> None:
                         "test/acc@1": float(test_metrics.get("acc@1", 0.0)),
                         "test/acc@3": float(test_metrics.get("acc@3", 0.0)),
                         "test/multiacc@1": float(test_metrics.get("multiacc@1", 0.0)),
-                        "test/ObjectIDValidRate": float(test_metrics.get("ObjectIDValidRate", 0.0)),
+                        "test/ObjectTokenValidRate": float(test_metrics.get("ObjectTokenValidRate", 0.0)),
+                        "test/ObjectParseFailTop1Rate": float(test_metrics.get("ObjectParseFailTop1Rate", 0.0)),
+                        "test/ObjectParseFailBeamRate": float(test_metrics.get("ObjectParseFailBeamRate", 0.0)),
+                        "test/ObjectParseTop1FromTokenRate": float(test_metrics.get("ObjectParseTop1FromTokenRate", 0.0)),
+                        "test/ObjectParseTop1FromTextRate": float(test_metrics.get("ObjectParseTop1FromTextRate", 0.0)),
+                        "test/ObjectParseBeamFromTokenRate": float(test_metrics.get("ObjectParseBeamFromTokenRate", 0.0)),
+                        "test/ObjectParseBeamFromTextRate": float(test_metrics.get("ObjectParseBeamFromTextRate", 0.0)),
+                        "test/ObjectParseFailTop1Count": float(test_metrics.get("ObjectParseFailTop1Count", 0.0)),
+                        "test/ObjectParseFailBeamCount": float(test_metrics.get("ObjectParseFailBeamCount", 0.0)),
+                        "test/ObjectParseTop1FromTokenCount": float(test_metrics.get("ObjectParseTop1FromTokenCount", 0.0)),
+                        "test/ObjectParseTop1FromTextCount": float(test_metrics.get("ObjectParseTop1FromTextCount", 0.0)),
+                        "test/ObjectParseBeamFromTokenCount": float(test_metrics.get("ObjectParseBeamFromTokenCount", 0.0)),
+                        "test/ObjectParseBeamFromTextCount": float(test_metrics.get("ObjectParseBeamFromTextCount", 0.0)),
                         "test/num_samples": float(test_metrics["num_samples"]),
                         "test/num_valid_targets": float(test_metrics["num_valid_targets"]),
                     },

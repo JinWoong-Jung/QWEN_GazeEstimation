@@ -56,24 +56,28 @@ text:
   point_decimals: 4
 
 loss:
+  # Recommended starting weights (special-token object setting):
+  # total = w_answer * L_answer + w_point * L_point + w_object * L_object
+  # Keep answer low (format regularization), point baseline, object moderately higher.
   loss_answer_weight: 0.1
-  loss_localization_weight: 1.0
-  loss_recognition_weight: 1.0
+  loss_point_weight: 1.0
+  loss_object_weight: 1.5
   loss_use_lm_fallback: false
 
 prompt:
   prompt_template: ""
   visual_prompting: true
   prompt_text: |
-    Given the highlighted subject, estimate gaze point and identify the gazed object class ID.
+    Given the highlighted subject, estimate gaze point and the gazed object token.
     Subject head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]
-    You must output exactly two lines in this format:
-    Point: x y
-    ObjectID: id
+    Output exactly two lines.
+    Line 1: Point: x y
+    Line 2: Object: <obj_xxx>
+    The object must be exactly one object token from the predefined vocabulary.
     Do not output any extra text.
   answer_template: |
     Point: {point_x} {point_y}
-    ObjectID: {object_id}
+    Object: {object_token}
   fallback_target_text: "unknown"
   fallback_object_id: -1
 

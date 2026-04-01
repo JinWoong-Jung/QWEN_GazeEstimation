@@ -2,7 +2,7 @@
 시각-언어 생성 모델 기반 시선 대상 Localization/Recognition 통합 프레임워크
 
 초록
-본 프레임워크는 단일 시각-언어 생성 모델을 이용해 시선 추정 문제를 두 하위 과제인 (1) 시선 좌표 예측(localization)과 (2) 응시 객체 식별(recognition)로 동시에 해결한다. 입력은 장면 이미지와 사람의 머리 영역 정보이며, 출력은 고정된 텍스트 형식 `Point: x y` 및 `ObjectID: id`이다. 학습 시 출력 문자열 내부의 의미 단위(point, object id)를 분리해 마스킹 기반 다중 손실을 적용하고, 추론 시 생성 결과를 파싱해 위치·분류 지표를 동시에 평가한다. 또한 recognition 라벨의 불완전성을 보완하기 위해 보조 주석 기반 매핑(fallback)을 도입하고, localization/recognition 감독 신호를 분리해 한 작업의 결측이 다른 작업 학습을 저해하지 않도록 설계했다.
+본 프레임워크는 단일 시각-언어 생성 모델을 이용해 시선 추정 문제를 두 하위 과제인 (1) 시선 좌표 예측(localization)과 (2) 응시 객체 식별(recognition)로 동시에 해결한다. 입력은 장면 이미지와 사람의 머리 영역 정보이며, 출력은 고정된 텍스트 형식 `Point: x y` 및 `Object: <obj_xxx>`이다. 학습 시 출력 문자열 내부의 의미 단위(point, object token)를 분리해 마스킹 기반 다중 손실을 적용하고, 추론 시 생성 결과를 파싱해 위치·분류 지표를 동시에 평가한다. 또한 recognition 라벨의 불완전성을 보완하기 위해 보조 주석 기반 매핑(fallback)을 도입하고, localization/recognition 감독 신호를 분리해 한 작업의 결측이 다른 작업 학습을 저해하지 않도록 설계했다.
 
 1. 문제 정의
 입력 이미지 I와 대상 인물의 머리 박스 b가 주어질 때, 모델은
@@ -10,7 +10,7 @@
 2. 폐집합 클래스 c∈{0,…,K-1}
 를 예측한다. 이를 생성 문제로 변환해 다음과 같은 2줄 텍스트를 출력하도록 학습한다.
 - `Point: x y`
-- `ObjectID: id`
+- `Object: <obj_xxx>`
 
 2. 입력 표현 및 조건부 생성
 모델 입력은 (i) 이미지, (ii) 머리 박스를 포함한 텍스트 프롬프트로 구성된다. 선택적으로 시각 프롬프팅을 적용하여 머리 박스를 이미지 위에 강조(빨간 사각형)함으로써 모델이 주체 인물을 명확히 식별하도록 유도한다. 이 조건부 입력에 대해 생성 모델이 정형 출력 포맷을 따르도록 학습한다.
@@ -18,7 +18,7 @@
 3. 감독 신호 구성
 학습 라벨은 다음 두 축으로 구성된다.
 1. Localization 라벨: GT 시선 좌표 x,y
-2. Recognition 라벨: 객체 클래스 ID
+2. Recognition 라벨: 객체 클래스 ID(내부 정수 라벨, 출력은 `<obj_xxx>` special token)
 Recognition은 1차 라벨(의사 라벨)과 보조 주석을 결합해 매핑률을 높인다. 즉, 1차 매핑 실패 샘플에 대해 보조 주석에서 후보 텍스트를 추출해 클래스 사전에 재매핑한다. 이를 통해 학습 가능한 recognition 샘플 수를 확장한다.
 
 4. 학습 목적함수
@@ -31,7 +31,7 @@ L
 
 - L_answer: 전체 정답 라인 구간
 - L_point: `x,y` 숫자 토큰 구간
-- L_object: `ObjectID` 숫자 토큰 구간
+- L_object: `Object` 라인의 `<obj_xxx>` special token 구간
 
 중요한 점은 localization/recognition 유효성 마스크를 분리했다는 것이다. recognition 라벨이 무효여도 point 감독은 유지되어 localization 학습이 계속 진행된다.
 
@@ -39,15 +39,15 @@ L
 기반 시각-언어 모델은 LoRA 방식으로 파라미터 효율 미세조정한다. 옵티마이저는 AdamW, 스케줄러는 cosine warmup을 사용하며, gradient accumulation과 clipping을 통해 안정적으로 학습한다.
 
 6. 추론 및 후처리
-추론은 beam search 기반 생성으로 수행한다. 생성 텍스트에서 정규식 파싱을 통해 x,y와 object id를 추출한다.
-- Top-1 객체: 첫 유효 object id
-- Top-3 객체: beam 후보에서 중복 제거한 상위 유효 id 집합
+추론은 beam search 기반 생성으로 수행한다. 객체는 생성 token id에서 `<obj_xxx>`를 우선 탐지하고, 실패 시 텍스트 파싱으로 fallback한다.
+- Top-1 객체: 첫 유효 object token
+- Top-3 객체: beam 후보에서 중복 제거한 상위 유효 token 집합
 
 출력 형식이 어긋난 경우(파싱 실패)는 해당 항목을 invalid로 처리하고, 지표 계산에서 적절히 제외/반영한다.
 
 7. 평가 지표
 프레임워크는 생성 품질 + 과제 성능을 동시에 보고한다.
-- 생성 형식: `ExactMatch`, `Contains`, `ObjectIDValidRate`
+- 생성 형식: `ExactMatch`, `Contains`, `ObjectTokenValidRate`
 - Localization: `Avg L2`, `Min L2`
 - Recognition: `acc@1`, `acc@3`, `multiacc@1`
 

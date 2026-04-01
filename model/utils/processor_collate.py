@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from ..modules.preprocess import resize_scene
+from .object_tokens import parse_object_token_span
 
 
 def _build_chat_text(
@@ -111,14 +112,13 @@ def _tokenize_with_offsets(tokenizer: Any, text: str) -> tuple[list[int], list[t
         return [int(x) for x in ids], None
 
 
-def _parse_target_numeric_spans(text: str) -> tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[int, int] | None]:
+def _parse_target_component_spans(text: str) -> tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[int, int] | None]:
     txt = str(text or "")
     num = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
     m_point = re.search(rf"(?im)^\s*point\s*:\s*({num})\s*[,\s]+\s*({num})\s*$", txt)
-    m_obj = re.search(r"(?im)^\s*objectid\s*:\s*(-?\d+)\s*$", txt)
     x_span = (int(m_point.start(1)), int(m_point.end(1))) if m_point is not None else None
     y_span = (int(m_point.start(2)), int(m_point.end(2))) if m_point is not None else None
-    o_span = (int(m_obj.start(1)), int(m_obj.end(1))) if m_obj is not None else None
+    o_span = parse_object_token_span(txt)
     return x_span, y_span, o_span
 
 
@@ -167,7 +167,7 @@ def _build_component_loss_masks(
         if ans_offsets is None or len(ans_offsets) != len(ans_ids):
             continue
 
-        x_span, y_span, o_span = _parse_target_numeric_spans(ans_txt)
+        x_span, y_span, o_span = _parse_target_component_spans(ans_txt)
         for j, (a, b) in enumerate(ans_offsets):
             if b <= a:
                 continue
@@ -339,7 +339,7 @@ class QwenTrainCollator:
             dim=0,
         ).to(dtype=torch.float32).flatten()
 
-        joint_inputs, labels, loss_mask_answer, loss_mask_point, loss_mask_objectid = _build_train_inputs(
+        joint_inputs, labels, loss_mask_answer, loss_mask_point, loss_mask_object = _build_train_inputs(
             processor=self.processor,
             scene_images=scene_images,
             text_inputs=text_inputs,
@@ -359,7 +359,7 @@ class QwenTrainCollator:
             "target_label": torch.tensor([int(x["target_label"]) for x in batch], dtype=torch.long),
             "loss_mask_answer": loss_mask_answer,
             "loss_mask_point": loss_mask_point,
-            "loss_mask_objectid": loss_mask_objectid,
+            "loss_mask_object": loss_mask_object,
         }
         if self.include_raw_inputs:
             out["scene_images"] = list(scene_images)

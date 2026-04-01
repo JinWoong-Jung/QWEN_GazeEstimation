@@ -13,6 +13,7 @@ from .utils.data_utils import (
     build_prompt,
     sanitize_bbox_pixels,
 )
+from .utils.object_tokens import build_object_token, format_answer, object_token_width
 
 
 def _format_target_text(
@@ -52,13 +53,22 @@ def _format_target_text(
     else:
         is_valid_obj = int(obj_id) >= 0
     is_valid = 1.0 if is_valid_obj else 0.0
-    if not is_valid_obj:
-        obj_id = int(fallback_object_id)
+    obj_w = object_token_width(int(num_classes))
+    if is_valid_obj:
+        obj_token = build_object_token(int(obj_id), width=obj_w)
+    else:
+        if int(num_classes) > 0:
+            safe_fallback_id = int(fallback_object_id)
+            if (safe_fallback_id < 0) or (safe_fallback_id >= int(num_classes)):
+                safe_fallback_id = 0
+        else:
+            safe_fallback_id = max(0, int(fallback_object_id))
+        obj_token = build_object_token(int(safe_fallback_id), width=obj_w)
 
     dec = max(0, int(point_decimals))
     px = f"{_clamp01(point_x):.{dec}f}"
     py = f"{_clamp01(point_y):.{dec}f}"
-    tpl = str(answer_template or "Point: {point_x} {point_y}\nObjectID: {object_id}")
+    tpl = str(answer_template or "Point: {point_x} {point_y}\nObject: {object_token}")
     try:
         text = tpl.format(
             label_text=raw,
@@ -66,9 +76,16 @@ def _format_target_text(
             point_x=px,
             point_y=py,
             object_id=int(obj_id),
+            object_token=str(obj_token),
         )
     except Exception:
-        text = f"Point: {px} {py}\nObjectID: {int(obj_id)}"
+        text = format_answer(
+            point_x=float(point_x),
+            point_y=float(point_y),
+            label_id=int(safe_fallback_id if (not is_valid_obj) else int(obj_id)),
+            point_decimals=dec,
+            width=int(obj_w),
+        )
     return str(text), float(is_valid)
 
 
@@ -107,7 +124,7 @@ class GazeDataset(Dataset):
         vocab2id: dict[str, int] | None = None,
         vocab2id_lower: dict[str, int] | None = None,
         num_classes: int = 0,
-        answer_template: str = "Point: {point_x} {point_y}\nObjectID: {object_id}",
+        answer_template: str = "Point: {point_x} {point_y}\nObject: {object_token}",
         fallback_target_text: str = "unknown",
         fallback_object_id: int = -1,
         point_decimals: int = 4,
@@ -121,7 +138,7 @@ class GazeDataset(Dataset):
         self.vocab2id = vocab2id or {}
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
-        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObjectID: {object_id}")
+        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: {object_token}")
         self.fallback_target_text = str(fallback_target_text)
         self.fallback_object_id = int(fallback_object_id)
         self.point_decimals = int(point_decimals)
@@ -188,7 +205,7 @@ class GazeTestDataset(Dataset):
         vocab2id: dict[str, int] | None = None,
         vocab2id_lower: dict[str, int] | None = None,
         num_classes: int = 0,
-        answer_template: str = "Point: {point_x} {point_y}\nObjectID: {object_id}",
+        answer_template: str = "Point: {point_x} {point_y}\nObject: {object_token}",
         fallback_target_text: str = "unknown",
         fallback_object_id: int = -1,
         point_decimals: int = 4,
@@ -201,7 +218,7 @@ class GazeTestDataset(Dataset):
         self.vocab2id = vocab2id or {}
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
-        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObjectID: {object_id}")
+        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: {object_token}")
         self.fallback_target_text = str(fallback_target_text)
         self.fallback_object_id = int(fallback_object_id)
         self.point_decimals = int(point_decimals)

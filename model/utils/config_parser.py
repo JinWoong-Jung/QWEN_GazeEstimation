@@ -115,9 +115,21 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--max_text_length", type=int, default=int(_default(d, "max_text_length", 256)))
     p.add_argument("--generation_max_new_tokens", type=int, default=int(_default(d, "generation_max_new_tokens", 16)))
     p.add_argument("--point_decimals", type=int, default=int(_default(d, "point_decimals", 4)))
-    p.add_argument("--loss_answer_weight", type=float, default=float(_default(d, "loss_answer_weight", 0.0)))
+    p.add_argument("--loss_answer_weight", type=float, default=float(_default(d, "loss_answer_weight", 0.1)))
+    p.add_argument(
+        "--loss_point_weight",
+        type=float,
+        default=float(_default(d, "loss_point_weight", _default(d, "loss_localization_weight", 1.0))),
+    )
+    p.add_argument(
+        "--loss_object_weight",
+        type=float,
+        default=float(_default(d, "loss_object_weight", _default(d, "loss_recognition_weight", 1.5))),
+    )
+    # TODO(cleanup): keep legacy CLI aliases temporarily for older run scripts.
+    # Prefer --loss_point_weight / --loss_object_weight in all new configs.
     p.add_argument("--loss_localization_weight", type=float, default=float(_default(d, "loss_localization_weight", 1.0)))
-    p.add_argument("--loss_recognition_weight", type=float, default=float(_default(d, "loss_recognition_weight", 1.0)))
+    p.add_argument("--loss_recognition_weight", type=float, default=float(_default(d, "loss_recognition_weight", 1.5)))
     p.add_argument("--loss_use_lm_fallback", dest="loss_use_lm_fallback", action="store_true")
     p.add_argument("--no_loss_use_lm_fallback", dest="loss_use_lm_fallback", action="store_false")
     p.set_defaults(loss_use_lm_fallback=bool(_default(d, "loss_use_lm_fallback", False)))
@@ -130,7 +142,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument(
         "--answer_template",
         type=str,
-        default=str(_default(d, "answer_template", "Point: {point_x} {point_y}\nObjectID: {object_id}")),
+        default=str(_default(d, "answer_template", "Point: {point_x} {point_y}\nObject: {object_token}")),
     )
     p.add_argument("--fallback_target_text", type=str, default=str(_default(d, "fallback_target_text", "unknown")))
     p.add_argument("--fallback_object_id", type=int, default=int(_default(d, "fallback_object_id", -1)))
