@@ -1,0 +1,122 @@
+판단하면, 현재 리포지토리는 “label embedding matching / retrieval”로 완전히 정합되게 설계된 상태는 아닙니다.
+더 정확히 말하면, config·trainer 일부는 retrieval 방향으로 움직였지만, 실제 model / collator / loss / dataset target formatting은 아직 generation-based object token 설계에 묶여 있습니다. 그래서 지금 상태는 부분 전환 상태로 보는 것이 맞습니다.
+
+왜 그렇게 판단하는가
+1) 상위 설정은 아직 “object token 생성”을 전제로 합니다
+
+config.yaml은 여전히 프롬프트를
+Line 1: Point: x y / Line 2: Object:
+형태로 두고, **“The object must be exactly one object token from the predefined vocabulary.”**라고 명시합니다. 또한 answer_template도 Object: {object_token}이고, loss 주석도 special-token object setting을 전제로 적혀 있습니다. 즉 최상위 문제 정의 자체가 아직 semantic embedding retrieval이 아니라 predefined object token generation 쪽에 가깝습니다.
+
+2) 모델 본체가 retrieval 출력을 만들지 않습니다
+
+model/model.py의 QwenTextGenerationModel은 사실상 Qwen wrapper이고, forward에서 반환하는 것이 loss와 logits뿐입니다.
+즉 현재 모델은:
+
+output_hidden_states=True
+<obj_emb> 위치 추출
+2560→512 projector
+pred_object_emb 반환
+
+같은 retrieval 핵심 경로를 아직 제공하지 않습니다. 이 상태에서는 label embedding matching을 위한 예측 임베딩이 모델 인터페이스에 존재하지 않습니다.
+
+3) 손실 함수가 아직 InfoNCE / retrieval loss가 아닙니다
+
+loss_utils.py는 _masked_token_ce()와 compute_structured_losses()만 가지고 있고, 여기서 계산하는 것은 loss_answer, loss_point, loss_object의 masked token cross-entropy입니다.
+즉 object branch도 여전히 “정답 object token을 맞히는가”를 학습할 뿐, 정답 label embedding과 가까워지도록 학습하지 않습니다. InfoNCE, contrastive, retrieval CE, pred_emb vs label_bank 같은 경로는 이 파일에 없습니다.
+
+4) 데이터셋과 collator도 아직 object token supervision 기준입니다
+
+datasets.py의 _format_target_text()는 build_object_token()을 통해 object id를 <obj_xxx> 계열 token으로 바꿔 target text를 만듭니다. 그리고 train/test dataset은 target_label이나 target_label_ids는 내보내지만, 정답 label embedding 자체는 만들지 않습니다. 즉 supervision의 실체가 여전히 target text 안의 object token입니다.
+
+processor_collate.py도 마찬가지입니다. 여기서는 parse_target_spans, component_masks, loss_mask_object를 통해 target text 안에서 object 문자열 span을 찾아 object token CE 마스크를 만듭니다. 반면 retrieval 구조에 필요한 <obj_emb> 위치 인덱스나 **object slot hidden state를 뽑기 위한 object_positions**는 만들지 않습니다. 즉 collator 설계도 아직 generation-token loss에 최적화되어 있습니다.
+
+5) 그런데 trainer는 retrieval 쪽 설정을 이미 일부 도입했습니다
+
+반대로 trainer.py를 보면 retrieval 쪽 흔적이 분명히 있습니다.
+여기서는:
+
+OBJ_SLOT / add_slot_token()으로 object slot token을 tokenizer에 추가하고,
+object_embedding_dim
+object_temperature
+object_loss_mode (retrieval, infonce, full_bank_retrieval)
+build_vocab_embedding_matrix(...)
+train/test label embedding bank 구축
+
+같은 요소를 로드합니다. 즉 trainer는 이미 label embedding bank 기반 학습/평가를 하려는 방향으로 확장되어 있습니다. 또한 로깅 payload에도 RetrievalAcc@1, RetrievalAcc@3, RetrievalMultiAcc@1 같은 이름이 들어 있습니다.
+
+종합 판단
+
+그래서 현재 구현을 한 줄로 판정하면:
+
+의도는 retrieval 쪽으로 이동했지만, 실제 학습 경로는 아직 generation/object-token CE에 묶여 있어 end-to-end로는 정합하지 않다.
+
+즉 **“label embedding 매칭을 잘 수행하도록 설계되었는가?”**라는 질문에는 현재 기준으로는 아직 아니라고 보는 것이 맞습니다.
+이유는 trainer만 retrieval 준비가 되어 있고, 실제로 retrieval에 필요한 핵심 경로인:
+
+모델의 pred_object_emb 산출
+collator의 object_positions
+loss의 InfoNCE / retrieval CE
+dataset target의 <obj_emb> slot supervision
+
+이 빠져 있거나 generation 구조와 충돌하기 때문입니다.
+
+지금 구조에서 가장 큰 설계 불일치
+
+가장 큰 문제는 object를 두 가지 방식으로 동시에 정의하고 있다는 점입니다.
+
+하나는 old path:
+
+object = predefined vocabulary token
+target text에 직접 들어감
+object CE로 학습
+span mask로 supervision
+
+다른 하나는 new path:
+
+object = slot hidden state
+projector로 512차원 embedding
+label bank와 matching
+retrieval metric 사용
+
+이 두 방식이 현재 코드상에서 완전히 통합되지 않았습니다. 그래서 설계가 “둘 중 하나로 명확히 수렴한 상태”가 아닙니다.
+
+내가 권하는 판정과 수정 우선순위
+
+판정은 이렇게 하겠습니다.
+
+데이터 로딩/기본 학습 파이프라인: 돌아갈 수 있음
+object token generation baseline: 비교적 일관적
+label embedding retrieval 파이프라인: 아직 미완성
+현재 상태로 semantic retrieval 성능을 신뢰할 수 있는가: 아니오
+
+수정 우선순위는 명확합니다.
+
+1. object target을 하나로 통일
+
+Object: {object_token} 대신 Object: <obj_emb> 또는 object slot 하나로 고정해야 합니다. 지금처럼 실제 class token을 target text에 넣으면 retrieval 정의와 충돌합니다.
+
+2. model forward에서 hidden state와 pred_object_emb를 반환
+
+현재 wrapper는 logits만 반환하므로 retrieval branch가 실질적으로 없습니다. 여기서 output_hidden_states=True, slot position indexing, projector, normalization이 들어가야 합니다.
+
+3. collator에서 object_positions를 만들어야 함
+
+지금의 loss_mask_object는 token CE용입니다. retrieval로 가려면 span mask가 아니라 slot index가 필요합니다.
+
+4. loss_utils.py를 retrieval loss 중심으로 재작성
+
+현재는 masked token CE뿐입니다. 여기에 pred_object_emb와 label_bank를 받아 normalized similarity logits를 만들고 retrieval CE / InfoNCE를 계산하는 함수가 들어가야 합니다.
+
+5. evaluation도 generation parse가 아니라 retrieval 점수 기반으로 바꾸기
+
+trainer가 retrieval metric 이름을 갖고 있는 것과 별개로, 실제 평가가 pred_emb @ label_bank.T 구조로 끝까지 이어져야 설계가 닫힙니다.
+
+최종 결론
+
+현재 리포지토리는 “label embedding matching을 잘 수행하도록 이미 완성된 설계”라고 보기는 어렵습니다.
+가장 정확한 표현은:
+
+retrieval로 옮겨가고 있는 중간 단계 코드이며, trainer/config에는 retrieval 개념이 들어갔지만 실제 모델-콜레이터-로스의 주 경로는 아직 object token generation에 남아 있다.
+
+입니다.
