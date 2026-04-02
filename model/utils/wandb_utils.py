@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-def _parse_tags(raw: Any) -> list[str]:
+def parse_tags(raw: Any) -> list[str]:
     if isinstance(raw, (list, tuple)):
         return [str(x).strip() for x in raw if str(x).strip()]
     s = str(raw).strip()
@@ -46,7 +46,7 @@ def init_wandb(args: Any, root: Path):
         wb_kwargs["entity"] = str(args.wandb_entity).strip()
     if str(getattr(args, "wandb_run_name", "")).strip():
         wb_kwargs["name"] = str(args.wandb_run_name).strip()
-    tags = _parse_tags(getattr(args, "wandb_tags", []))
+    tags = parse_tags(getattr(args, "wandb_tags", []))
     if tags:
         wb_kwargs["tags"] = tags
     if str(getattr(args, "wandb_notes", "")).strip():
@@ -73,4 +73,3 @@ def finish_wandb(run: Any) -> None:
         run.finish()
     except Exception:
         pass
-

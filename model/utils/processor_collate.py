@@ -6,42 +6,11 @@ from typing import Any
 import torch
 
 from ..modules.preprocess import resize_scene
-from .object_tokens import parse_object_token_span
+from .common import chat_text
+from .object_tokens import slot_span
 
 
-def _build_chat_text(
-    processor: Any,
-    user_text: str,
-    assistant_text: str | None,
-    *,
-    with_image: bool,
-    add_generation_prompt: bool,
-) -> str:
-    user_txt = str(user_text)
-    if hasattr(processor, "apply_chat_template"):
-        content: list[dict[str, str]] = []
-        if with_image:
-            content.append({"type": "image"})
-        content.append({"type": "text", "text": user_txt})
-        messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
-        if assistant_text is not None:
-            messages.append({"role": "assistant", "content": [{"type": "text", "text": str(assistant_text)}]})
-        try:
-            return processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=bool(add_generation_prompt),
-            )
-        except TypeError:
-            return processor.apply_chat_template(messages, tokenize=False)
-
-    prefix = f"<|vision_start|><|image_pad|><|vision_end|>\n{user_txt}" if with_image else user_txt
-    if assistant_text is None:
-        return prefix
-    return f"{prefix}\n{str(assistant_text)}"
-
-
-def _move_labels_to_ignore_padding(
+def mask_padding_labels(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None,
     pad_token_id: int | None,
@@ -54,7 +23,7 @@ def _move_labels_to_ignore_padding(
     return labels
 
 
-def _find_subseq(seq: list[int], sub: list[int], *, start: int = 0, from_right: bool = False) -> int:
+def find_subseq(seq: list[int], sub: list[int], *, start: int = 0, from_right: bool = False) -> int:
     if len(sub) <= 0:
         return -1
     n = len(seq)
@@ -73,7 +42,7 @@ def _find_subseq(seq: list[int], sub: list[int], *, start: int = 0, from_right: 
     return -1
 
 
-def _tokenize_with_offsets(tokenizer: Any, text: str) -> tuple[list[int], list[tuple[int, int]] | None]:
+def tokenize_offsets(tokenizer: Any, text: str) -> tuple[list[int], list[tuple[int, int]] | None]:
     txt = str(text)
     try:
         out = tokenizer(
@@ -112,17 +81,17 @@ def _tokenize_with_offsets(tokenizer: Any, text: str) -> tuple[list[int], list[t
         return [int(x) for x in ids], None
 
 
-def _parse_target_component_spans(text: str) -> tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[int, int] | None]:
+def parse_target_spans(text: str) -> tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[int, int] | None]:
     txt = str(text or "")
     num = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
     m_point = re.search(rf"(?im)^\s*point\s*:\s*({num})\s*[,\s]+\s*({num})\s*$", txt)
     x_span = (int(m_point.start(1)), int(m_point.end(1))) if m_point is not None else None
     y_span = (int(m_point.start(2)), int(m_point.end(2))) if m_point is not None else None
-    o_span = parse_object_token_span(txt)
+    o_span = slot_span(txt)
     return x_span, y_span, o_span
 
 
-def _build_component_loss_masks(
+def component_masks(
     processor: Any,
     joint_inputs: dict[str, Any],
     target_texts: list[str],
@@ -154,11 +123,11 @@ def _build_component_loss_masks(
 
         seq_ids = [int(x) for x in input_ids[i, :valid_len].tolist()]
         ans_txt = str(target_texts[i])
-        ans_ids, ans_offsets = _tokenize_with_offsets(tokenizer, ans_txt)
+        ans_ids, ans_offsets = tokenize_offsets(tokenizer, ans_txt)
         if len(ans_ids) <= 0:
             continue
 
-        ans_start = _find_subseq(seq_ids, ans_ids, from_right=True)
+        ans_start = find_subseq(seq_ids, ans_ids, from_right=True)
         if ans_start < 0:
             continue
         ans_end = min(valid_len, ans_start + len(ans_ids))
@@ -167,7 +136,7 @@ def _build_component_loss_masks(
         if ans_offsets is None or len(ans_offsets) != len(ans_ids):
             continue
 
-        x_span, y_span, o_span = _parse_target_component_spans(ans_txt)
+        x_span, y_span, o_span = parse_target_spans(ans_txt)
         for j, (a, b) in enumerate(ans_offsets):
             if b <= a:
                 continue
@@ -184,7 +153,7 @@ def _build_component_loss_masks(
     return answer_mask, point_mask, object_mask
 
 
-def _build_train_inputs(
+def build_train_inputs(
     processor: Any,
     scene_images: list[Any],
     text_inputs: list[str],
@@ -198,7 +167,7 @@ def _build_train_inputs(
         raise ValueError("scene/text/target batch sizes must match.")
 
     chat_texts = [
-        _build_chat_text(
+        chat_text(
             processor=processor,
             user_text=text_inputs[i],
             assistant_text=target_texts[i],
@@ -220,12 +189,12 @@ def _build_train_inputs(
     tokenizer = getattr(processor, "tokenizer", None)
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     attention_mask = joint_inputs.get("attention_mask", None)
-    labels = _move_labels_to_ignore_padding(
+    labels = mask_padding_labels(
         input_ids=joint_inputs["input_ids"],
         attention_mask=attention_mask,
         pad_token_id=pad_token_id,
     )
-    answer_mask, point_mask, object_mask = _build_component_loss_masks(
+    answer_mask, point_mask, object_mask = component_masks(
         processor=processor,
         joint_inputs=dict(joint_inputs),
         target_texts=target_texts,
@@ -265,7 +234,7 @@ def _build_train_inputs(
     return dict(joint_inputs), labels, answer_mask, point_mask, object_mask
 
 
-def _build_infer_inputs(
+def build_infer_inputs(
     processor: Any,
     scene_images: list[Any],
     text_inputs: list[str],
@@ -274,7 +243,7 @@ def _build_infer_inputs(
     if len(scene_images) != len(text_inputs):
         raise ValueError("scene/text batch sizes must match for inference inputs.")
     chat_texts = [
-        _build_chat_text(
+        chat_text(
             processor=processor,
             user_text=t,
             assistant_text=None,
@@ -339,7 +308,7 @@ class QwenTrainCollator:
             dim=0,
         ).to(dtype=torch.float32).flatten()
 
-        joint_inputs, labels, loss_mask_answer, loss_mask_point, loss_mask_object = _build_train_inputs(
+        joint_inputs, labels, loss_mask_answer, loss_mask_point, loss_mask_object = build_train_inputs(
             processor=self.processor,
             scene_images=scene_images,
             text_inputs=text_inputs,
@@ -387,7 +356,7 @@ class QwenTestCollator:
             scene_size=self.scene_size,
         )
         text_inputs = [str(x["text_input"]) for x in batch]
-        joint_inputs = _build_infer_inputs(
+        joint_inputs = build_infer_inputs(
             processor=self.processor,
             scene_images=scene_images,
             text_inputs=text_inputs,

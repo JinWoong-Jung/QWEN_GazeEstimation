@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 
-def _to_size_tuple(size: int | tuple[int, int]) -> tuple[int, int]:
+def size_tuple(size: int | tuple[int, int]) -> tuple[int, int]:
     if isinstance(size, int):
         return (size, size)
     if len(size) != 2:
@@ -16,7 +16,7 @@ def _to_size_tuple(size: int | tuple[int, int]) -> tuple[int, int]:
     return int(size[0]), int(size[1])
 
 
-def _resize_tensor_image(
+def resize_tensor_image(
     image: torch.Tensor,
     size: tuple[int, int],
     mode: str = "bilinear",
@@ -37,7 +37,7 @@ def _resize_tensor_image(
     return resized if is_batched else resized.squeeze(0)
 
 
-def _resize_pil_image(
+def resize_pil_image(
     image: Image.Image,
     size: tuple[int, int],
     resample: int = Image.Resampling.BILINEAR,
@@ -46,19 +46,19 @@ def _resize_pil_image(
     return image.resize((w, h), resample=resample)
 
 
-def _resize_any(
+def resize_any(
     image: Any,
     size: tuple[int, int],
 ) -> Any:
     if image is None:
         return None
     if isinstance(image, (list, tuple)):
-        resized = [_resize_any(x, size) for x in image]
+        resized = [resize_any(x, size) for x in image]
         return type(image)(resized) if isinstance(image, tuple) else resized
     if isinstance(image, torch.Tensor):
-        return _resize_tensor_image(image, size=size)
+        return resize_tensor_image(image, size=size)
     if isinstance(image, Image.Image):
-        return _resize_pil_image(image, size=size)
+        return resize_pil_image(image, size=size)
     raise TypeError(f"unsupported image type: {type(image)}")
 
 
@@ -68,17 +68,17 @@ def resize_scene_and_head(
     scene_size: int | tuple[int, int] = (512, 512),
     head_size: int | tuple[int, int] = (224, 224),
 ) -> tuple[Any, Any]:
-    scene_hw = _to_size_tuple(scene_size)
-    head_hw = _to_size_tuple(head_size)
-    return _resize_any(scene_image, scene_hw), _resize_any(head_image, head_hw)
+    scene_hw = size_tuple(scene_size)
+    head_hw = size_tuple(head_size)
+    return resize_any(scene_image, scene_hw), resize_any(head_image, head_hw)
 
 
 def resize_scene(
     scene_image: Any,
     scene_size: int | tuple[int, int] = (512, 512),
 ) -> Any:
-    scene_hw = _to_size_tuple(scene_size)
-    return _resize_any(scene_image, scene_hw)
+    scene_hw = size_tuple(scene_size)
+    return resize_any(scene_image, scene_hw)
 
 
 class GazeInputResizer(nn.Module):
@@ -88,8 +88,8 @@ class GazeInputResizer(nn.Module):
         head_size: int | tuple[int, int] = (224, 224),
     ) -> None:
         super().__init__()
-        self.scene_size = _to_size_tuple(scene_size)
-        self.head_size = _to_size_tuple(head_size)
+        self.scene_size = size_tuple(scene_size)
+        self.head_size = size_tuple(head_size)
 
     def forward(self, scene_image: Any, head_image: Any) -> tuple[Any, Any]:
         return resize_scene_and_head(

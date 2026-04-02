@@ -11,6 +11,7 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
+  label_embed_dir: "data/gazefollow/label-embeds"
   output_dir: "checkpoints/qwen_text_only"
 
 data:
@@ -52,34 +53,37 @@ image:
 text:
   # NOTE: currently not applied because collator tokenization uses truncation=False.
   max_text_length: 256
-  generation_max_new_tokens: 24
+  generation_max_new_tokens: 16
+  object_embedding_dim: 512
+  test_retrieval_top_k: 3
   point_decimals: 4
 
 loss:
-  # Recommended starting weights (special-token object setting):
   # total = w_answer * L_answer + w_point * L_point + w_object * L_object
-  # Keep answer low (format regularization), point baseline, object moderately higher.
-  loss_answer_weight: 0.1
-  loss_point_weight: 1.0
-  loss_object_weight: 1.0
+  # L_object: full label bank retrieval CE (InfoNCE).
+  # Priority: localization(point) > output format(answer) > object retrieval.
+  loss_answer_weight: 0.6
+  loss_point_weight: 2.0
+  loss_object_weight: 0.5
+  object_loss_mode: "retrieval"
+  object_temperature: 0.07
   loss_use_lm_fallback: false
 
 prompt:
   prompt_template: ""
   visual_prompting: true
   prompt_text: |
-    Given the highlighted subject, estimate gaze point and the gazed object token.
+    Given the highlighted subject, estimate gaze point and object embedding slot.
     Subject head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]
-    Output exactly two lines.
-    Line 1: Point: x y
-    Line 2: Object: <obj_xxx>
-    The object must be exactly one object token from the predefined vocabulary.
-    Do not output any extra text.
+    Output EXACTLY two lines in this exact format:
+    Point: x y
+    Object: <obj_emb>
+    Keep <obj_emb> exactly as-is (fixed marker token).
+    Do not output any extra text, symbols, or lines.
   answer_template: |
     Point: {point_x} {point_y}
-    Object: {object_token}
+    Object: <obj_emb>
   fallback_target_text: "unknown"
-  fallback_object_id: -1
 
 lora:
   lora_r: 16

@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 
-def _resolve_qwen_model(model: Any) -> Any:
+def resolve_qwen_model(model: Any) -> Any:
     if hasattr(model, "qwen"):
         return model.qwen
     if hasattr(model, "backbone") and hasattr(model.backbone, "qwen"):
@@ -35,11 +35,16 @@ def save_checkpoint(
                     pass
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    qwen_model = _resolve_qwen_model(model)
+    qwen_model = resolve_qwen_model(model)
     if hasattr(qwen_model, "save_pretrained"):
         qwen_model.save_pretrained(str(ckpt_dir / "lora_adapter"))
     if hasattr(processor, "save_pretrained"):
         processor.save_pretrained(str(ckpt_dir / "processor"))
+    if hasattr(model, "object_projector"):
+        try:
+            torch.save(model.object_projector.state_dict(), ckpt_dir / "object_projector.pt")
+        except Exception:
+            pass
 
     torch.save(
         {
@@ -62,7 +67,7 @@ def load_checkpoint_for_eval(
 
     adapter_dir = ckpt_dir / "lora_adapter"
     if adapter_dir.exists():
-        qwen_model = _resolve_qwen_model(model)
+        qwen_model = resolve_qwen_model(model)
         if hasattr(qwen_model, "load_adapter"):
             adapter_name = "best_eval"
             try:
@@ -84,4 +89,12 @@ def load_checkpoint_for_eval(
     if trainer_state_path.exists():
         _ = torch.load(trainer_state_path, map_location=device)
         loaded_any = True
+    object_projector_path = ckpt_dir / "object_projector.pt"
+    if object_projector_path.exists() and hasattr(model, "object_projector"):
+        try:
+            st = torch.load(object_projector_path, map_location=device)
+            model.object_projector.load_state_dict(st, strict=False)
+            loaded_any = True
+        except Exception:
+            pass
     return loaded_any

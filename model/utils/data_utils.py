@@ -5,7 +5,7 @@ import random
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -62,27 +62,11 @@ def build_prompt(
     )
 
 
-def gaussian_heatmap(
-    x_norm: float,
-    y_norm: float,
-    size: tuple[int, int],
-    sigma: float,
-) -> torch.Tensor:
-    h, w = int(size[0]), int(size[1])
-    cx = float(x_norm) * (w - 1)
-    cy = float(y_norm) * (h - 1)
-    ys = torch.arange(h, dtype=torch.float32).view(h, 1)
-    xs = torch.arange(w, dtype=torch.float32).view(1, w)
-    dist2 = (xs - cx) ** 2 + (ys - cy) ** 2
-    denom = max(float(sigma), 1e-6) ** 2 * 2.0
-    return torch.exp(-dist2 / denom)
-
-
-def _clamp01(x: float) -> float:
+def clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
-def _expand_px(
+def expand_bbox(
     bbox_px: tuple[float, float, float, float],
     width: int,
     height: int,
@@ -100,7 +84,7 @@ def _expand_px(
     return nx1, ny1, nx2, ny2
 
 
-def _random_safe_crop(
+def safe_crop(
     scene: Image.Image,
     gaze_x: float,
     gaze_y: float,
@@ -111,8 +95,8 @@ def _random_safe_crop(
         return scene, gaze_x, gaze_y, bbox_px
 
     w, h = scene.size
-    gx = _clamp01(gaze_x) * (w - 1)
-    gy = _clamp01(gaze_y) * (h - 1)
+    gx = clamp01(gaze_x) * (w - 1)
+    gy = clamp01(gaze_y) * (h - 1)
     x1, y1, x2, y2 = bbox_px
 
     min_x = max(0.0, min(gx, x1))
@@ -154,10 +138,10 @@ def _random_safe_crop(
     if ny2 <= ny1:
         ny2 = min(float(new_h), ny1 + 1.0)
 
-    return cropped, _clamp01(gx_new), _clamp01(gy_new), (nx1, ny1, nx2, ny2)
+    return cropped, clamp01(gx_new), clamp01(gy_new), (nx1, ny1, nx2, ny2)
 
 
-def _maybe_hflip(
+def maybe_hflip(
     scene: Image.Image,
     gaze_x: float,
     bbox_px: tuple[float, float, float, float],
@@ -171,10 +155,10 @@ def _maybe_hflip(
     nx1 = float(w) - x2
     nx2 = float(w) - x1
     ngx = 1.0 - float(gaze_x)
-    return flipped, _clamp01(ngx), (nx1, y1, nx2, y2)
+    return flipped, clamp01(ngx), (nx1, y1, nx2, y2)
 
 
-def _maybe_color_jitter(scene: Image.Image, p: float = 0.8) -> Image.Image:
+def color_jitter(scene: Image.Image, p: float = 0.8) -> Image.Image:
     if random.random() >= float(p):
         return scene
     out = scene
@@ -199,27 +183,27 @@ def apply_train_augmentation(
 
     if random.random() < 0.5:
         scale = random.uniform(1.0, 1.2)
-        bbox_f = _expand_px(bbox_f, width=w, height=h, scale=scale)
+        bbox_f = expand_bbox(bbox_f, width=w, height=h, scale=scale)
 
-    scene, gaze_x, gaze_y, bbox_f = _random_safe_crop(
+    scene, gaze_x, gaze_y, bbox_f = safe_crop(
         scene=scene,
         gaze_x=gaze_x,
         gaze_y=gaze_y,
         bbox_px=bbox_f,
         p=0.5,
     )
-    scene, gaze_x, bbox_f = _maybe_hflip(
+    scene, gaze_x, bbox_f = maybe_hflip(
         scene=scene,
         gaze_x=gaze_x,
         bbox_px=bbox_f,
         p=0.5,
     )
-    scene = _maybe_color_jitter(scene, p=0.8)
+    scene = color_jitter(scene, p=0.8)
 
     nw, nh = scene.size
     x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_f, width=nw, height=nh)
-    gaze_x = _clamp01(gaze_x)
-    gaze_y = _clamp01(gaze_y)
+    gaze_x = clamp01(gaze_x)
+    gaze_y = clamp01(gaze_y)
     return scene, gaze_x, gaze_y, (float(x1), float(y1), float(x2), float(y2))
 
 
@@ -244,7 +228,7 @@ def load_vocab2id(vocab2id_path: Path | None) -> tuple[dict[str, int], dict[str,
     return v, vl
 
 
-def _map_text_to_vocab_id(
+def vocab_id(
     label_text: str,
     vocab2id: dict[str, int] | None = None,
     vocab2id_lower: dict[str, int] | None = None,
@@ -264,12 +248,12 @@ def _map_text_to_vocab_id(
     return -100
 
 
-def _normalize_label_text(txt: str) -> str:
+def clean_label(txt: str) -> str:
     return " ".join(str(txt or "").strip().split())
 
 
-def _annotation_text_candidates(raw: str) -> list[str]:
-    base = _normalize_label_text(raw)
+def annotation_candidates(raw: str) -> list[str]:
+    base = clean_label(raw)
     if not base:
         return []
 
@@ -277,7 +261,7 @@ def _annotation_text_candidates(raw: str) -> list[str]:
     seen: set[str] = set()
 
     def _push(v: str) -> None:
-        t = _normalize_label_text(v)
+        t = clean_label(v)
         if not t:
             return
         key = t.lower()
@@ -288,7 +272,7 @@ def _annotation_text_candidates(raw: str) -> list[str]:
         tl = t.lower()
         for pref in ("a ", "an ", "the "):
             if tl.startswith(pref):
-                t2 = _normalize_label_text(t[len(pref) :])
+                t2 = clean_label(t[len(pref) :])
                 if t2:
                     k2 = t2.lower()
                     if k2 not in seen:
@@ -305,7 +289,7 @@ def _annotation_text_candidates(raw: str) -> list[str]:
     return out
 
 
-def _normalize_split_name(split_name: str | None) -> set[str]:
+def split_aliases(split_name: str | None) -> set[str]:
     if split_name is None:
         return set()
     s = str(split_name).strip().lower()
@@ -316,7 +300,7 @@ def _normalize_split_name(split_name: str | None) -> set[str]:
     return {s}
 
 
-def _build_fallback_annotation_map(
+def build_fallback_map(
     fallback_csvs: list[Path | None] | None,
     fallback_text_key: str = "annotation",
     split_name: str | None = None,
@@ -325,7 +309,7 @@ def _build_fallback_annotation_map(
     if not fallback_csvs:
         return out
 
-    split_filter = _normalize_split_name(split_name)
+    split_filter = split_aliases(split_name)
     for csv_path in fallback_csvs:
         if csv_path is None or (not csv_path.exists()):
             continue
@@ -344,7 +328,7 @@ def _build_fallback_annotation_map(
                     if row_split not in split_filter:
                         continue
                 text_raw = str(row.get(fallback_text_key, "")).strip()
-                cands = _annotation_text_candidates(text_raw)
+                cands = annotation_candidates(text_raw)
                 if not cands:
                     continue
                 key = (path, sample_id)
@@ -356,6 +340,63 @@ def _build_fallback_annotation_map(
     return out
 
 
+def build_embed_id_mapper(
+    vocab2id: dict[str, int],
+    label_embed_dir: Path | None,
+    label_emb_dim: int = 512,
+) -> Callable[[str], int] | None:
+    bank = build_vocab_embedding_matrix(
+        vocab2id=vocab2id,
+        label_embed_dir=label_embed_dir,
+        label_emb_dim=int(label_emb_dim),
+        normalize=True,
+    )
+    if (not torch.is_tensor(bank)) or bank.dim() != 2 or int(bank.shape[0]) <= 0:
+        return None
+    bank = bank.to(dtype=torch.float32)
+    valid = bank.norm(dim=1).gt(0)
+    if int(valid.sum().item()) <= 0:
+        return None
+    valid_ids = [int(x) for x in torch.nonzero(valid, as_tuple=False).flatten().tolist()]
+    valid_bank = bank[valid].contiguous()
+    embed_dir = label_embed_dir if (label_embed_dir is not None and label_embed_dir.exists()) else None
+    if embed_dir is None:
+        return None
+
+    cache: dict[str, int] = {}
+
+    def _map(label_text: str) -> int:
+        txt = clean_label(label_text)
+        if not txt:
+            return -100
+        if txt in cache:
+            return int(cache[txt])
+        emb_path = embed_dir / f"{txt}-emb.pt"
+        if not emb_path.exists():
+            cache[txt] = -100
+            return -100
+        try:
+            vec = torch.load(emb_path, map_location="cpu")
+            if not torch.is_tensor(vec):
+                cache[txt] = -100
+                return -100
+            q = vec.to(dtype=torch.float32).flatten()
+            if int(q.numel()) != int(valid_bank.shape[1]):
+                cache[txt] = -100
+                return -100
+            q = F.normalize(q.unsqueeze(0), p=2, dim=-1)
+            sim = q @ valid_bank.t()
+            j = int(torch.argmax(sim, dim=1).item())
+            mapped = int(valid_ids[j]) if 0 <= j < len(valid_ids) else -100
+            cache[txt] = int(mapped)
+            return int(mapped)
+        except Exception:
+            cache[txt] = -100
+            return -100
+
+    return _map
+
+
 def load_label_map(
     labels_csv: Path | None,
     vocab2id: dict[str, int] | None = None,
@@ -364,6 +405,9 @@ def load_label_map(
     fallback_csvs: list[Path | None] | None = None,
     fallback_text_key: str = "annotation",
     split_name: str | None = None,
+    label_embed_dir: Path | None = None,
+    label_emb_dim: int = 512,
+    use_embed_fallback: bool = True,
 ) -> tuple[dict[tuple[str, int], int], dict[str, int]]:
     stats = {
         "rows": 0,
@@ -372,6 +416,8 @@ def load_label_map(
         "unknown_text": 0,
         "primary_mapped": 0,
         "primary_unknown": 0,
+        "embed_fallback_considered": 0,
+        "embed_fallback_mapped": 0,
         "fallback_considered": 0,
         "fallback_mapped": 0,
     }
@@ -380,7 +426,16 @@ def load_label_map(
 
     v = vocab2id or {}
     vl = vocab2id_lower or {}
-    fallback_map = _build_fallback_annotation_map(
+    embed_mapper = (
+        build_embed_id_mapper(
+            vocab2id=v,
+            label_embed_dir=label_embed_dir,
+            label_emb_dim=int(label_emb_dim),
+        )
+        if bool(use_embed_fallback)
+        else None
+    )
+    fallback_map = build_fallback_map(
         fallback_csvs=fallback_csvs,
         fallback_text_key=fallback_text_key,
         split_name=split_name,
@@ -396,23 +451,31 @@ def load_label_map(
                 continue
             stats["rows"] += 1
             key = (path, sample_id)
-            label_text = _normalize_label_text(str(row.get(text_key, "")))
+            label_text = clean_label(str(row.get(text_key, "")))
             label_id = -100
             if not label_text:
                 stats["missing_text"] += 1
             else:
-                label_id = _map_text_to_vocab_id(label_text, v, vl)
+                label_id = vocab_id(label_text, v, vl)
                 if label_id >= 0:
                     stats["primary_mapped"] += 1
                 else:
                     stats["primary_unknown"] += 1
 
             if label_id < 0:
+                if (embed_mapper is not None) and bool(label_text):
+                    stats["embed_fallback_considered"] += 1
+                    mapped = int(embed_mapper(label_text))
+                    if mapped >= 0:
+                        label_id = int(mapped)
+                        stats["embed_fallback_mapped"] += 1
+
+            if label_id < 0:
                 cands = fallback_map.get(key, [])
                 if cands:
                     stats["fallback_considered"] += 1
                     for cand in cands:
-                        cand_id = _map_text_to_vocab_id(cand, v, vl)
+                        cand_id = vocab_id(cand, v, vl)
                         if cand_id >= 0:
                             label_id = int(cand_id)
                             stats["fallback_mapped"] += 1
@@ -530,7 +593,7 @@ def load_test_label_map(
             t_multi = str(row.get("gaze_gt_labels", "")).strip()
 
             chosen_text = t_primary
-            chosen_id = _map_text_to_vocab_id(t_primary, v, vl)
+            chosen_id = vocab_id(t_primary, v, vl)
             if not t_primary:
                 stats["missing_text"] += 1
                 chosen_id = -100
@@ -543,7 +606,7 @@ def load_test_label_map(
             parsed_multi: list[int] = []
             if chosen_id >= 0:
                 if t_multi:
-                    parsed = [_map_text_to_vocab_id(x.strip(), v, vl) for x in t_multi.split("-") if x.strip()]
+                    parsed = [vocab_id(x.strip(), v, vl) for x in t_multi.split("-") if x.strip()]
                     parsed_multi = sorted({int(x) for x in parsed if int(x) >= 0})
                 if not parsed_multi:
                     parsed_multi = [int(chosen_id)]
@@ -575,6 +638,37 @@ def load_test_label_map(
                 multi_id_map[path] = [int(x) for x in merged if int(x) >= 0]
 
     return id_map, text_map, multi_id_map, stats
+
+
+def load_test_vocab_texts(
+    labels_csv: Path | None,
+) -> list[str]:
+    if labels_csv is None or (not labels_csv.exists()):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(raw: str) -> None:
+        txt = clean_label(raw)
+        if not txt:
+            return
+        key = txt.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(txt)
+
+    with labels_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            primary = str(row.get("gaze_gt_label", "")).strip()
+            _push(primary)
+            multi = str(row.get("gaze_gt_labels", "")).strip()
+            if multi:
+                for cand in multi.split("-"):
+                    _push(cand)
+    return out
 
 
 @dataclass
@@ -661,7 +755,7 @@ def load_records(
     return records
 
 
-def _rounded_bbox_key(
+def round_bbox(
     bbox: tuple[float, float, float, float],
     decimals: int,
 ) -> tuple[float, float, float, float]:
@@ -703,7 +797,7 @@ def load_test_groups(
         if not image_path.exists():
             continue
 
-        key = (image_rel, _rounded_bbox_key(bbox, decimals=bbox_round_decimals))
+        key = (image_rel, round_bbox(bbox, decimals=bbox_round_decimals))
         if key not in grouped:
             grouped[key] = TestGroup(
                 image_rel=image_rel,
