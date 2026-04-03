@@ -1,5 +1,5 @@
 paths:
-  model_path: "model/Qwen3-VL-4B-Instruct"
+  model_path: "Qwen/Qwen3-VL-4B-Instruct"
   image_root: "data/gazefollow_extended/train"
   train_ann: "data/gazefollow/train_annotations_new.txt"
   val_ann: "data/gazefollow/val_annotations_new.txt"
@@ -33,7 +33,6 @@ train:
   epochs: 10
   num_workers: 4
   show_tqdm: true
-  collator_include_raw_inputs: false
   run_test: true
   eval_only: false
   lr: 3e-5
@@ -59,13 +58,14 @@ text:
   point_decimals: 4
 
 loss:
-  # total = w_answer * L_answer + w_point * L_point + w_object * L_object
-  # L_object: full label bank retrieval CE (InfoNCE).
-  # Priority: localization(point) > output format(answer) > object retrieval.
-  loss_answer_weight: 0.6
+  # total = w_fmt * L_fmt + w_point * L_point + w_object * L_obj-ret
+  # L_fmt:     LM CE on fixed template tokens ("Point: ", "\nObject: ")
+  # L_point:   LM CE on predicted gaze coordinates (x y)
+  # L_obj-ret: InfoNCE retrieval CE on <obj_emb> hidden state → 512-dim projection
+  # Priority: localization(point) > format(fmt) > object retrieval.
+  loss_fmt_weight: 0.6
   loss_point_weight: 2.0
   loss_object_weight: 0.5
-  object_loss_mode: "retrieval"
   object_temperature: 0.07
   loss_use_lm_fallback: false
 

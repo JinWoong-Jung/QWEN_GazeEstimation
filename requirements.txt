@@ -1,0 +1,10 @@
+torch
+transformers>=4.57.0
+accelerate
+peft
+Pillow
+PyYAML
+tqdm
+wandb
+sentencepiece
+safetensors

@@ -97,9 +97,6 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--no_show_tqdm", dest="show_tqdm", action="store_false")
     p.set_defaults(show_tqdm=bool(default_value(d, "show_tqdm", True)))
 
-    p.add_argument("--collator_include_raw_inputs", dest="collator_include_raw_inputs", action="store_true")
-    p.add_argument("--no_collator_include_raw_inputs", dest="collator_include_raw_inputs", action="store_false")
-    p.set_defaults(collator_include_raw_inputs=bool(default_value(d, "collator_include_raw_inputs", False)))
     p.add_argument("--run_test", dest="run_test", action="store_true")
     p.add_argument("--no_run_test", dest="run_test", action="store_false")
     p.set_defaults(run_test=bool(default_value(d, "run_test", True)))
@@ -118,29 +115,17 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--object_embedding_dim", type=int, default=int(default_value(d, "object_embedding_dim", 512)))
     p.add_argument("--test_retrieval_top_k", type=int, default=int(default_value(d, "test_retrieval_top_k", 3)))
     p.add_argument("--point_decimals", type=int, default=int(default_value(d, "point_decimals", 4)))
-    p.add_argument("--loss_answer_weight", type=float, default=float(default_value(d, "loss_answer_weight", 0.1)))
+    # loss_fmt_weight: CE weight on fixed template tokens ("Point: ", "\nObject: ")
     p.add_argument(
-        "--loss_point_weight",
+        "--loss_fmt_weight",
         type=float,
-        default=float(default_value(d, "loss_point_weight", default_value(d, "loss_localization_weight", 1.0))),
+        default=float(default_value(d, "loss_fmt_weight", default_value(d, "loss_answer_weight", 0.6))),
     )
-    p.add_argument(
-        "--loss_object_weight",
-        type=float,
-        default=float(default_value(d, "loss_object_weight", default_value(d, "loss_recognition_weight", 1.5))),
-    )
-    # TODO(cleanup): keep legacy CLI aliases temporarily for older run scripts.
-    # Prefer --loss_point_weight / --loss_object_weight in all new configs.
-    p.add_argument("--loss_localization_weight", type=float, default=float(default_value(d, "loss_localization_weight", 1.0)))
-    p.add_argument("--loss_recognition_weight", type=float, default=float(default_value(d, "loss_recognition_weight", 1.5)))
+    p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 2.0)))
+    p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 0.5)))
     p.add_argument("--loss_use_lm_fallback", dest="loss_use_lm_fallback", action="store_true")
     p.add_argument("--no_loss_use_lm_fallback", dest="loss_use_lm_fallback", action="store_false")
     p.set_defaults(loss_use_lm_fallback=bool(default_value(d, "loss_use_lm_fallback", False)))
-    p.add_argument(
-        "--object_loss_mode",
-        type=str,
-        default=str(default_value(d, "object_loss_mode", "retrieval")),
-    )
     p.add_argument(
         "--object_temperature",
         type=float,

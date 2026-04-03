@@ -202,12 +202,8 @@ def build_train_inputs(
     )
 
     bsz = int(labels.shape[0])
-    point_valid = target_point_valid
-    object_valid = target_object_valid
-    if point_valid is None:
-        point_valid = torch.ones((bsz,), dtype=torch.float32)
-    if object_valid is None:
-        object_valid = target_valid
+    point_valid = target_point_valid if target_point_valid is not None else torch.ones((bsz,), dtype=torch.float32)
+    object_valid = target_object_valid if target_object_valid is not None else target_valid
     point_valid = point_valid.to(dtype=torch.float32).flatten()
     object_valid = object_valid.to(dtype=torch.float32).flatten()
 
@@ -220,18 +216,23 @@ def build_train_inputs(
         if torch.any(invalid_object):
             object_mask[invalid_object] = False
 
-    invalid_answer = torch.zeros((bsz,), dtype=torch.bool)
-    if point_valid.numel() == bsz:
-        invalid_answer = invalid_answer | point_valid.le(0)
-    if object_valid.numel() == bsz:
-        invalid_answer = invalid_answer | object_valid.le(0)
-    if torch.any(invalid_answer):
-        answer_mask[invalid_answer] = False
+    # L_fmt: CE loss only on fixed template tokens ("Point: ", "\nObject: "),
+    # excluding coordinate tokens (L_point) and <obj_emb> token (L_obj-ret).
+    fmt_mask = answer_mask & ~point_mask & ~object_mask
 
-    supervised = answer_mask.any(dim=1) | point_mask.any(dim=1) | object_mask.any(dim=1)
+    # Propagate invalidity to fmt_mask as well.
+    invalid_fmt = torch.zeros((bsz,), dtype=torch.bool)
+    if point_valid.numel() == bsz:
+        invalid_fmt = invalid_fmt | point_valid.le(0)
+    if object_valid.numel() == bsz:
+        invalid_fmt = invalid_fmt | object_valid.le(0)
+    if torch.any(invalid_fmt):
+        fmt_mask[invalid_fmt] = False
+
+    supervised = fmt_mask.any(dim=1) | point_mask.any(dim=1) | object_mask.any(dim=1)
     if torch.any(~supervised):
         labels[~supervised] = -100
-    return dict(joint_inputs), labels, answer_mask, point_mask, object_mask
+    return dict(joint_inputs), labels, fmt_mask, point_mask, object_mask
 
 
 def build_infer_inputs(
