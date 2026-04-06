@@ -8,6 +8,10 @@ OBJ_SLOT = "<obj_emb>"
 SLOT_LINE_RE = re.compile(r"(?im)^\s*object\s*:\s*(<obj_emb>)\s*$")
 SLOT_ANY_RE = re.compile(r"<obj_emb>")
 
+# Matches the label text content after "Object:" prefix (pure-text answer format).
+# Group 1 captures the trimmed label string, e.g. "television" from "Object: television".
+OBJECT_LABEL_CONTENT_RE = re.compile(r"(?im)^\s*object\s*:\s*(\S.*?)\s*$")
+
 
 def add_slot_token(tokenizer: Any) -> int:
     if tokenizer is None:
@@ -51,3 +55,22 @@ def slot_span(text: str) -> tuple[int, int] | None:
     if m2 is None:
         return None
     return int(m2.start(0)), int(m2.end(0))
+
+
+def object_label_span(text: str) -> tuple[int, int] | None:
+    """Return the char span of the label content after the 'Object:' line prefix.
+
+    For pure-text answers (e.g. 'Object: television') this returns the span of
+    'television'.  For legacy '<obj_emb>' answers it falls back to slot_span().
+    Returns None when no 'Object:' line is found.
+    """
+    txt = str(text or "")
+    # Legacy: 'Object: <obj_emb>' – keep backward compat
+    m = SLOT_LINE_RE.search(txt)
+    if m is not None:
+        return int(m.start(1)), int(m.end(1))
+    # Pure-text: 'Object: <label text>'
+    m2 = OBJECT_LABEL_CONTENT_RE.search(txt)
+    if m2 is None:
+        return None
+    return int(m2.start(1)), int(m2.end(1))

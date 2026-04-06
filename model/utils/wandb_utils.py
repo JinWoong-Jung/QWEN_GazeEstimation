@@ -56,8 +56,16 @@ def init_wandb(args: Any, root: Path):
         run = wandb.init(**wb_kwargs)
         print(f"[INFO] wandb enabled (project={args.wandb_project}, run={run.name}).")
         try:
+            wandb.define_metric("val/loss", summary="min")
             wandb.define_metric("val/dist", summary="min")
+            wandb.define_metric("val/acc@1", summary="max")
+            wandb.define_metric("val/acc@3", summary="max")
+            wandb.define_metric("val/multiacc@1", summary="max")
+            wandb.define_metric("metric/val/loss", summary="min")
             wandb.define_metric("metric/val/dist", summary="min")
+            wandb.define_metric("metric/val/acc@1", summary="max")
+            wandb.define_metric("metric/val/acc@3", summary="max")
+            wandb.define_metric("metric/val/multiacc@1", summary="max")
         except Exception:
             pass
         return run

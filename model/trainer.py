@@ -64,20 +64,6 @@ def resolve_path(path: str) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
-def resolve_model_source(model_path: str) -> str:
-    raw = str(model_path).strip()
-    if not raw:
-        return raw
-    p = Path(raw)
-    if p.is_absolute():
-        return str(p)
-    local = ROOT / p
-    if local.exists():
-        return str(local)
-    # If local path does not exist, keep raw string so HF repo IDs (e.g., "Qwen/...") work.
-    return raw
-
-
 def set_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(int(seed))
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -226,7 +212,7 @@ def resize_embeddings(model: Any, processor: Any) -> bool:
 
 def init_processor(
     *,
-    model_path: str,
+    model_path: Path,
     checkpoint_dir: Path | None,
 ) -> Any:
     processor_path = model_path
@@ -243,7 +229,7 @@ def init_processor(
 
 def init_base_model(
     *,
-    model_path: str,
+    model_path: Path,
     model_kwargs: dict[str, Any],
     processor: Any,
 ) -> Any:
@@ -256,20 +242,50 @@ def init_base_model(
 def test_log_payload(test_metrics: dict[str, float], epoch: float) -> dict[str, float]:
     return {
         "test/epoch": float(epoch),
-        "test/AvgL2": float(test_metrics.get("Avg L2", 0.0)),
+        "test/ExactMatch": float(test_metrics.get("ExactMatch", 0.0)),
+        "test/Contains": float(test_metrics.get("Contains", 0.0)),
+        "test/AvgL2": float(test_metrics.get("Avg L2", test_metrics.get("PointL2", 0.0))),
         "test/MinL2": float(test_metrics.get("Min L2", 0.0)),
+        "test/PointL2": float(test_metrics.get("PointL2", 0.0)),
         "test/acc@1": float(test_metrics.get("acc@1", 0.0)),
         "test/acc@3": float(test_metrics.get("acc@3", 0.0)),
         "test/multiacc@1": float(test_metrics.get("multiacc@1", 0.0)),
+        "test/ObjectTokenValidRate": float(test_metrics.get("ObjectTokenValidRate", 0.0)),
+        "test/ObjectParseFailTop1Rate": float(test_metrics.get("ObjectParseFailTop1Rate", 0.0)),
+        "test/ObjectParseFailBeamRate": float(test_metrics.get("ObjectParseFailBeamRate", 0.0)),
+        "test/ObjectParseTop1FromTokenRate": float(test_metrics.get("ObjectParseTop1FromTokenRate", 0.0)),
+        "test/ObjectParseBeamFromTokenRate": float(test_metrics.get("ObjectParseBeamFromTokenRate", 0.0)),
+        "test/ObjectParseFailTop1Count": float(test_metrics.get("ObjectParseFailTop1Count", 0.0)),
+        "test/ObjectParseFailBeamCount": float(test_metrics.get("ObjectParseFailBeamCount", 0.0)),
+        "test/ObjectParseTop1FromTokenCount": float(test_metrics.get("ObjectParseTop1FromTokenCount", 0.0)),
+        "test/ObjectParseBeamFromTokenCount": float(test_metrics.get("ObjectParseBeamFromTokenCount", 0.0)),
         "test/RetrievalQueryValidRate": float(test_metrics.get("RetrievalQueryValidRate", 0.0)),
         "test/RetrievalAcc@1": float(test_metrics.get("RetrievalAcc@1", 0.0)),
         "test/RetrievalAcc@3": float(test_metrics.get("RetrievalAcc@3", 0.0)),
         "test/RetrievalMultiAcc@1": float(test_metrics.get("RetrievalMultiAcc@1", 0.0)),
-        "test/ParseFailRate": float(test_metrics.get("ParseFailRate", 0.0)),
         "test/RetrievalDen": float(test_metrics.get("RetrievalDen", 0.0)),
-        "test/MultiAccDen": float(test_metrics.get("MultiAccDen", 0.0)),
         "test/num_samples": float(test_metrics.get("num_samples", 0.0)),
         "test/num_valid_targets": float(test_metrics.get("num_valid_targets", 0.0)),
+    }
+
+
+def val_metric_log_payload(val_metrics: dict[str, float], epoch: float) -> dict[str, float]:
+    point_l2 = float(val_metrics.get("PointL2", val_metrics.get("Avg L2", 0.0)))
+    acc1 = float(val_metrics.get("acc@1", 0.0))
+    acc3 = float(val_metrics.get("acc@3", 0.0))
+    multiacc1 = float(val_metrics.get("multiacc@1", 0.0))
+    return {
+        "val/epoch": float(epoch),
+        "val/dist": point_l2,
+        "val/acc@1": acc1,
+        "val/acc@3": acc3,
+        "val/multiacc@1": multiacc1,
+        "metric/val/dist": point_l2,
+        "metric/val/acc@1": acc1,
+        "metric/val/acc@3": acc3,
+        "metric/val/multiacc@1": multiacc1,
+        "val/num_samples": float(val_metrics.get("num_samples", 0.0)),
+        "val/num_valid_targets": float(val_metrics.get("num_valid_targets", 0.0)),
     }
 
 
@@ -297,7 +313,7 @@ def main() -> None:
         raise RuntimeError("CUDA requested but no GPU is available.")
     device = torch.device(args.device)
 
-    model_path = resolve_model_source(args.model_path)
+    model_path = resolve_path(args.model_path)
     checkpoint_dir = resolve_path(args.checkpoint_dir) if str(args.checkpoint_dir).strip() else None
     train_ann = resolve_path(args.train_ann)
     val_ann = resolve_path(args.val_ann)
@@ -317,13 +333,8 @@ def main() -> None:
     print(f"[INFO] loaded vocab2id classes: {len(vocab2id)} (id_range=0..{max(num_classes - 1, 0)})")
 
     prompt_text_for_run = str(args.prompt_text or "")
-    if "Object: <obj_emb>" not in prompt_text_for_run:
-        if prompt_text_for_run and (not prompt_text_for_run.endswith("\n")):
-            prompt_text_for_run += "\n"
-        prompt_text_for_run += (
-            "Output must contain exactly two lines: "
-            "Line 1 `Point: x y`, Line 2 `Object: <obj_emb>`."
-        )
+    # Pure-text mode: prompt_text in config.yaml already instructs the model to
+    # output "Object: <object name>".  No automatic injection of <obj_emb> marker.
 
     label_embed_dir = (
         resolve_path(getattr(args, "label_embed_dir"))
@@ -333,6 +344,13 @@ def main() -> None:
     object_embedding_dim = int(getattr(args, "object_embedding_dim", 512))
     object_temperature = float(getattr(args, "object_temperature", 0.07))
     test_retrieval_top_k = max(1, int(getattr(args, "test_retrieval_top_k", 3)))
+    object_loss_mode = str(getattr(args, "object_loss_mode", "retrieval")).strip().lower()
+    if object_loss_mode not in {"retrieval", "infonce", "full_bank_retrieval"}:
+        raise RuntimeError(
+            f"Unsupported object_loss_mode={object_loss_mode!r}. "
+            "Use one of: retrieval, infonce, full_bank_retrieval."
+        )
+
     train_label_embedding_bank = build_vocab_embedding_matrix(
         vocab2id=vocab2id,
         label_embed_dir=label_embed_dir,
@@ -347,7 +365,7 @@ def main() -> None:
     print(
         "[INFO] train label embedding bank: "
         f"shape={tuple(train_label_embedding_bank.shape)} "
-        f"dim={int(object_embedding_dim)}"
+        f"dim={int(object_embedding_dim)} mode={object_loss_mode}"
     )
 
     test_vocab_texts = load_test_vocab_texts(test_labels)
@@ -375,6 +393,9 @@ def main() -> None:
         f"raw_vocab={len(test_vocab_texts)} valid_rows={len(test_retrieval_texts)} "
         f"shape={tuple(test_label_embedding_bank.shape)} topk={test_retrieval_top_k}"
     )
+    retrieval_query_text_to_label_id = {
+        label_key(k): int(v) for k, v in vocab2id.items()
+    }
 
     if bool(getattr(args, "test_only", False)):
         print("[INFO] test_only=True; skipping train/val loading and training.")
@@ -410,7 +431,7 @@ def main() -> None:
             checkpoint_dir=checkpoint_dir,
         )
 
-        print("[INFO] collator raw input passthrough: enabled (scene_images/text_inputs).")
+        print("[INFO] collator raw input passthrough: test=enabled.")
         test_collator = QwenTestCollator(
             processor=processor,
             scene_size=(int(args.scene_h), int(args.scene_w)),
@@ -507,12 +528,14 @@ def main() -> None:
                 processor=processor,
                 label_embedding_bank=test_label_embedding_bank_device,
                 retrieval_label_texts=test_retrieval_texts,
+                query_text_to_label_id=retrieval_query_text_to_label_id,
                 query_id_to_label_text=id2label,
                 retrieval_top_k=int(test_retrieval_top_k),
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
+                num_beams=int(getattr(args, "generation_num_beams", 3)),
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
@@ -675,21 +698,21 @@ def main() -> None:
         checkpoint_dir=checkpoint_dir,
     )
 
-    # Raw inputs (scene_images, text_inputs) are always passed through the collator
-    # so that pred_embeddings_from_generated can re-encode predictions at test time.
-    print("[INFO] collator raw input passthrough: enabled (scene_images/text_inputs).")
-
+    # raw inputs (scene_images, text_inputs) are only needed at test time for
+    # pred_embeddings_from_generated()'s second re-encode pass.
+    # Passing them through train/val batches wastes CPU memory for no benefit.
+    print("[INFO] collator raw input passthrough: train/val=disabled, test=enabled.")
     train_collator = QwenTrainCollator(
         processor=processor,
         scene_size=(int(args.scene_h), int(args.scene_w)),
         max_text_length=int(args.max_text_length),
-        include_raw_inputs=True,
+        include_raw_inputs=False,
     )
     val_collator = QwenTrainCollator(
         processor=processor,
         scene_size=(int(args.scene_h), int(args.scene_w)),
         max_text_length=int(args.max_text_length),
-        include_raw_inputs=True,
+        include_raw_inputs=False,
     )
     test_collator = QwenTestCollator(
         processor=processor,
@@ -714,6 +737,16 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
         collate_fn=val_collator,
     )
+    val_metric_loader = None
+    if bool(getattr(args, "run_val_metrics", True)):
+        val_metric_loader = DataLoader(
+            val_ds,
+            batch_size=max(1, int(args.test_batch_size)),
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            collate_fn=test_collator,
+        )
 
     base_qwen = init_base_model(
         model_path=model_path,
@@ -772,15 +805,18 @@ def main() -> None:
     )
 
     amp_dtype = to_autocast_dtype(load_dtype)
-    loss_fmt_weight = float(getattr(args, "loss_fmt_weight", getattr(args, "loss_answer_weight", 0.6)))
-    loss_point_weight = float(getattr(args, "loss_point_weight", 2.0))
-    loss_object_weight = float(getattr(args, "loss_object_weight", 0.5))
+    loss_answer_weight = float(getattr(args, "loss_answer_weight", 0.1))
+    loss_point_weight = float(getattr(args, "loss_point_weight", 1.0))
+    loss_object_weight = float(getattr(args, "loss_object_weight", 1.5))
+    loss_slot_weight = float(getattr(args, "loss_slot_weight", 0.0))
     loss_use_lm_fallback = bool(getattr(args, "loss_use_lm_fallback", False))
     print(
         "[INFO] structured loss weights: "
-        f"fmt={loss_fmt_weight:.4f} "
+        f"answer={loss_answer_weight:.4f} "
         f"point={loss_point_weight:.4f} "
         f"object={loss_object_weight:.4f} "
+        f"slot={loss_slot_weight:.4f} "
+        f"object_mode={object_loss_mode} "
         f"object_temp={object_temperature:.4f} "
         f"lm_fallback={str(loss_use_lm_fallback).lower()}"
     )
@@ -839,31 +875,39 @@ def main() -> None:
                 dtype=amp_dtype,
                 enabled=(device.type == "cuda"),
             ):
+                # Pass labels only when lm_fallback is enabled; otherwise Qwen
+                # computes a full-sequence LM loss that is never used, wasting
+                # memory and compute every step.
+                pass_labels = labels if loss_use_lm_fallback else None
                 out = model(
                     joint_inputs=joint_inputs,
-                    labels=labels,
+                    labels=pass_labels,
                     object_slot_mask=object_slot_mask,
                     use_cache=False,
                 )
                 lm_loss = out.get("loss", None)
-                if lm_loss is None:
-                    raise RuntimeError("Model forward must return loss during training.")
-                tgt_label = batch.get("target_label", None)
-                tgt_obj_valid = batch.get("target_object_valid", None)
+                if loss_use_lm_fallback and lm_loss is None:
+                    raise RuntimeError("Model forward must return loss when lm_fallback is enabled.")
                 structured = compute_structured_losses(
                     logits=out.get("logits", None),
                     labels=labels,
-                    loss_mask_fmt=batch.get("loss_mask_answer", None),
+                    loss_mask_answer=batch.get("loss_mask_answer", None),
                     loss_mask_point=batch.get("loss_mask_point", None),
                     loss_mask_object=batch.get("loss_mask_object", None),
                     pred_object_emb=out.get("pred_object_emb", None),
-                    target_label=tgt_label.to(device) if torch.is_tensor(tgt_label) else None,
-                    target_object_valid=tgt_obj_valid.to(device) if torch.is_tensor(tgt_obj_valid) else None,
+                    target_label=batch.get("target_label", None).to(device) if torch.is_tensor(batch.get("target_label", None)) else None,
+                    target_object_valid=(
+                        batch.get("target_object_valid", None).to(device)
+                        if torch.is_tensor(batch.get("target_object_valid", None))
+                        else None
+                    ),
                     label_embedding_bank=train_label_embedding_bank_device,
+                    object_loss_mode=object_loss_mode,
                     object_temperature=object_temperature,
-                    weight_fmt=loss_fmt_weight,
+                    weight_answer=loss_answer_weight,
                     weight_point=loss_point_weight,
                     weight_object=loss_object_weight,
+                    weight_slot=loss_slot_weight,
                     fallback_loss=(lm_loss if loss_use_lm_fallback else None),
                 )
                 raw_loss = structured["loss"]
@@ -891,12 +935,15 @@ def main() -> None:
                     )
                     wandb_run.log(
                         {
-                            "train/loss": float(raw_loss.detach().item()),
                             "train/loss/total": float(structured["loss_total"].detach().item()),
-                            "train/loss/fmt": float(structured["loss_fmt"].detach().item()),
+                            "train/loss/answer": float(structured["loss_answer"].detach().item()),
                             "train/loss/point": float(structured["loss_point"].detach().item()),
                             "train/loss/object": float(structured["loss_object"].detach().item()),
-                            "train/loss/lm_fallback": float(lm_loss.detach().item()),
+                            "train/loss/slot": float(structured["loss_slot"].detach().item()),
+                            "train/loss/lm_fallback": float(lm_loss.detach().item()) if torch.is_tensor(lm_loss) else 0.0,
+                            "train/loss": float(raw_loss.detach().item()),
+                            "train/loss_answer": float(structured["loss_answer"].detach().item()),
+                            "train/loss_lm_fallback": float(lm_loss.detach().item()) if torch.is_tensor(lm_loss) else 0.0,
                             "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                             "train/grad_norm": grad_norm_value,
                             "train/global_step": float(global_step),
@@ -927,11 +974,13 @@ def main() -> None:
                 val_loader,
                 device,
                 amp_dtype,
-                loss_fmt_weight=loss_fmt_weight,
+                loss_answer_weight=loss_answer_weight,
                 loss_point_weight=loss_point_weight,
                 loss_object_weight=loss_object_weight,
+                loss_slot_weight=loss_slot_weight,
                 loss_use_lm_fallback=loss_use_lm_fallback,
                 label_embedding_bank=train_label_embedding_bank_device,
+                object_loss_mode=object_loss_mode,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"Eval {epoch}/{args.epochs}",
@@ -940,32 +989,57 @@ def main() -> None:
             else {"loss": train_loss}
         )
         val_loss = float(val_metrics.get("loss", train_loss))
+        val_gen_metrics = None
+        if val_metric_loader is not None and len(val_ds) > 0:
+            val_gen_metrics = run_test_metrics(
+                model=model,
+                loader=val_metric_loader,
+                device=device,
+                amp_dtype=amp_dtype,
+                processor=processor,
+                label_embedding_bank=test_label_embedding_bank_device,
+                retrieval_label_texts=test_retrieval_texts,
+                query_text_to_label_id=retrieval_query_text_to_label_id,
+                query_id_to_label_text=id2label,
+                retrieval_top_k=int(test_retrieval_top_k),
+                object_temperature=object_temperature,
+                show_tqdm=bool(args.show_tqdm),
+                desc=f"ValMetric {epoch}/{args.epochs}",
+                max_new_tokens=int(args.generation_max_new_tokens),
+                num_beams=int(getattr(args, "generation_num_beams", 3)),
+            )
 
-        print(
+        epoch_msg = (
             f"[EPOCH {epoch}] "
             f"train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} "
-            f"val_fmt={float(val_metrics.get('loss_fmt', 0.0)):.6f} "
             f"val_point={float(val_metrics.get('loss_point', 0.0)):.6f} "
             f"val_object={float(val_metrics.get('loss_object', 0.0)):.6f}"
         )
+        if isinstance(val_gen_metrics, dict):
+            epoch_msg += (
+                f" val_dist={float(val_gen_metrics.get('PointL2', val_gen_metrics.get('Avg L2', 0.0))):.6f} "
+                f"val_acc1={float(val_gen_metrics.get('acc@1', 0.0)):.6f} "
+                f"val_acc3={float(val_gen_metrics.get('acc@3', 0.0)):.6f}"
+            )
+        print(epoch_msg)
 
         if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "epoch/index": float(epoch),
-                    "epoch/global_step": float(global_step),
-                    "epoch/train_loss": float(train_loss),
-                    "val/epoch": float(epoch),
-                    "val/loss": float(val_loss),
-                    "val/loss/total": float(val_metrics.get("loss_total", val_loss)),
-                    "val/loss/fmt": float(val_metrics.get("loss_fmt", 0.0)),
-                    "val/loss/point": float(val_metrics.get("loss_point", 0.0)),
-                    "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
-                    "metric/val/loss": float(val_loss),
-                },
-                step=global_step,
-            )
+            payload = {
+                "epoch/index": float(epoch),
+                "epoch/global_step": float(global_step),
+                "epoch/train_loss": float(train_loss),
+                "val/epoch": float(epoch),
+                "val/loss": float(val_loss),
+                "val/loss/total": float(val_metrics.get("loss_total", val_loss)),
+                "val/loss/answer": float(val_metrics.get("loss_answer", 0.0)),
+                "val/loss/point": float(val_metrics.get("loss_point", 0.0)),
+                "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
+                "metric/val/loss": float(val_loss),
+            }
+            if isinstance(val_gen_metrics, dict):
+                payload.update(val_metric_log_payload(val_gen_metrics, epoch=float(epoch)))
+            wandb_run.log(payload, step=global_step)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -986,30 +1060,54 @@ def main() -> None:
             val_loader,
             device,
             amp_dtype,
-            loss_fmt_weight=loss_fmt_weight,
+            loss_answer_weight=loss_answer_weight,
             loss_point_weight=loss_point_weight,
             loss_object_weight=loss_object_weight,
+            loss_slot_weight=loss_slot_weight,
             loss_use_lm_fallback=loss_use_lm_fallback,
             label_embedding_bank=train_label_embedding_bank_device,
+            object_loss_mode=object_loss_mode,
             object_temperature=object_temperature,
             show_tqdm=bool(args.show_tqdm),
             desc="Eval (checkpoint)",
         )
         best_val_loss = float(val_metrics.get("loss", best_val_loss))
-        print(f"[EVAL] val_loss={best_val_loss:.6f}")
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "val/epoch": 0.0,
-                    "val/loss": float(best_val_loss),
-                    "val/loss/total": float(val_metrics.get("loss_total", best_val_loss)),
-                    "val/loss/fmt": float(val_metrics.get("loss_fmt", 0.0)),
-                    "val/loss/point": float(val_metrics.get("loss_point", 0.0)),
-                    "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
-                    "metric/val/loss": float(best_val_loss),
-                },
-                step=global_step,
+        val_gen_metrics = None
+        if val_metric_loader is not None:
+            val_gen_metrics = run_test_metrics(
+                model=model,
+                loader=val_metric_loader,
+                device=device,
+                amp_dtype=amp_dtype,
+                processor=processor,
+                label_embedding_bank=test_label_embedding_bank_device,
+                retrieval_label_texts=test_retrieval_texts,
+                query_text_to_label_id=retrieval_query_text_to_label_id,
+                query_id_to_label_text=id2label,
+                retrieval_top_k=int(test_retrieval_top_k),
+                object_temperature=object_temperature,
+                show_tqdm=bool(args.show_tqdm),
+                desc="Eval metrics (checkpoint)",
+                max_new_tokens=int(args.generation_max_new_tokens),
+                num_beams=int(getattr(args, "generation_num_beams", 3)),
             )
+        print(
+            "[EVAL] "
+            f"val_loss={best_val_loss:.6f}"
+        )
+        if wandb_run is not None:
+            payload = {
+                "val/epoch": 0.0,
+                "val/loss": float(best_val_loss),
+                "val/loss/total": float(val_metrics.get("loss_total", best_val_loss)),
+                "val/loss/answer": float(val_metrics.get("loss_answer", 0.0)),
+                "val/loss/point": float(val_metrics.get("loss_point", 0.0)),
+                "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
+                "metric/val/loss": float(best_val_loss),
+            }
+            if isinstance(val_gen_metrics, dict):
+                payload.update(val_metric_log_payload(val_gen_metrics, epoch=0.0))
+            wandb_run.log(payload, step=global_step)
 
     elapsed = time.time() - start_time
 
@@ -1082,12 +1180,14 @@ def main() -> None:
                 processor=processor,
                 label_embedding_bank=test_label_embedding_bank_device,
                 retrieval_label_texts=test_retrieval_texts,
+                query_text_to_label_id=retrieval_query_text_to_label_id,
                 query_id_to_label_text=id2label,
                 retrieval_top_k=int(test_retrieval_top_k),
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
+                num_beams=int(getattr(args, "generation_num_beams", 3)),
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:

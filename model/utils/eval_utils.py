@@ -14,6 +14,23 @@ from .loss_utils import compute_structured_losses
 from .processor_collate import component_masks
 
 
+def parse_object_text(text: str) -> str | None:
+    """Extract the label text from a generated 'Object: <label>' line.
+
+    Returns the stripped label string, or None if the line is absent or empty.
+    Works for both pure-text format ('Object: television') and the legacy slot
+    format ('Object: <obj_emb>') – though the latter is treated as unparseable
+    for retrieval purposes.
+    """
+    m = re.search(r"(?im)^\s*object\s*:\s*(\S.*?)\s*$", str(text or ""))
+    if m is None:
+        return None
+    val = str(m.group(1)).strip()
+    if not val or val == "<obj_emb>":
+        return None
+    return val
+
+
 def decode_generated(
     processor: Any,
     generated_ids: torch.Tensor,
@@ -26,13 +43,18 @@ def decode_generated(
     nrs = max(1, int(num_return_sequences))
     bsz = int(input_ids.shape[0]) if torch.is_tensor(input_ids) and input_ids.dim() >= 2 else 0
     for i in range(generated_ids.shape[0]):
-        src_i = min(max(0, i // nrs), bsz - 1) if bsz > 0 else i
+        src_i = (i // nrs) if bsz > 0 else i
+        if bsz > 0:
+            src_i = min(max(0, int(src_i)), bsz - 1)
         if attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dim() >= 2 and bsz > 0:
             start = int(attention_mask[src_i].sum().item())
         else:
             start = int(input_ids.shape[1])
         new_tokens = generated_ids[i, start:]
-        txt = tok.decode(new_tokens, skip_special_tokens=False) if tok is not None else str(new_tokens.tolist())
+        if tok is not None:
+            txt = tok.decode(new_tokens, skip_special_tokens=False)
+        else:
+            txt = str(new_tokens.tolist())
         txt = re.sub(r"<\|[^>]+?\|>", " ", str(txt))
         out.append(str(txt).strip())
     return out
@@ -57,11 +79,11 @@ def l2_stats(pred_xy: tuple[float, float], gt_points: torch.Tensor) -> tuple[flo
     pts = gt_points.to(dtype=torch.float32).view(-1, 2)
     if int(pts.shape[0]) <= 0:
         return None
-    px, py = float(pred_xy[0]), float(pred_xy[1])
-    dists = [
-        math.sqrt((px - float(pts[j, 0].item())) ** 2 + (py - float(pts[j, 1].item())) ** 2)
-        for j in range(int(pts.shape[0]))
-    ]
+    px = float(pred_xy[0])
+    py = float(pred_xy[1])
+    dists = [math.sqrt((px - float(pts[j, 0].item())) ** 2 + (py - float(pts[j, 1].item())) ** 2) for j in range(int(pts.shape[0]))]
+    if not dists:
+        return None
     return float(sum(dists) / len(dists)), float(min(dists))
 
 
@@ -72,7 +94,8 @@ def topk_similarity(query: torch.Tensor, bank: torch.Tensor, k: int, temperature
         return []
     q = F.normalize(query.unsqueeze(0), p=2, dim=-1)
     b = F.normalize(bank, p=2, dim=-1)
-    sim = (q @ b.t()) / max(float(temperature), 1e-6)
+    t = max(float(temperature), 1e-6)
+    sim = (q @ b.t()) / t
     kk = min(max(1, int(k)), int(b.shape[0]))
     return [int(x) for x in torch.topk(sim.squeeze(0), k=kk, largest=True, sorted=True).indices.tolist()]
 
@@ -110,7 +133,7 @@ def pred_embeddings_from_generated(
         truncation=False,
     )
     valid = torch.ones((len(generated_texts),), dtype=torch.float32)
-    _fmt, _p, obj_mask = component_masks(
+    _a, _p, obj_mask = component_masks(
         processor=processor,
         joint_inputs=dict(joint),
         target_texts=[str(x) for x in generated_texts],
@@ -139,21 +162,26 @@ def run_eval(
     loader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype,
-    loss_fmt_weight: float = 0.6,
-    loss_point_weight: float = 2.0,
-    loss_object_weight: float = 0.5,
+    loss_answer_weight: float = 0.1,
+    loss_point_weight: float = 1.0,
+    loss_object_weight: float = 1.5,
+    loss_slot_weight: float = 0.0,
     loss_use_lm_fallback: bool = False,
     label_embedding_bank: torch.Tensor | None = None,
+    object_loss_mode: str = "retrieval",
     object_temperature: float = 0.07,
     show_tqdm: bool = True,
     desc: str = "Eval",
 ) -> dict[str, float]:
     model.eval()
     loss_sum = 0.0
-    fmt_sum = 0.0
+    answer_sum = 0.0
     point_sum = 0.0
     object_sum = 0.0
+    slot_sum = 0.0
     count = 0
+    point_w = float(loss_point_weight)
+    object_w = float(loss_object_weight)
 
     with torch.no_grad():
         it = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not show_tqdm)
@@ -173,46 +201,51 @@ def run_eval(
             if torch.is_tensor(y_valid):
                 y_valid = y_valid.to(device=device, dtype=torch.float32)
 
+            pass_labels = labels if bool(loss_use_lm_fallback) else None
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                out = model(joint_inputs=joint, labels=labels, object_slot_mask=obj_mask, use_cache=False)
+                out = model(joint_inputs=joint, labels=pass_labels, object_slot_mask=obj_mask, use_cache=False)
             lm_loss = out.get("loss", None)
-            if lm_loss is None:
-                raise RuntimeError("Model forward must return loss during evaluation.")
+            if bool(loss_use_lm_fallback) and lm_loss is None:
+                raise RuntimeError("Model forward must return loss when lm_fallback is enabled.")
             losses = compute_structured_losses(
                 logits=out.get("logits", None),
                 labels=labels,
-                loss_mask_fmt=batch.get("loss_mask_answer", None),
+                loss_mask_answer=batch.get("loss_mask_answer", None),
                 loss_mask_point=batch.get("loss_mask_point", None),
                 loss_mask_object=batch.get("loss_mask_object", None),
                 pred_object_emb=out.get("pred_object_emb", None),
                 target_label=y,
                 target_object_valid=y_valid,
                 label_embedding_bank=label_embedding_bank,
+                object_loss_mode=object_loss_mode,
                 object_temperature=object_temperature,
-                weight_fmt=float(loss_fmt_weight),
-                weight_point=float(loss_point_weight),
-                weight_object=float(loss_object_weight),
+                weight_answer=float(loss_answer_weight),
+                weight_point=point_w,
+                weight_object=object_w,
+                weight_slot=float(loss_slot_weight),
                 fallback_loss=(lm_loss if bool(loss_use_lm_fallback) else None),
             )
             total = losses["loss"]
             loss_sum += float(total.detach().item()) * float(bsz)
-            fmt_sum += float(losses["loss_fmt"].detach().item()) * float(bsz)
+            answer_sum += float(losses["loss_answer"].detach().item()) * float(bsz)
             point_sum += float(losses["loss_point"].detach().item()) * float(bsz)
             object_sum += float(losses["loss_object"].detach().item()) * float(bsz)
+            slot_sum += float(losses["loss_slot"].detach().item()) * float(bsz)
             count += bsz
             if show_tqdm:
                 it.set_postfix(loss=f"{(loss_sum / max(count, 1)):.4f}")
 
     if count <= 0:
-        return {"loss": 0.0, "loss_total": 0.0, "loss_fmt": 0.0, "loss_point": 0.0, "loss_object": 0.0}
+        return {"loss": 0.0, "loss_total": 0.0, "loss_answer": 0.0, "loss_point": 0.0, "loss_object": 0.0, "loss_slot": 0.0}
     d = float(count)
-    total_avg = float(loss_sum / d)
+    total = float(loss_sum / d)
     return {
-        "loss": total_avg,
-        "loss_total": total_avg,
-        "loss_fmt": float(fmt_sum / d),
+        "loss": total,
+        "loss_total": total,
+        "loss_answer": float(answer_sum / d),
         "loss_point": float(point_sum / d),
         "loss_object": float(object_sum / d),
+        "loss_slot": float(slot_sum / d),
     }
 
 
@@ -224,6 +257,7 @@ def run_test_metrics(
     processor: Any,
     label_embedding_bank: torch.Tensor,
     retrieval_label_texts: list[str],
+    query_text_to_label_id: dict[str, int] | None = None,
     query_id_to_label_text: dict[int, str] | None = None,
     retrieval_top_k: int = 3,
     object_temperature: float = 0.07,
@@ -235,26 +269,34 @@ def run_test_metrics(
     model.eval()
     if (not torch.is_tensor(label_embedding_bank)) or label_embedding_bank.dim() != 2:
         raise RuntimeError("label_embedding_bank must be a [N, D] tensor for retrieval evaluation.")
+    if not isinstance(retrieval_label_texts, list):
+        raise RuntimeError("retrieval_label_texts must be a list[str].")
 
-    keep = min(int(label_embedding_bank.shape[0]), len(retrieval_label_texts))
+    bank_n = int(label_embedding_bank.shape[0])
+    text_n = int(len(retrieval_label_texts))
+    keep = min(bank_n, text_n)
     if keep <= 0:
         raise RuntimeError("retrieval label bank is empty.")
     bank = label_embedding_bank[:keep].to(device=device, dtype=torch.float32)
-    label_texts = [str(x) for x in retrieval_label_texts[:keep]]
+    labels = [str(x) for x in retrieval_label_texts[:keep]]
 
     total = 0
     valid_total = 0
+    exact = 0
+    contains = 0
     avg_l2_sum = 0.0
     min_l2_sum = 0.0
     l2_den = 0
-    # Retrieval counters.
-    # acc@1, acc@3: primary GT only.  multiacc@1: full multi-label GT.
-    retrieval_den = 0        # samples with a primary GT label
-    multiacc_den = 0         # samples with at least one GT label (primary or multi)
+    retrieval_den = 0
     retrieval_acc1 = 0
     retrieval_acc3 = 0
     retrieval_multiacc1 = 0
-    parse_fail = 0           # failed embedding extractions (no <obj_emb> in generated text)
+    query_valid = 0
+    object_valid = 0
+    parse_fail_top1 = 0
+    parse_fail_beam = 0
+    parse_top1_token = 0
+    parse_beam_token = 0
     beam_k = max(1, int(num_beams))
 
     with torch.no_grad():
@@ -292,16 +334,21 @@ def run_test_metrics(
                 num_return_sequences=beam_k,
             )
             bsz = len(target_texts)
-            # Top-1 beam per sample.
-            top1_texts = [flat[i * beam_k] if (i * beam_k) < len(flat) else "" for i in range(bsz)]
+            preds_by_sample: list[list[str]] = []
+            for i in range(bsz):
+                s = i * beam_k
+                e = s + beam_k
+                cand = flat[s:e]
+                preds_by_sample.append(cand if cand else [""])
+            top1_texts = [str(preds_by_sample[i][0]) if preds_by_sample[i] else "" for i in range(bsz)]
 
             scene_images = batch.get("scene_images", None)
-            text_inputs_raw = batch.get("text_inputs", None)
+            text_inputs = batch.get("text_inputs", None)
             pred_emb, pred_ok = pred_embeddings_from_generated(
                 model=model,
                 processor=processor,
                 scene_images=list(scene_images) if isinstance(scene_images, list) else [],
-                text_inputs=[str(x) for x in text_inputs_raw] if isinstance(text_inputs_raw, list) else [],
+                text_inputs=[str(x) for x in text_inputs] if isinstance(text_inputs, list) else [],
                 generated_texts=top1_texts,
                 device=device,
                 amp_dtype=amp_dtype,
@@ -309,9 +356,7 @@ def run_test_metrics(
 
             for i in range(bsz):
                 total += 1
-                pred_top1 = top1_texts[i]
-
-                # Localization: Avg L2 and Min L2 over all annotator GT points.
+                pred_top1 = top1_texts[i] if i < len(top1_texts) else ""
                 pt = parse_point(pred_top1)
                 if pt is not None and isinstance(gt_points, list) and i < len(gt_points):
                     stats = l2_stats(pt, gt_points[i])
@@ -319,21 +364,20 @@ def run_test_metrics(
                         avg_l2_sum += float(stats[0])
                         min_l2_sum += float(stats[1])
                         l2_den += 1
-
                 if float(target_valid[i].item()) <= 0.0:
                     continue
-                valid_total += 1
 
-                # Build GT label sets.
-                # gt_primary_set: canonical single GT label → used for acc@1 and acc@3.
-                # gt_multi_set:   all valid GT labels       → used for multiacc@1.
-                gt_primary_set: set[str] = set()
+                valid_total += 1
+                tgt_norm = normalize_text(target_texts[i])
+                pred_norm = normalize_text(pred_top1)
+                exact += int(pred_norm == tgt_norm)
+                contains += int((tgt_norm != "") and (tgt_norm in pred_norm))
+
+                gt_set: set[str] = set()
                 if isinstance(target_text_label, list) and i < len(target_text_label):
                     t = normalize_text(str(target_text_label[i]))
                     if t:
-                        gt_primary_set.add(t)
-
-                gt_multi_set: set[str] = set(gt_primary_set)
+                        gt_set.add(t)
                 if isinstance(target_label_ids, list) and i < len(target_label_ids):
                     raw_multi = target_label_ids[i]
                     if isinstance(raw_multi, list) and isinstance(query_id_to_label_text, dict):
@@ -343,98 +387,128 @@ def run_test_metrics(
                                 continue
                             t = normalize_text(str(query_id_to_label_text.get(xid, "")))
                             if t:
-                                gt_multi_set.add(t)
-
-                if gt_primary_set:
+                                gt_set.add(t)
+                if gt_set:
                     retrieval_den += 1
-                if gt_multi_set:
-                    multiacc_den += 1
 
-                # Object embedding extraction.
-                emb_ok = (
+                # --- object prediction: span-hidden retrieval (primary) ------
+                ok = False
+                if (
                     torch.is_tensor(pred_emb)
                     and torch.is_tensor(pred_ok)
                     and i < int(pred_emb.shape[0])
                     and i < int(pred_ok.numel())
-                    and bool(pred_ok[i].item())
-                )
-                if not emb_ok:
-                    parse_fail += 1
+                ):
+                    ok = bool(pred_ok[i].item())
+
+                q = None
+                if ok and torch.is_tensor(pred_emb):
+                    q_cand = pred_emb[i].to(device=device, dtype=torch.float32)
+                    if float(q_cand.norm().item()) > 0:
+                        q = q_cand
+
+                # --- fallback: parse generated object text -> exact match ---
+                gen_obj_text = parse_object_text(pred_top1)
+                if q is None and gen_obj_text is None:
+                    parse_fail_top1 += 1
+                    parse_fail_beam += 1
                     continue
 
-                q = pred_emb[i].to(device=device, dtype=torch.float32)
-                if float(q.norm().item()) <= 0:
-                    parse_fail += 1
-                    continue
+                if q is not None:
+                    query_valid += 1
+                    object_valid += 1
+                    topk_idx = topk_similarity(q, bank, retrieval_top_k, object_temperature)
+                    topk_text = [normalize_text(labels[j]) for j in topk_idx if 0 <= int(j) < len(labels)]
+                    topk_text = [x for x in topk_text if x]
+                elif gen_obj_text is not None:
+                    # pure-text fallback: use parsed object string directly
+                    norm_gen = normalize_text(gen_obj_text)
+                    topk_text = [norm_gen] if norm_gen else []
+                    object_valid += 1
+                else:
+                    topk_text = []
 
-                topk_idx = topk_similarity(q, bank, retrieval_top_k, object_temperature)
-                topk_text = [normalize_text(label_texts[j]) for j in topk_idx if 0 <= int(j) < len(label_texts)]
-                topk_text = [x for x in topk_text if x]
                 if not topk_text:
-                    parse_fail += 1
+                    parse_fail_top1 += 1
+                    parse_fail_beam += 1
                     continue
 
+                parse_top1_token += 1
+                parse_beam_token += 1
                 pred_label = topk_text[0]
-
-                # Acc@1, Acc@3: top-k prediction vs. primary GT.
-                if gt_primary_set:
-                    retrieval_acc1 += int(pred_label in gt_primary_set)
-                    retrieval_acc3 += int(any(x in gt_primary_set for x in topk_text[:3]))
-
-                # MultiAcc@1: top-1 prediction vs. full multi-label GT set.
-                if gt_multi_set:
-                    retrieval_multiacc1 += int(pred_label in gt_multi_set)
+                if gt_set:
+                    retrieval_acc1 += int(pred_label in gt_set)
+                    retrieval_acc3 += int(any(x in gt_set for x in topk_text[: min(3, len(topk_text))]))
+                    retrieval_multiacc1 += int(pred_label in gt_set)
 
             if show_tqdm and valid_total > 0:
                 it.set_postfix(
                     l2=f"{(avg_l2_sum / max(l2_den, 1)):.4f}",
                     acc1=f"{(retrieval_acc1 / max(retrieval_den, 1)):.4f}",
-                    macc1=f"{(retrieval_multiacc1 / max(multiacc_den, 1)):.4f}",
+                    acc3=f"{(retrieval_acc3 / max(retrieval_den, 1)):.4f}",
                 )
 
     if total <= 0:
-        return _empty_test_metrics()
+        return {
+            "ExactMatch": 0.0,
+            "Contains": 0.0,
+            "Avg L2": 0.0,
+            "Min L2": 0.0,
+            "PointL2": 0.0,
+            "acc@1": 0.0,
+            "acc@3": 0.0,
+            "multiacc@1": 0.0,
+            "ObjectTokenValidRate": 0.0,
+            "ObjectParseFailTop1Rate": 0.0,
+            "ObjectParseFailBeamRate": 0.0,
+            "ObjectParseTop1FromTokenRate": 0.0,
+            "ObjectParseBeamFromTokenRate": 0.0,
+            "ObjectParseFailTop1Count": 0.0,
+            "ObjectParseFailBeamCount": 0.0,
+            "ObjectParseTop1FromTokenCount": 0.0,
+            "ObjectParseBeamFromTokenCount": 0.0,
+            "RetrievalQueryValidRate": 0.0,
+            "RetrievalAcc@1": 0.0,
+            "RetrievalAcc@3": 0.0,
+            "RetrievalMultiAcc@1": 0.0,
+            "RetrievalDen": 0.0,
+            "num_samples": 0.0,
+            "num_valid_targets": 0.0,
+        }
 
     return {
+        "ExactMatch": float(exact / max(valid_total, 1)),
+        "Contains": float(contains / max(valid_total, 1)),
         "Avg L2": float(avg_l2_sum / max(l2_den, 1)),
         "Min L2": float(min_l2_sum / max(l2_den, 1)),
+        "PointL2": float(avg_l2_sum / max(l2_den, 1)),
         "acc@1": float(retrieval_acc1 / max(retrieval_den, 1)),
         "acc@3": float(retrieval_acc3 / max(retrieval_den, 1)),
-        "multiacc@1": float(retrieval_multiacc1 / max(multiacc_den, 1)),
-        "RetrievalQueryValidRate": float((valid_total - parse_fail) / max(valid_total, 1)),
+        "multiacc@1": float(retrieval_multiacc1 / max(retrieval_den, 1)),
+        "ObjectTokenValidRate": float(object_valid / max(valid_total, 1)),
+        "ObjectParseFailTop1Rate": float(parse_fail_top1 / max(valid_total, 1)),
+        "ObjectParseFailBeamRate": float(parse_fail_beam / max(valid_total, 1)),
+        "ObjectParseTop1FromTokenRate": float(parse_top1_token / max(valid_total, 1)),
+        "ObjectParseBeamFromTokenRate": float(parse_beam_token / max(valid_total, 1)),
+        "ObjectParseFailTop1Count": float(parse_fail_top1),
+        "ObjectParseFailBeamCount": float(parse_fail_beam),
+        "ObjectParseTop1FromTokenCount": float(parse_top1_token),
+        "ObjectParseBeamFromTokenCount": float(parse_beam_token),
+        "RetrievalQueryValidRate": float(query_valid / max(valid_total, 1)),
         "RetrievalAcc@1": float(retrieval_acc1 / max(retrieval_den, 1)),
         "RetrievalAcc@3": float(retrieval_acc3 / max(retrieval_den, 1)),
-        "RetrievalMultiAcc@1": float(retrieval_multiacc1 / max(multiacc_den, 1)),
-        "ParseFailRate": float(parse_fail / max(valid_total, 1)),
+        "RetrievalMultiAcc@1": float(retrieval_multiacc1 / max(retrieval_den, 1)),
         "RetrievalDen": float(retrieval_den),
-        "MultiAccDen": float(multiacc_den),
         "num_samples": float(total),
         "num_valid_targets": float(valid_total),
     }
 
 
-def _empty_test_metrics() -> dict[str, float]:
-    return {
-        "Avg L2": 0.0,
-        "Min L2": 0.0,
-        "acc@1": 0.0,
-        "acc@3": 0.0,
-        "multiacc@1": 0.0,
-        "RetrievalQueryValidRate": 0.0,
-        "RetrievalAcc@1": 0.0,
-        "RetrievalAcc@3": 0.0,
-        "RetrievalMultiAcc@1": 0.0,
-        "ParseFailRate": 0.0,
-        "RetrievalDen": 0.0,
-        "MultiAccDen": 0.0,
-        "num_samples": 0.0,
-        "num_valid_targets": 0.0,
-    }
-
-
 def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
     rows = [
-        ("Avg L2", float(test_metrics.get("Avg L2", 0.0))),
+        ("ExactMatch", float(test_metrics.get("ExactMatch", 0.0))),
+        ("Contains", float(test_metrics.get("Contains", 0.0))),
+        ("Avg L2", float(test_metrics.get("Avg L2", test_metrics.get("PointL2", 0.0)))),
         ("Min L2", float(test_metrics.get("Min L2", 0.0))),
         ("acc@1", float(test_metrics.get("acc@1", 0.0))),
         ("acc@3", float(test_metrics.get("acc@3", 0.0))),
@@ -443,9 +517,7 @@ def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
         ("RetrievalAcc@1", float(test_metrics.get("RetrievalAcc@1", 0.0))),
         ("RetrievalAcc@3", float(test_metrics.get("RetrievalAcc@3", 0.0))),
         ("RetrievalMultiAcc@1", float(test_metrics.get("RetrievalMultiAcc@1", 0.0))),
-        ("ParseFailRate", float(test_metrics.get("ParseFailRate", 0.0))),
         ("RetrievalDen", float(test_metrics.get("RetrievalDen", 0.0))),
-        ("MultiAccDen", float(test_metrics.get("MultiAccDen", 0.0))),
         ("num_samples", float(test_metrics.get("num_samples", 0.0))),
         ("num_valid_targets", float(test_metrics.get("num_valid_targets", 0.0))),
     ]

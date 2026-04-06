@@ -97,9 +97,15 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--no_show_tqdm", dest="show_tqdm", action="store_false")
     p.set_defaults(show_tqdm=bool(default_value(d, "show_tqdm", True)))
 
+    p.add_argument("--collator_include_raw_inputs", dest="collator_include_raw_inputs", action="store_true")
+    p.add_argument("--no_collator_include_raw_inputs", dest="collator_include_raw_inputs", action="store_false")
+    p.set_defaults(collator_include_raw_inputs=bool(default_value(d, "collator_include_raw_inputs", False)))
     p.add_argument("--run_test", dest="run_test", action="store_true")
     p.add_argument("--no_run_test", dest="run_test", action="store_false")
     p.set_defaults(run_test=bool(default_value(d, "run_test", True)))
+    p.add_argument("--run_val_metrics", dest="run_val_metrics", action="store_true")
+    p.add_argument("--no_run_val_metrics", dest="run_val_metrics", action="store_false")
+    p.set_defaults(run_val_metrics=bool(default_value(d, "run_val_metrics", True)))
 
     p.add_argument("--test_split_prefix", type=str, default=str(default_value(d, "test_split_prefix", "test2/")))
     p.add_argument("--test_strip_split_prefix", dest="test_strip_split_prefix", action="store_true")
@@ -111,21 +117,23 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--scene_w", type=int, default=int(default_value(d, "scene_w", 512)))
 
     p.add_argument("--max_text_length", type=int, default=int(default_value(d, "max_text_length", 256)))
-    p.add_argument("--generation_max_new_tokens", type=int, default=int(default_value(d, "generation_max_new_tokens", 16)))
+    p.add_argument("--generation_max_new_tokens", type=int, default=int(default_value(d, "generation_max_new_tokens", 24)))
+    p.add_argument("--generation_num_beams", type=int, default=int(default_value(d, "generation_num_beams", 3)))
     p.add_argument("--object_embedding_dim", type=int, default=int(default_value(d, "object_embedding_dim", 512)))
     p.add_argument("--test_retrieval_top_k", type=int, default=int(default_value(d, "test_retrieval_top_k", 3)))
     p.add_argument("--point_decimals", type=int, default=int(default_value(d, "point_decimals", 4)))
-    # loss_fmt_weight: CE weight on fixed template tokens ("Point: ", "\nObject: ")
-    p.add_argument(
-        "--loss_fmt_weight",
-        type=float,
-        default=float(default_value(d, "loss_fmt_weight", default_value(d, "loss_answer_weight", 0.6))),
-    )
-    p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 2.0)))
-    p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 0.5)))
+    p.add_argument("--loss_answer_weight", type=float, default=float(default_value(d, "loss_answer_weight", 1.0)))
+    p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 0.0)))
+    p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 0.3)))
+    p.add_argument("--loss_slot_weight", type=float, default=float(default_value(d, "loss_slot_weight", 0.0)))
     p.add_argument("--loss_use_lm_fallback", dest="loss_use_lm_fallback", action="store_true")
     p.add_argument("--no_loss_use_lm_fallback", dest="loss_use_lm_fallback", action="store_false")
     p.set_defaults(loss_use_lm_fallback=bool(default_value(d, "loss_use_lm_fallback", False)))
+    p.add_argument(
+        "--object_loss_mode",
+        type=str,
+        default=str(default_value(d, "object_loss_mode", "retrieval")),
+    )
     p.add_argument(
         "--object_temperature",
         type=float,
@@ -140,7 +148,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument(
         "--answer_template",
         type=str,
-        default=str(default_value(d, "answer_template", "Point: {point_x} {point_y}\nObject: <obj_emb>")),
+        default=str(default_value(d, "answer_template", "Point: {point_x} {point_y}\nObject: {label_text}")),
     )
     p.add_argument("--fallback_target_text", type=str, default=str(default_value(d, "fallback_target_text", "unknown")))
 

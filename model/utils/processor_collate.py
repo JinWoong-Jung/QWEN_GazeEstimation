@@ -7,7 +7,7 @@ import torch
 
 from ..modules.preprocess import resize_scene
 from .common import chat_text
-from .object_tokens import slot_span
+from .object_tokens import object_label_span
 
 
 def mask_padding_labels(
@@ -87,7 +87,9 @@ def parse_target_spans(text: str) -> tuple[tuple[int, int] | None, tuple[int, in
     m_point = re.search(rf"(?im)^\s*point\s*:\s*({num})\s*[,\s]+\s*({num})\s*$", txt)
     x_span = (int(m_point.start(1)), int(m_point.end(1))) if m_point is not None else None
     y_span = (int(m_point.start(2)), int(m_point.end(2))) if m_point is not None else None
-    o_span = slot_span(txt)
+    # Use object_label_span to support both pure-text labels ("Object: television")
+    # and legacy slot format ("Object: <obj_emb>").
+    o_span = object_label_span(txt)
     return x_span, y_span, o_span
 
 
@@ -202,8 +204,12 @@ def build_train_inputs(
     )
 
     bsz = int(labels.shape[0])
-    point_valid = target_point_valid if target_point_valid is not None else torch.ones((bsz,), dtype=torch.float32)
-    object_valid = target_object_valid if target_object_valid is not None else target_valid
+    point_valid = target_point_valid
+    object_valid = target_object_valid
+    if point_valid is None:
+        point_valid = torch.ones((bsz,), dtype=torch.float32)
+    if object_valid is None:
+        object_valid = target_valid
     point_valid = point_valid.to(dtype=torch.float32).flatten()
     object_valid = object_valid.to(dtype=torch.float32).flatten()
 
@@ -216,23 +222,19 @@ def build_train_inputs(
         if torch.any(invalid_object):
             object_mask[invalid_object] = False
 
-    # L_fmt: CE loss only on fixed template tokens ("Point: ", "\nObject: "),
-    # excluding coordinate tokens (L_point) and <obj_emb> token (L_obj-ret).
-    fmt_mask = answer_mask & ~point_mask & ~object_mask
-
-    # Propagate invalidity to fmt_mask as well.
-    invalid_fmt = torch.zeros((bsz,), dtype=torch.bool)
+    # answer_mask (format CE) should stay alive whenever point supervision is live,
+    # regardless of object validity.  Killing it on object_valid <= 0 would also
+    # suppress "Point: x y" CE for samples that merely lack an object label.
+    invalid_answer = torch.zeros((bsz,), dtype=torch.bool)
     if point_valid.numel() == bsz:
-        invalid_fmt = invalid_fmt | point_valid.le(0)
-    if object_valid.numel() == bsz:
-        invalid_fmt = invalid_fmt | object_valid.le(0)
-    if torch.any(invalid_fmt):
-        fmt_mask[invalid_fmt] = False
+        invalid_answer = invalid_answer | point_valid.le(0)
+    if torch.any(invalid_answer):
+        answer_mask[invalid_answer] = False
 
-    supervised = fmt_mask.any(dim=1) | point_mask.any(dim=1) | object_mask.any(dim=1)
+    supervised = answer_mask.any(dim=1) | point_mask.any(dim=1) | object_mask.any(dim=1)
     if torch.any(~supervised):
         labels[~supervised] = -100
-    return dict(joint_inputs), labels, fmt_mask, point_mask, object_mask
+    return dict(joint_inputs), labels, answer_mask, point_mask, object_mask
 
 
 def build_infer_inputs(
@@ -327,6 +329,27 @@ class QwenTrainCollator:
             "target_point_valid": target_point_valid,
             "target_object_valid": target_object_valid,
             "target_label": torch.tensor([int(x["target_label"]) for x in batch], dtype=torch.long),
+            "target_label_ids": [
+                [int(v) for v in x.get("target_label_ids", []) if int(v) >= 0]
+                for x in batch
+            ],
+            "target_point": torch.stack(
+                [
+                    x.get("target_point", torch.tensor([0.0, 0.0], dtype=torch.float32))
+                    if torch.is_tensor(x.get("target_point", None))
+                    else torch.tensor([0.0, 0.0], dtype=torch.float32)
+                    for x in batch
+                ],
+                dim=0,
+            ).to(dtype=torch.float32),
+            "gt_points": [
+                x.get("gt_points", torch.zeros((1, 2), dtype=torch.float32))
+                if torch.is_tensor(x.get("gt_points", None))
+                else torch.zeros((1, 2), dtype=torch.float32)
+                for x in batch
+            ],
+            "target_label_text": [str(x.get("target_label_text", "")) for x in batch],
+            "image_rel": [str(x.get("image_rel", "")) for x in batch],
             "loss_mask_answer": loss_mask_answer,
             "loss_mask_point": loss_mask_point,
             "loss_mask_object": loss_mask_object,

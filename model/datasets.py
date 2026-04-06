@@ -13,8 +13,6 @@ from .utils.data_utils import (
     build_prompt,
     sanitize_bbox_pixels,
 )
-from .utils.object_tokens import OBJ_SLOT
-
 
 def format_target_text(
     label_text: str,
@@ -52,21 +50,15 @@ def format_target_text(
     else:
         is_valid_obj = int(obj_id) >= 0
     is_valid = 1.0 if is_valid_obj else 0.0
-    obj_token = str(OBJ_SLOT)
 
     dec = max(0, int(point_decimals))
     px = f"{clamp01(point_x):.{dec}f}"
     py = f"{clamp01(point_y):.{dec}f}"
-    tpl = str(answer_template or "Point: {point_x} {point_y}\nObject: {object_token}")
+    tpl = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
     try:
-        text = tpl.format(
-            label_text=raw,
-            point_x=px,
-            point_y=py,
-            object_token=str(obj_token),
-        )
+        text = tpl.format(label_text=raw, point_x=px, point_y=py)
     except Exception:
-        text = f"Point: {px} {py}\nObject: {OBJ_SLOT}"
+        text = f"Point: {px} {py}\nObject: {raw}"
     return str(text), float(is_valid)
 
 
@@ -105,7 +97,7 @@ class GazeDataset(Dataset):
         vocab2id: dict[str, int] | None = None,
         vocab2id_lower: dict[str, int] | None = None,
         num_classes: int = 0,
-        answer_template: str = "Point: {point_x} {point_y}\nObject: <obj_emb>",
+        answer_template: str = "Point: {point_x} {point_y}\nObject: {label_text}",
         fallback_target_text: str = "unknown",
         point_decimals: int = 4,
         visual_prompting: bool = False,
@@ -118,7 +110,7 @@ class GazeDataset(Dataset):
         self.vocab2id = vocab2id or {}
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
-        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: <obj_emb>")
+        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
         self.fallback_target_text = str(fallback_target_text)
         self.point_decimals = int(point_decimals)
         self.visual_prompting = bool(visual_prompting)
@@ -148,8 +140,11 @@ class GazeDataset(Dataset):
             scene = draw_head_bbox_prompt(scene, x1=x1, y1=y1, x2=x2, y2=y2)
         bbox_norm = (x1 / w, y1 / h, x2 / w, y2 / h)
         prompt = build_prompt(bbox_norm, self.prompt_template, self.prompt_text)
+        resolved_label_text = str(rec.label_text or "").strip()
+        if (not resolved_label_text) and int(rec.label_id) >= 0:
+            resolved_label_text = str(self.id2label.get(int(rec.label_id), "")).strip()
         target_text, target_valid = format_target_text(
-            label_text=rec.label_text,
+            label_text=resolved_label_text,
             label_id=int(rec.label_id),
             id2label=self.id2label,
             vocab2id=self.vocab2id,
@@ -166,10 +161,20 @@ class GazeDataset(Dataset):
             "scene_image": scene,
             "text_input": prompt,
             "target_text": target_text,
-            "target_text_valid": torch.tensor(target_valid, dtype=torch.float32),
+            # target_text_valid controls whether point/format masks are built.
+            # Always 1.0: even when the object label is invalid we still want
+            # to supervise the gaze coordinate (localization is the primary goal).
+            "target_text_valid": torch.tensor(1.0, dtype=torch.float32),
             "target_point_valid": torch.tensor(1.0, dtype=torch.float32),
+            # target_object_valid is decoupled from point validity so that
+            # object retrieval loss is suppressed only when the label is bad.
             "target_object_valid": torch.tensor(target_valid, dtype=torch.float32),
             "target_label": int(rec.label_id),
+            "target_label_ids": [int(rec.label_id)] if int(rec.label_id) >= 0 else [],
+            "target_point": torch.tensor([float(gaze_x), float(gaze_y)], dtype=torch.float32),
+            "gt_points": torch.tensor([[float(gaze_x), float(gaze_y)]], dtype=torch.float32),
+            "target_label_text": resolved_label_text,
+            "image_rel": str(rec.image_rel),
         }
 
 
@@ -183,7 +188,7 @@ class GazeTestDataset(Dataset):
         vocab2id: dict[str, int] | None = None,
         vocab2id_lower: dict[str, int] | None = None,
         num_classes: int = 0,
-        answer_template: str = "Point: {point_x} {point_y}\nObject: <obj_emb>",
+        answer_template: str = "Point: {point_x} {point_y}\nObject: {label_text}",
         fallback_target_text: str = "unknown",
         point_decimals: int = 4,
         visual_prompting: bool = False,
@@ -195,7 +200,7 @@ class GazeTestDataset(Dataset):
         self.vocab2id = vocab2id or {}
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
-        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: <obj_emb>")
+        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
         self.fallback_target_text = str(fallback_target_text)
         self.point_decimals = int(point_decimals)
         self.visual_prompting = bool(visual_prompting)
