@@ -603,11 +603,16 @@ def load_test_label_map(
                 stats["mapped"] += 1
                 chosen_id = int(chosen_id)
 
+            # Parse multi-labels independently of primary mapping result so that
+            # samples with a failed primary lookup can still contribute to multiacc@1.
             parsed_multi: list[int] = []
+            if t_multi:
+                parsed = [vocab_id(x.strip(), v, vl) for x in t_multi.split("-") if x.strip()]
+                parsed_multi = sorted({int(x) for x in parsed if int(x) >= 0})
+            # Always include the primary ID when valid (ensures acc@1 ⊆ multiacc@1).
             if chosen_id >= 0:
-                if t_multi:
-                    parsed = [vocab_id(x.strip(), v, vl) for x in t_multi.split("-") if x.strip()]
-                    parsed_multi = sorted({int(x) for x in parsed if int(x) >= 0})
+                if chosen_id not in parsed_multi:
+                    parsed_multi = sorted(set(parsed_multi) | {int(chosen_id)})
                 if not parsed_multi:
                     parsed_multi = [int(chosen_id)]
 

@@ -247,6 +247,7 @@ def test_log_payload(test_metrics: dict[str, float], epoch: float) -> dict[str, 
         "test/AvgL2": float(test_metrics.get("Avg L2", test_metrics.get("PointL2", 0.0))),
         "test/MinL2": float(test_metrics.get("Min L2", 0.0)),
         "test/PointL2": float(test_metrics.get("PointL2", 0.0)),
+        "test/RegressionL2": float(test_metrics.get("RegressionL2", 0.0)),
         "test/acc@1": float(test_metrics.get("acc@1", 0.0)),
         "test/acc@3": float(test_metrics.get("acc@3", 0.0)),
         "test/multiacc@1": float(test_metrics.get("multiacc@1", 0.0)),
@@ -280,12 +281,6 @@ def val_metric_log_payload(val_metrics: dict[str, float], epoch: float) -> dict[
         "val/acc@1": acc1,
         "val/acc@3": acc3,
         "val/multiacc@1": multiacc1,
-        "metric/val/dist": point_l2,
-        "metric/val/acc@1": acc1,
-        "metric/val/acc@3": acc3,
-        "metric/val/multiacc@1": multiacc1,
-        "val/num_samples": float(val_metrics.get("num_samples", 0.0)),
-        "val/num_valid_targets": float(val_metrics.get("num_valid_targets", 0.0)),
     }
 
 
@@ -456,9 +451,15 @@ def main() -> None:
             qwen_model = base_qwen
             print("[INFO] adapter checkpoint not found; running zero-shot base model.")
 
+        point_head_enabled = bool(getattr(args, "point_head_enabled", True))
+        point_head_hidden_dim = int(getattr(args, "point_head_hidden_dim", 256))
+        point_head_num_hidden_layers = int(getattr(args, "point_head_num_hidden_layers", 3))
         model = QwenTextGenerationModel(
             qwen_model=qwen_model,
             object_embedding_dim=int(object_embedding_dim),
+            point_head_enabled=point_head_enabled,
+            point_head_hidden_dim=point_head_hidden_dim,
+            point_head_num_hidden_layers=point_head_num_hidden_layers,
         ).to(device)
         train_label_embedding_bank_device = train_label_embedding_bank.to(device=device)
         test_label_embedding_bank_device = test_label_embedding_bank.to(device=device)
@@ -471,6 +472,14 @@ def main() -> None:
                     print(f"[INFO] loaded object projector from: {obj_proj_path}")
                 except Exception as e:
                     print(f"[WARN] failed to load object projector from {obj_proj_path}: {e}")
+            pt_head_path = checkpoint_dir / "point_head.pt"
+            if pt_head_path.exists() and model.point_head is not None:
+                try:
+                    st = torch.load(pt_head_path, map_location=device)
+                    model.point_head.load_state_dict(st, strict=False)
+                    print(f"[INFO] loaded point head from: {pt_head_path}")
+                except Exception as e:
+                    print(f"[WARN] failed to load point head from {pt_head_path}: {e}")
         model.eval()
 
         test_groups = load_test_groups(
@@ -536,6 +545,7 @@ def main() -> None:
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
+                point_head_enabled=point_head_enabled,
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
@@ -779,9 +789,15 @@ def main() -> None:
         qwen_lora = get_peft_model(base_qwen, lora_cfg)
         qwen_lora.print_trainable_parameters()
 
+    point_head_enabled = bool(getattr(args, "point_head_enabled", True))
+    point_head_hidden_dim = int(getattr(args, "point_head_hidden_dim", 256))
+    point_head_num_hidden_layers = int(getattr(args, "point_head_num_hidden_layers", 3))
     model = QwenTextGenerationModel(
         qwen_model=qwen_lora,
         object_embedding_dim=int(object_embedding_dim),
+        point_head_enabled=point_head_enabled,
+        point_head_hidden_dim=point_head_hidden_dim,
+        point_head_num_hidden_layers=point_head_num_hidden_layers,
     ).to(device)
     train_label_embedding_bank_device = train_label_embedding_bank.to(device=device)
     test_label_embedding_bank_device = test_label_embedding_bank.to(device=device)
@@ -810,15 +826,20 @@ def main() -> None:
     loss_object_weight = float(getattr(args, "loss_object_weight", 1.5))
     loss_slot_weight = float(getattr(args, "loss_slot_weight", 0.0))
     loss_use_lm_fallback = bool(getattr(args, "loss_use_lm_fallback", False))
+    loss_point_reg_weight = float(getattr(args, "loss_point_reg_weight", 1.0))
+    point_reg_loss_type = str(getattr(args, "point_reg_loss_type", "smooth_l1")).strip().lower()
     print(
         "[INFO] structured loss weights: "
         f"answer={loss_answer_weight:.4f} "
-        f"point={loss_point_weight:.4f} "
+        f"point_ce={loss_point_weight:.4f} "
         f"object={loss_object_weight:.4f} "
         f"slot={loss_slot_weight:.4f} "
+        f"point_reg={loss_point_reg_weight:.4f} "
+        f"point_reg_type={point_reg_loss_type} "
         f"object_mode={object_loss_mode} "
         f"object_temp={object_temperature:.4f} "
-        f"lm_fallback={str(loss_use_lm_fallback).lower()}"
+        f"lm_fallback={str(loss_use_lm_fallback).lower()} "
+        f"point_head={str(point_head_enabled).lower()}"
     )
     best_val_loss = float("inf")
     global_step = 0
@@ -862,6 +883,12 @@ def main() -> None:
             object_slot_mask = batch.get("loss_mask_object", None)
             if torch.is_tensor(object_slot_mask):
                 object_slot_mask = object_slot_mask.to(device=device)
+            # Pass point coordinate token mask to point head when regression is active.
+            point_span_mask = None
+            if bool(point_head_enabled) and float(loss_point_reg_weight) > 0.0:
+                point_span_mask = batch.get("loss_mask_point", None)
+                if torch.is_tensor(point_span_mask):
+                    point_span_mask = point_span_mask.to(device=device)
             bsz = int(labels.shape[0])
             is_last_batch = (step == num_train_batches)
             current_accum_steps = (
@@ -883,11 +910,14 @@ def main() -> None:
                     joint_inputs=joint_inputs,
                     labels=pass_labels,
                     object_slot_mask=object_slot_mask,
+                    point_span_mask=point_span_mask,
                     use_cache=False,
                 )
                 lm_loss = out.get("loss", None)
                 if loss_use_lm_fallback and lm_loss is None:
                     raise RuntimeError("Model forward must return loss when lm_fallback is enabled.")
+                _target_point = batch.get("target_point", None)
+                _target_point_valid = batch.get("target_point_valid", None)
                 structured = compute_structured_losses(
                     logits=out.get("logits", None),
                     labels=labels,
@@ -908,6 +938,12 @@ def main() -> None:
                     weight_point=loss_point_weight,
                     weight_object=loss_object_weight,
                     weight_slot=loss_slot_weight,
+                    pred_point_xy=out.get("pred_point_xy", None),
+                    target_point=_target_point.to(device) if torch.is_tensor(_target_point) else None,
+                    target_point_valid=_target_point_valid.to(device) if torch.is_tensor(_target_point_valid) else None,
+                    point_head_valid=out.get("point_head_valid", None),
+                    weight_point_reg=loss_point_reg_weight,
+                    point_reg_loss_type=point_reg_loss_type,
                     fallback_loss=(lm_loss if loss_use_lm_fallback else None),
                 )
                 raw_loss = structured["loss"]
@@ -935,18 +971,12 @@ def main() -> None:
                     )
                     wandb_run.log(
                         {
-                            "train/loss/total": float(structured["loss_total"].detach().item()),
                             "train/loss/answer": float(structured["loss_answer"].detach().item()),
-                            "train/loss/point": float(structured["loss_point"].detach().item()),
                             "train/loss/object": float(structured["loss_object"].detach().item()),
-                            "train/loss/slot": float(structured["loss_slot"].detach().item()),
-                            "train/loss/lm_fallback": float(lm_loss.detach().item()) if torch.is_tensor(lm_loss) else 0.0,
+                            "train/loss/point_reg": float(structured["loss_point_reg"].detach().item()),
                             "train/loss": float(raw_loss.detach().item()),
-                            "train/loss_answer": float(structured["loss_answer"].detach().item()),
-                            "train/loss_lm_fallback": float(lm_loss.detach().item()) if torch.is_tensor(lm_loss) else 0.0,
                             "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                             "train/grad_norm": grad_norm_value,
-                            "train/global_step": float(global_step),
                             "train/epoch": epoch_progress,
                         },
                         step=global_step,
@@ -982,6 +1012,9 @@ def main() -> None:
                 label_embedding_bank=train_label_embedding_bank_device,
                 object_loss_mode=object_loss_mode,
                 object_temperature=object_temperature,
+                loss_point_reg_weight=loss_point_reg_weight,
+                point_reg_loss_type=point_reg_loss_type,
+                point_head_enabled=point_head_enabled,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"Eval {epoch}/{args.epochs}",
             )
@@ -1007,6 +1040,7 @@ def main() -> None:
                 desc=f"ValMetric {epoch}/{args.epochs}",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
+                point_head_enabled=point_head_enabled,
             )
 
         epoch_msg = (
@@ -1031,11 +1065,9 @@ def main() -> None:
                 "epoch/train_loss": float(train_loss),
                 "val/epoch": float(epoch),
                 "val/loss": float(val_loss),
-                "val/loss/total": float(val_metrics.get("loss_total", val_loss)),
                 "val/loss/answer": float(val_metrics.get("loss_answer", 0.0)),
-                "val/loss/point": float(val_metrics.get("loss_point", 0.0)),
                 "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
-                "metric/val/loss": float(val_loss),
+                "val/loss/point_reg": float(val_metrics.get("loss_point_reg", 0.0)),
             }
             if isinstance(val_gen_metrics, dict):
                 payload.update(val_metric_log_payload(val_gen_metrics, epoch=float(epoch)))
@@ -1068,6 +1100,9 @@ def main() -> None:
             label_embedding_bank=train_label_embedding_bank_device,
             object_loss_mode=object_loss_mode,
             object_temperature=object_temperature,
+            loss_point_reg_weight=loss_point_reg_weight,
+            point_reg_loss_type=point_reg_loss_type,
+            point_head_enabled=point_head_enabled,
             show_tqdm=bool(args.show_tqdm),
             desc="Eval (checkpoint)",
         )
@@ -1090,6 +1125,7 @@ def main() -> None:
                 desc="Eval metrics (checkpoint)",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
+                point_head_enabled=point_head_enabled,
             )
         print(
             "[EVAL] "
@@ -1099,11 +1135,9 @@ def main() -> None:
             payload = {
                 "val/epoch": 0.0,
                 "val/loss": float(best_val_loss),
-                "val/loss/total": float(val_metrics.get("loss_total", best_val_loss)),
                 "val/loss/answer": float(val_metrics.get("loss_answer", 0.0)),
-                "val/loss/point": float(val_metrics.get("loss_point", 0.0)),
                 "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
-                "metric/val/loss": float(best_val_loss),
+                "val/loss/point_reg": float(val_metrics.get("loss_point_reg", 0.0)),
             }
             if isinstance(val_gen_metrics, dict):
                 payload.update(val_metric_log_payload(val_gen_metrics, epoch=0.0))
@@ -1188,6 +1222,7 @@ def main() -> None:
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
+                point_head_enabled=point_head_enabled,
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:

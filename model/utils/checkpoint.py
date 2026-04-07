@@ -45,6 +45,11 @@ def save_checkpoint(
             torch.save(model.object_projector.state_dict(), ckpt_dir / "object_projector.pt")
         except Exception:
             pass
+    if hasattr(model, "point_head") and model.point_head is not None:
+        try:
+            torch.save(model.point_head.state_dict(), ckpt_dir / "point_head.pt")
+        except Exception:
+            pass
 
     torch.save(
         {
@@ -94,6 +99,14 @@ def load_checkpoint_for_eval(
         try:
             st = torch.load(object_projector_path, map_location=device)
             model.object_projector.load_state_dict(st, strict=False)
+            loaded_any = True
+        except Exception:
+            pass
+    point_head_path = ckpt_dir / "point_head.pt"
+    if point_head_path.exists() and hasattr(model, "point_head") and model.point_head is not None:
+        try:
+            st = torch.load(point_head_path, map_location=device)
+            model.point_head.load_state_dict(st, strict=False)
             loaded_any = True
         except Exception:
             pass

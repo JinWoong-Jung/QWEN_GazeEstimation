@@ -162,6 +162,19 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--lora_target_modules", type=str, default=str(lora_target_default))
     p.add_argument("--attn_implementation", type=str, default=str(default_value(d, "attn_implementation", "sdpa")))
 
+    # ── Point regression head ──────────────────────────────────────────────
+    p.add_argument("--point_head_enabled", dest="point_head_enabled", action="store_true")
+    p.add_argument("--no_point_head_enabled", dest="point_head_enabled", action="store_false")
+    p.set_defaults(point_head_enabled=bool(default_value(d, "point_head_enabled", True)))
+    p.add_argument("--point_head_hidden_dim", type=int, default=int(default_value(d, "point_head_hidden_dim", 256)))
+    p.add_argument("--point_head_num_hidden_layers", type=int, default=int(default_value(d, "point_head_num_hidden_layers", 3)))
+    p.add_argument("--loss_point_reg_weight", type=float, default=float(default_value(d, "loss_point_reg_weight", 1.0)))
+    p.add_argument(
+        "--point_reg_loss_type",
+        type=str,
+        default=str(default_value(d, "point_reg_loss_type", "smooth_l1")),
+    )
+
     p.add_argument("--wandb_enabled", dest="wandb_enabled", action="store_true")
     p.add_argument("--no_wandb_enabled", dest="wandb_enabled", action="store_false")
     p.set_defaults(wandb_enabled=bool(default_value(d, "wandb_enabled", default_value(d, "enabled", False))))
