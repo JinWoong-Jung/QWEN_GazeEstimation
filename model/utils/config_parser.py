@@ -97,21 +97,20 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--no_show_tqdm", dest="show_tqdm", action="store_false")
     p.set_defaults(show_tqdm=bool(default_value(d, "show_tqdm", True)))
 
-    p.add_argument("--collator_include_raw_inputs", dest="collator_include_raw_inputs", action="store_true")
-    p.add_argument("--no_collator_include_raw_inputs", dest="collator_include_raw_inputs", action="store_false")
-    p.set_defaults(collator_include_raw_inputs=bool(default_value(d, "collator_include_raw_inputs", False)))
     p.add_argument("--run_test", dest="run_test", action="store_true")
     p.add_argument("--no_run_test", dest="run_test", action="store_false")
     p.set_defaults(run_test=bool(default_value(d, "run_test", True)))
     p.add_argument("--run_val_metrics", dest="run_val_metrics", action="store_true")
     p.add_argument("--no_run_val_metrics", dest="run_val_metrics", action="store_false")
     p.set_defaults(run_val_metrics=bool(default_value(d, "run_val_metrics", True)))
+    p.add_argument("--run_val_metrics_every_n_epochs", type=int, default=int(default_value(d, "run_val_metrics_every_n_epochs", 5)))
 
     p.add_argument("--test_split_prefix", type=str, default=str(default_value(d, "test_split_prefix", "test2/")))
     p.add_argument("--test_strip_split_prefix", dest="test_strip_split_prefix", action="store_true")
     p.add_argument("--no_test_strip_split_prefix", dest="test_strip_split_prefix", action="store_false")
     p.set_defaults(test_strip_split_prefix=bool(default_value(d, "test_strip_split_prefix", True)))
     p.add_argument("--test_bbox_round_decimals", type=int, default=int(default_value(d, "test_bbox_round_decimals", 3)))
+    p.add_argument("--image_cache_size", type=int, default=int(default_value(d, "image_cache_size", 1000)))
 
     p.add_argument("--scene_h", type=int, default=int(default_value(d, "scene_h", 512)))
     p.add_argument("--scene_w", type=int, default=int(default_value(d, "scene_w", 512)))
@@ -123,21 +122,15 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--test_retrieval_top_k", type=int, default=int(default_value(d, "test_retrieval_top_k", 3)))
     p.add_argument("--point_decimals", type=int, default=int(default_value(d, "point_decimals", 4)))
     p.add_argument("--loss_answer_weight", type=float, default=float(default_value(d, "loss_answer_weight", 1.0)))
-    p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 0.0)))
-    p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 0.3)))
-    p.add_argument("--loss_slot_weight", type=float, default=float(default_value(d, "loss_slot_weight", 0.0)))
-    p.add_argument("--loss_use_lm_fallback", dest="loss_use_lm_fallback", action="store_true")
-    p.add_argument("--no_loss_use_lm_fallback", dest="loss_use_lm_fallback", action="store_false")
-    p.set_defaults(loss_use_lm_fallback=bool(default_value(d, "loss_use_lm_fallback", False)))
-    p.add_argument(
-        "--object_loss_mode",
-        type=str,
-        default=str(default_value(d, "object_loss_mode", "retrieval")),
-    )
     p.add_argument(
         "--object_temperature",
         type=float,
         default=float(default_value(d, "object_temperature", 0.07)),
+    )
+    p.add_argument(
+        "--clip_model_path",
+        type=str,
+        default=str(default_value(d, "clip_model_path", "openai/clip-vit-base-patch32")),
     )
 
     p.add_argument("--prompt_template", type=str, default=str(default_value(d, "prompt_template", "")))
@@ -161,19 +154,6 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
         lora_target_default = ",".join(str(x) for x in lora_target_default)
     p.add_argument("--lora_target_modules", type=str, default=str(lora_target_default))
     p.add_argument("--attn_implementation", type=str, default=str(default_value(d, "attn_implementation", "sdpa")))
-
-    # ── Point regression head ──────────────────────────────────────────────
-    p.add_argument("--point_head_enabled", dest="point_head_enabled", action="store_true")
-    p.add_argument("--no_point_head_enabled", dest="point_head_enabled", action="store_false")
-    p.set_defaults(point_head_enabled=bool(default_value(d, "point_head_enabled", True)))
-    p.add_argument("--point_head_hidden_dim", type=int, default=int(default_value(d, "point_head_hidden_dim", 256)))
-    p.add_argument("--point_head_num_hidden_layers", type=int, default=int(default_value(d, "point_head_num_hidden_layers", 3)))
-    p.add_argument("--loss_point_reg_weight", type=float, default=float(default_value(d, "loss_point_reg_weight", 1.0)))
-    p.add_argument(
-        "--point_reg_loss_type",
-        type=str,
-        default=str(default_value(d, "point_reg_loss_type", "smooth_l1")),
-    )
 
     p.add_argument("--wandb_enabled", dest="wandb_enabled", action="store_true")
     p.add_argument("--no_wandb_enabled", dest="wandb_enabled", action="store_false")

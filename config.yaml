@@ -26,6 +26,7 @@ data:
   test_split_prefix: "test2/"
   test_strip_split_prefix: true
   test_bbox_round_decimals: 3
+  image_cache_size: 1000
 
 train:
   batch_size: 8
@@ -33,9 +34,9 @@ train:
   epochs: 20
   num_workers: 4
   show_tqdm: true
-  collator_include_raw_inputs: false
   run_test: true
   run_val_metrics: true
+  run_val_metrics_every_n_epochs: 1
   eval_only: false
   lr: 1e-4
   weight_decay: 0.01
@@ -54,32 +55,19 @@ image:
 text:
   # NOTE: currently not applied because collator tokenization uses truncation=False.
   max_text_length: 256
-  generation_max_new_tokens: 26  # slightly larger to fit "Object: <label text>" in pure-text mode
+  generation_max_new_tokens: 26
   generation_num_beams: 3
   object_embedding_dim: 512
   test_retrieval_top_k: 3
   point_decimals: 4
+  # CLIP model used for test-time object text encoding.
+  # Must match the model used to pre-compute label-embeds/*.pt files.
+  clip_model_path: "openai/clip-vit-base-patch32"
 
 loss:
-  # total = w_answer * L_answer_nll + w_object * L_obj_retrieval + w_point_reg * L_point_reg
-  # L_answer_nll : full assistant answer autoregressive NLL (main objective).
-  # L_obj_retrieval : object span hidden -> CLIP bank retrieval CE (auxiliary).
-  # L_point_reg  : point head hidden -> SmoothL1/MSE regression to GT (x, y) (auxiliary).
-  # Priority: full-answer NLL > point regression > object retrieval.
+  # Sole training objective: masked autoregressive NLL over answer tokens.
   loss_answer_weight: 1.0
-  loss_point_weight: 0.0    # point tokens CE — already covered by full answer NLL
-  loss_object_weight: 0.5   # retrieval auxiliary; keep low so NLL stays primary
-  loss_slot_weight: 0.0     # no <obj_emb> slot token in pure-text mode
-  loss_point_reg_weight: 2.0  # point head regression loss weight
-  point_reg_loss_type: "mse"  # "smooth_l1" or "mse"
-  object_loss_mode: "retrieval"
-  object_temperature: 0.07
-  loss_use_lm_fallback: false
-
-point_head:
-  point_head_enabled: true
-  point_head_hidden_dim: 256
-  point_head_num_hidden_layers: 3
+  object_temperature: 0.07  # cosine similarity temperature for CLIP retrieval at test time
 
 prompt:
   prompt_template: ""

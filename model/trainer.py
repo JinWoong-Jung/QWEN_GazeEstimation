@@ -45,12 +45,13 @@ from .utils.data_utils import (
     load_test_label_map,
     load_vocab2id,
 )
-from .utils.eval_utils import print_test_metrics_table, run_eval, run_test_metrics
-from .utils.loss_utils import compute_structured_losses
-from .utils.object_tokens import (
-    OBJ_SLOT,
-    add_slot_token,
+from .utils.eval_utils import (
+    CLIPTextEncoder,
+    print_test_metrics_table,
+    run_eval,
+    run_test_metrics,
 )
+from .utils.loss_utils import compute_answer_loss
 from .utils.processor_collate import QwenTestCollator, QwenTrainCollator
 from .utils.wandb_utils import finish_wandb, init_wandb
 
@@ -162,52 +163,11 @@ def infer_num_classes(vocab2id: dict[str, int], vocab2id_path: Path) -> int:
         first = got[:10]
         last = got[-10:] if len(got) > 10 else got
         raise RuntimeError(
-            "vocab2id ids must be exactly contiguous 0..N-1 for object token migration. "
+            "vocab2id ids must be exactly contiguous 0..N-1. "
             f"path={vocab2id_path} N={n} got_min={min(got)} got_max={max(got)} "
             f"head={first} tail={last}"
         )
     return n
-
-
-def ensure_slot_token(
-    processor: Any,
-) -> int:
-    tok = getattr(processor, "tokenizer", None)
-    if tok is None:
-        raise RuntimeError("processor.tokenizer is missing; cannot register object slot token.")
-    return int(add_slot_token(tok))
-
-
-def resize_embeddings(model: Any, processor: Any) -> bool:
-    tok = getattr(processor, "tokenizer", None)
-    if tok is None:
-        return False
-    if not hasattr(model, "resize_token_embeddings"):
-        return False
-    target_vocab = int(len(tok))
-    current_vocab = None
-    try:
-        emb = model.get_input_embeddings()
-        current_vocab = int(getattr(emb, "num_embeddings", -1))
-    except Exception:
-        current_vocab = None
-    if current_vocab is not None and current_vocab == target_vocab:
-        return False
-    try:
-        model.resize_token_embeddings(target_vocab)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to resize model token embeddings to tokenizer size={target_vocab}: {e}"
-        ) from e
-    try:
-        new_vocab = int(getattr(model.get_input_embeddings(), "num_embeddings", -1))
-    except Exception as e:
-        raise RuntimeError(f"Could not verify resized embedding size after resize_token_embeddings: {e}") from e
-    if new_vocab != target_vocab:
-        raise RuntimeError(
-            f"Embedding resize mismatch: tokenizer_vocab={target_vocab} model_vocab={new_vocab}."
-        )
-    return True
 
 
 def init_processor(
@@ -218,69 +178,36 @@ def init_processor(
     processor_path = model_path
     if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
         processor_path = checkpoint_dir / "processor"
-    processor = AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
-    n_added_slot_token = ensure_slot_token(processor)
-    print(
-        "[INFO] object slot token: "
-        f"token={OBJ_SLOT} added={int(n_added_slot_token)} source={processor_path}"
-    )
-    return processor
+    return AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
 
 
 def init_base_model(
     *,
     model_path: Path,
     model_kwargs: dict[str, Any],
-    processor: Any,
 ) -> Any:
-    base_qwen = AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
-    if resize_embeddings(base_qwen, processor):
-        print(f"[INFO] resized model token embeddings to tokenizer size={len(processor.tokenizer)}")
-    return base_qwen
+    return AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
 
 
 def test_log_payload(test_metrics: dict[str, float], epoch: float) -> dict[str, float]:
     return {
-        "test/epoch": float(epoch),
-        "test/ExactMatch": float(test_metrics.get("ExactMatch", 0.0)),
-        "test/Contains": float(test_metrics.get("Contains", 0.0)),
-        "test/AvgL2": float(test_metrics.get("Avg L2", test_metrics.get("PointL2", 0.0))),
-        "test/MinL2": float(test_metrics.get("Min L2", 0.0)),
-        "test/PointL2": float(test_metrics.get("PointL2", 0.0)),
-        "test/RegressionL2": float(test_metrics.get("RegressionL2", 0.0)),
+        "test/Avg_L2": float(test_metrics.get("Avg L2", test_metrics.get("PointL2", 0.0))),
+        "test/Min_L2": float(test_metrics.get("Min L2", 0.0)),
         "test/acc@1": float(test_metrics.get("acc@1", 0.0)),
         "test/acc@3": float(test_metrics.get("acc@3", 0.0)),
         "test/multiacc@1": float(test_metrics.get("multiacc@1", 0.0)),
-        "test/ObjectTokenValidRate": float(test_metrics.get("ObjectTokenValidRate", 0.0)),
-        "test/ObjectParseFailTop1Rate": float(test_metrics.get("ObjectParseFailTop1Rate", 0.0)),
-        "test/ObjectParseFailBeamRate": float(test_metrics.get("ObjectParseFailBeamRate", 0.0)),
-        "test/ObjectParseTop1FromTokenRate": float(test_metrics.get("ObjectParseTop1FromTokenRate", 0.0)),
-        "test/ObjectParseBeamFromTokenRate": float(test_metrics.get("ObjectParseBeamFromTokenRate", 0.0)),
-        "test/ObjectParseFailTop1Count": float(test_metrics.get("ObjectParseFailTop1Count", 0.0)),
-        "test/ObjectParseFailBeamCount": float(test_metrics.get("ObjectParseFailBeamCount", 0.0)),
-        "test/ObjectParseTop1FromTokenCount": float(test_metrics.get("ObjectParseTop1FromTokenCount", 0.0)),
-        "test/ObjectParseBeamFromTokenCount": float(test_metrics.get("ObjectParseBeamFromTokenCount", 0.0)),
-        "test/RetrievalQueryValidRate": float(test_metrics.get("RetrievalQueryValidRate", 0.0)),
-        "test/RetrievalAcc@1": float(test_metrics.get("RetrievalAcc@1", 0.0)),
-        "test/RetrievalAcc@3": float(test_metrics.get("RetrievalAcc@3", 0.0)),
-        "test/RetrievalMultiAcc@1": float(test_metrics.get("RetrievalMultiAcc@1", 0.0)),
-        "test/RetrievalDen": float(test_metrics.get("RetrievalDen", 0.0)),
-        "test/num_samples": float(test_metrics.get("num_samples", 0.0)),
+        "test/ObjectParseFail": float(test_metrics.get("ObjectParseFail", 0.0)),
         "test/num_valid_targets": float(test_metrics.get("num_valid_targets", 0.0)),
     }
 
 
 def val_metric_log_payload(val_metrics: dict[str, float], epoch: float) -> dict[str, float]:
-    point_l2 = float(val_metrics.get("PointL2", val_metrics.get("Avg L2", 0.0)))
-    acc1 = float(val_metrics.get("acc@1", 0.0))
-    acc3 = float(val_metrics.get("acc@3", 0.0))
-    multiacc1 = float(val_metrics.get("multiacc@1", 0.0))
     return {
-        "val/epoch": float(epoch),
-        "val/dist": point_l2,
-        "val/acc@1": acc1,
-        "val/acc@3": acc3,
-        "val/multiacc@1": multiacc1,
+        "val/Avg_L2": float(val_metrics.get("Avg L2", val_metrics.get("PointL2", 0.0))),
+        "val/Min_L2": float(val_metrics.get("Min L2", 0.0)),
+        "val/acc@1": float(val_metrics.get("acc@1", 0.0)),
+        "val/acc@3": float(val_metrics.get("acc@3", 0.0)),
+        "val/multiacc@1": float(val_metrics.get("multiacc@1", 0.0)),
     }
 
 
@@ -328,8 +255,6 @@ def main() -> None:
     print(f"[INFO] loaded vocab2id classes: {len(vocab2id)} (id_range=0..{max(num_classes - 1, 0)})")
 
     prompt_text_for_run = str(args.prompt_text or "")
-    # Pure-text mode: prompt_text in config.yaml already instructs the model to
-    # output "Object: <object name>".  No automatic injection of <obj_emb> marker.
 
     label_embed_dir = (
         resolve_path(getattr(args, "label_embed_dir"))
@@ -339,30 +264,9 @@ def main() -> None:
     object_embedding_dim = int(getattr(args, "object_embedding_dim", 512))
     object_temperature = float(getattr(args, "object_temperature", 0.07))
     test_retrieval_top_k = max(1, int(getattr(args, "test_retrieval_top_k", 3)))
-    object_loss_mode = str(getattr(args, "object_loss_mode", "retrieval")).strip().lower()
-    if object_loss_mode not in {"retrieval", "infonce", "full_bank_retrieval"}:
-        raise RuntimeError(
-            f"Unsupported object_loss_mode={object_loss_mode!r}. "
-            "Use one of: retrieval, infonce, full_bank_retrieval."
-        )
+    clip_model_path = str(getattr(args, "clip_model_path", "openai/clip-vit-base-patch32")).strip()
 
-    train_label_embedding_bank = build_vocab_embedding_matrix(
-        vocab2id=vocab2id,
-        label_embed_dir=label_embed_dir,
-        label_emb_dim=int(object_embedding_dim),
-        normalize=True,
-    )
-    if train_label_embedding_bank is None:
-        raise RuntimeError(
-            "Failed to build training label embedding bank for object retrieval loss. "
-            f"label_embed_dir={label_embed_dir} object_embedding_dim={object_embedding_dim}"
-        )
-    print(
-        "[INFO] train label embedding bank: "
-        f"shape={tuple(train_label_embedding_bank.shape)} "
-        f"dim={int(object_embedding_dim)} mode={object_loss_mode}"
-    )
-
+    # Test label embedding bank (used only at eval/test time for CLIP retrieval)
     test_vocab_texts = load_test_vocab_texts(test_labels)
     test_vocab2id = {str(txt): int(i) for i, txt in enumerate(test_vocab_texts)}
     test_label_embedding_bank_raw = build_vocab_embedding_matrix(
@@ -388,9 +292,6 @@ def main() -> None:
         f"raw_vocab={len(test_vocab_texts)} valid_rows={len(test_retrieval_texts)} "
         f"shape={tuple(test_label_embedding_bank.shape)} topk={test_retrieval_top_k}"
     )
-    retrieval_query_text_to_label_id = {
-        label_key(k): int(v) for k, v in vocab2id.items()
-    }
 
     if bool(getattr(args, "test_only", False)):
         print("[INFO] test_only=True; skipping train/val loading and training.")
@@ -421,66 +322,29 @@ def main() -> None:
         if load_dtype != "auto":
             model_kwargs["dtype"] = load_dtype
 
-        processor = init_processor(
-            model_path=model_path,
-            checkpoint_dir=checkpoint_dir,
-        )
-
-        print("[INFO] collator raw input passthrough: test=enabled.")
+        processor = init_processor(model_path=model_path, checkpoint_dir=checkpoint_dir)
         test_collator = QwenTestCollator(
             processor=processor,
             scene_size=(int(args.scene_h), int(args.scene_w)),
             max_text_length=int(args.max_text_length),
-            include_raw_inputs=True,
         )
 
-        base_qwen = init_base_model(
-            model_path=model_path,
-            model_kwargs=model_kwargs,
-            processor=processor,
-        )
+        base_qwen = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
         adapter_dir = (checkpoint_dir / "lora_adapter") if checkpoint_dir is not None else None
         if adapter_dir is not None and adapter_dir.exists():
             qwen_model = PeftModel.from_pretrained(
-                base_qwen,
-                model_id=str(adapter_dir),
-                is_trainable=False,
+                base_qwen, model_id=str(adapter_dir), is_trainable=False,
             )
             print(f"[INFO] loaded LoRA adapter from: {adapter_dir}")
         else:
             qwen_model = base_qwen
             print("[INFO] adapter checkpoint not found; running zero-shot base model.")
 
-        point_head_enabled = bool(getattr(args, "point_head_enabled", True))
-        point_head_hidden_dim = int(getattr(args, "point_head_hidden_dim", 256))
-        point_head_num_hidden_layers = int(getattr(args, "point_head_num_hidden_layers", 3))
-        model = QwenTextGenerationModel(
-            qwen_model=qwen_model,
-            object_embedding_dim=int(object_embedding_dim),
-            point_head_enabled=point_head_enabled,
-            point_head_hidden_dim=point_head_hidden_dim,
-            point_head_num_hidden_layers=point_head_num_hidden_layers,
-        ).to(device)
-        train_label_embedding_bank_device = train_label_embedding_bank.to(device=device)
-        test_label_embedding_bank_device = test_label_embedding_bank.to(device=device)
-        if checkpoint_dir is not None:
-            obj_proj_path = checkpoint_dir / "object_projector.pt"
-            if obj_proj_path.exists():
-                try:
-                    st = torch.load(obj_proj_path, map_location=device)
-                    model.object_projector.load_state_dict(st, strict=False)
-                    print(f"[INFO] loaded object projector from: {obj_proj_path}")
-                except Exception as e:
-                    print(f"[WARN] failed to load object projector from {obj_proj_path}: {e}")
-            pt_head_path = checkpoint_dir / "point_head.pt"
-            if pt_head_path.exists() and model.point_head is not None:
-                try:
-                    st = torch.load(pt_head_path, map_location=device)
-                    model.point_head.load_state_dict(st, strict=False)
-                    print(f"[INFO] loaded point head from: {pt_head_path}")
-                except Exception as e:
-                    print(f"[WARN] failed to load point head from {pt_head_path}: {e}")
+        model = QwenTextGenerationModel(qwen_model=qwen_model).to(device)
         model.eval()
+
+        test_label_embedding_bank_device = test_label_embedding_bank.to(device=device)
+        clip_encoder = CLIPTextEncoder(model_path=clip_model_path, device=device)
 
         test_groups = load_test_groups(
             annotation_file=test_ann,
@@ -519,15 +383,19 @@ def main() -> None:
                 fallback_target_text=args.fallback_target_text,
                 point_decimals=int(args.point_decimals),
                 visual_prompting=bool(args.visual_prompting),
+                image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
             )
             log_target_example("test_only", test_ds)
+            _tnw = int(args.num_workers)
             test_loader = DataLoader(
                 test_ds,
                 batch_size=max(1, int(args.test_batch_size)),
                 shuffle=False,
-                num_workers=args.num_workers,
+                num_workers=_tnw,
                 pin_memory=(device.type == "cuda"),
                 collate_fn=test_collator,
+                persistent_workers=(_tnw > 0),
+                prefetch_factor=(2 if _tnw > 0 else None),
             )
             test_metrics = run_test_metrics(
                 model=model,
@@ -537,15 +405,14 @@ def main() -> None:
                 processor=processor,
                 label_embedding_bank=test_label_embedding_bank_device,
                 retrieval_label_texts=test_retrieval_texts,
-                query_text_to_label_id=retrieval_query_text_to_label_id,
                 query_id_to_label_text=id2label,
                 retrieval_top_k=int(test_retrieval_top_k),
+                clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
-                point_head_enabled=point_head_enabled,
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
@@ -586,12 +453,10 @@ def main() -> None:
     )
 
     train_label_text_map, train_label_text_stats = load_label_text_map(
-        train_labels,
-        text_key="gaze_pseudo_label",
+        train_labels, text_key="gaze_pseudo_label",
     )
     val_label_text_map, val_label_text_stats = load_label_text_map(
-        val_labels,
-        text_key="gaze_pseudo_label",
+        val_labels, text_key="gaze_pseudo_label",
     )
     test_label_map, test_label_text_map, test_label_ids_map, test_label_stats = load_test_label_map(
         test_labels,
@@ -610,20 +475,7 @@ def main() -> None:
     print(
         "[INFO] val label id coverage: "
         f"rows={val_label_stats['rows']} mapped={val_label_stats['mapped']} "
-        f"missing_text={val_label_stats['missing_text']} unknown_text={val_label_stats['unknown_text']} "
-        f"primary_mapped={val_label_stats.get('primary_mapped', 0)} "
-        f"embed_fallback_mapped={val_label_stats.get('embed_fallback_mapped', 0)} "
-        f"csv_fallback_mapped={val_label_stats.get('fallback_mapped', 0)}"
-    )
-    print(
-        "[INFO] train label text coverage: "
-        f"rows={train_label_text_stats['rows']} with_text={train_label_text_stats['with_text']} "
-        f"missing_text={train_label_text_stats['missing_text']}"
-    )
-    print(
-        "[INFO] val label text coverage: "
-        f"rows={val_label_text_stats['rows']} with_text={val_label_text_stats['with_text']} "
-        f"missing_text={val_label_text_stats['missing_text']}"
+        f"missing_text={val_label_stats['missing_text']} unknown_text={val_label_stats['unknown_text']}"
     )
     print(
         "[INFO] test label map: "
@@ -653,13 +505,13 @@ def main() -> None:
     if not train_records:
         raise RuntimeError("No train samples were loaded.")
 
-    train_valid_targets = count_valid_targets(train_records)
-    val_valid_targets = count_valid_targets(val_records)
     print(
         f"[INFO] train_records={len(train_records)} val_records={len(val_records)} "
-        f"train_valid_targets={train_valid_targets} val_valid_targets={val_valid_targets}"
+        f"train_valid_targets={count_valid_targets(train_records)} "
+        f"val_valid_targets={count_valid_targets(val_records)}"
     )
 
+    image_cache_size = max(0, int(getattr(args, "image_cache_size", 0)))
     train_ds = GazeDataset(
         records=train_records,
         prompt_template=args.prompt_template,
@@ -673,6 +525,7 @@ def main() -> None:
         fallback_target_text=args.fallback_target_text,
         point_decimals=int(args.point_decimals),
         visual_prompting=bool(args.visual_prompting),
+        image_cache_size=image_cache_size,
     )
     val_ds = GazeDataset(
         records=val_records,
@@ -687,6 +540,7 @@ def main() -> None:
         fallback_target_text=args.fallback_target_text,
         point_decimals=int(args.point_decimals),
         visual_prompting=bool(args.visual_prompting),
+        image_cache_size=image_cache_size,
     )
     log_target_example("train", train_ds)
     log_target_example("val", val_ds)
@@ -703,49 +557,47 @@ def main() -> None:
     if load_dtype != "auto":
         model_kwargs["dtype"] = load_dtype
 
-    processor = init_processor(
-        model_path=model_path,
-        checkpoint_dir=checkpoint_dir,
-    )
+    processor = init_processor(model_path=model_path, checkpoint_dir=checkpoint_dir)
 
-    # raw inputs (scene_images, text_inputs) are only needed at test time for
-    # pred_embeddings_from_generated()'s second re-encode pass.
-    # Passing them through train/val batches wastes CPU memory for no benefit.
-    print("[INFO] collator raw input passthrough: train/val=disabled, test=enabled.")
     train_collator = QwenTrainCollator(
         processor=processor,
         scene_size=(int(args.scene_h), int(args.scene_w)),
         max_text_length=int(args.max_text_length),
-        include_raw_inputs=False,
     )
     val_collator = QwenTrainCollator(
         processor=processor,
         scene_size=(int(args.scene_h), int(args.scene_w)),
         max_text_length=int(args.max_text_length),
-        include_raw_inputs=False,
     )
     test_collator = QwenTestCollator(
         processor=processor,
         scene_size=(int(args.scene_h), int(args.scene_w)),
         max_text_length=int(args.max_text_length),
-        include_raw_inputs=True,
     )
+
+    _nw = int(args.num_workers)
+    _persistent = _nw > 0
+    _prefetch = 2 if _nw > 0 else None
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=_nw,
         pin_memory=(device.type == "cuda"),
         collate_fn=train_collator,
+        persistent_workers=_persistent,
+        prefetch_factor=_prefetch,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=_nw,
         pin_memory=(device.type == "cuda"),
         collate_fn=val_collator,
+        persistent_workers=_persistent,
+        prefetch_factor=_prefetch,
     )
     val_metric_loader = None
     if bool(getattr(args, "run_val_metrics", True)):
@@ -753,16 +605,14 @@ def main() -> None:
             val_ds,
             batch_size=max(1, int(args.test_batch_size)),
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=_nw,
             pin_memory=(device.type == "cuda"),
             collate_fn=test_collator,
+            persistent_workers=_persistent,
+            prefetch_factor=_prefetch,
         )
 
-    base_qwen = init_base_model(
-        model_path=model_path,
-        model_kwargs=model_kwargs,
-        processor=processor,
-    )
+    base_qwen = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
     if args.gradient_checkpointing and hasattr(base_qwen, "gradient_checkpointing_enable"):
         base_qwen.gradient_checkpointing_enable()
     if args.gradient_checkpointing and hasattr(base_qwen, "enable_input_require_grads"):
@@ -789,18 +639,11 @@ def main() -> None:
         qwen_lora = get_peft_model(base_qwen, lora_cfg)
         qwen_lora.print_trainable_parameters()
 
-    point_head_enabled = bool(getattr(args, "point_head_enabled", True))
-    point_head_hidden_dim = int(getattr(args, "point_head_hidden_dim", 256))
-    point_head_num_hidden_layers = int(getattr(args, "point_head_num_hidden_layers", 3))
-    model = QwenTextGenerationModel(
-        qwen_model=qwen_lora,
-        object_embedding_dim=int(object_embedding_dim),
-        point_head_enabled=point_head_enabled,
-        point_head_hidden_dim=point_head_hidden_dim,
-        point_head_num_hidden_layers=point_head_num_hidden_layers,
-    ).to(device)
-    train_label_embedding_bank_device = train_label_embedding_bank.to(device=device)
+    model = QwenTextGenerationModel(qwen_model=qwen_lora).to(device)
     test_label_embedding_bank_device = test_label_embedding_bank.to(device=device)
+
+    # CLIP text encoder for object retrieval at eval/test time
+    clip_encoder = CLIPTextEncoder(model_path=clip_model_path, device=device)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -821,25 +664,11 @@ def main() -> None:
     )
 
     amp_dtype = to_autocast_dtype(load_dtype)
-    loss_answer_weight = float(getattr(args, "loss_answer_weight", 0.1))
-    loss_point_weight = float(getattr(args, "loss_point_weight", 1.0))
-    loss_object_weight = float(getattr(args, "loss_object_weight", 1.5))
-    loss_slot_weight = float(getattr(args, "loss_slot_weight", 0.0))
-    loss_use_lm_fallback = bool(getattr(args, "loss_use_lm_fallback", False))
-    loss_point_reg_weight = float(getattr(args, "loss_point_reg_weight", 1.0))
-    point_reg_loss_type = str(getattr(args, "point_reg_loss_type", "smooth_l1")).strip().lower()
+    loss_answer_weight = float(getattr(args, "loss_answer_weight", 1.0))
+    run_val_metrics_every_n = max(1, int(getattr(args, "run_val_metrics_every_n_epochs", 5)))
     print(
-        "[INFO] structured loss weights: "
-        f"answer={loss_answer_weight:.4f} "
-        f"point_ce={loss_point_weight:.4f} "
-        f"object={loss_object_weight:.4f} "
-        f"slot={loss_slot_weight:.4f} "
-        f"point_reg={loss_point_reg_weight:.4f} "
-        f"point_reg_type={point_reg_loss_type} "
-        f"object_mode={object_loss_mode} "
-        f"object_temp={object_temperature:.4f} "
-        f"lm_fallback={str(loss_use_lm_fallback).lower()} "
-        f"point_head={str(point_head_enabled).lower()}"
+        "[INFO] loss: answer_weight={loss_answer_weight:.4f} "
+        f"(pure autoregressive NLL; CLIP retrieval for object at eval/test)"
     )
     best_val_loss = float("inf")
     global_step = 0
@@ -880,15 +709,6 @@ def main() -> None:
                 continue
 
             joint_inputs = to_device(batch["joint_inputs"], device=device)
-            object_slot_mask = batch.get("loss_mask_object", None)
-            if torch.is_tensor(object_slot_mask):
-                object_slot_mask = object_slot_mask.to(device=device)
-            # Pass point coordinate token mask to point head when regression is active.
-            point_span_mask = None
-            if bool(point_head_enabled) and float(loss_point_reg_weight) > 0.0:
-                point_span_mask = batch.get("loss_mask_point", None)
-                if torch.is_tensor(point_span_mask):
-                    point_span_mask = point_span_mask.to(device=device)
             bsz = int(labels.shape[0])
             is_last_batch = (step == num_train_batches)
             current_accum_steps = (
@@ -902,51 +722,14 @@ def main() -> None:
                 dtype=amp_dtype,
                 enabled=(device.type == "cuda"),
             ):
-                # Pass labels only when lm_fallback is enabled; otherwise Qwen
-                # computes a full-sequence LM loss that is never used, wasting
-                # memory and compute every step.
-                pass_labels = labels if loss_use_lm_fallback else None
-                out = model(
-                    joint_inputs=joint_inputs,
-                    labels=pass_labels,
-                    object_slot_mask=object_slot_mask,
-                    point_span_mask=point_span_mask,
-                    use_cache=False,
-                )
-                lm_loss = out.get("loss", None)
-                if loss_use_lm_fallback and lm_loss is None:
-                    raise RuntimeError("Model forward must return loss when lm_fallback is enabled.")
-                _target_point = batch.get("target_point", None)
-                _target_point_valid = batch.get("target_point_valid", None)
-                structured = compute_structured_losses(
+                out = model(joint_inputs=joint_inputs, use_cache=False)
+                losses = compute_answer_loss(
                     logits=out.get("logits", None),
                     labels=labels,
                     loss_mask_answer=batch.get("loss_mask_answer", None),
-                    loss_mask_point=batch.get("loss_mask_point", None),
-                    loss_mask_object=batch.get("loss_mask_object", None),
-                    pred_object_emb=out.get("pred_object_emb", None),
-                    target_label=batch.get("target_label", None).to(device) if torch.is_tensor(batch.get("target_label", None)) else None,
-                    target_object_valid=(
-                        batch.get("target_object_valid", None).to(device)
-                        if torch.is_tensor(batch.get("target_object_valid", None))
-                        else None
-                    ),
-                    label_embedding_bank=train_label_embedding_bank_device,
-                    object_loss_mode=object_loss_mode,
-                    object_temperature=object_temperature,
                     weight_answer=loss_answer_weight,
-                    weight_point=loss_point_weight,
-                    weight_object=loss_object_weight,
-                    weight_slot=loss_slot_weight,
-                    pred_point_xy=out.get("pred_point_xy", None),
-                    target_point=_target_point.to(device) if torch.is_tensor(_target_point) else None,
-                    target_point_valid=_target_point_valid.to(device) if torch.is_tensor(_target_point_valid) else None,
-                    point_head_valid=out.get("point_head_valid", None),
-                    weight_point_reg=loss_point_reg_weight,
-                    point_reg_loss_type=point_reg_loss_type,
-                    fallback_loss=(lm_loss if loss_use_lm_fallback else None),
                 )
-                raw_loss = structured["loss"]
+                raw_loss = losses["loss"]
                 loss = raw_loss / float(max(current_accum_steps, 1))
 
             loss.backward()
@@ -965,15 +748,16 @@ def main() -> None:
                     and int(args.wandb_log_every_steps) > 0
                     and (global_step % int(args.wandb_log_every_steps) == 0)
                 ):
-                    grad_norm_value = float(grad_norm.detach().item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+                    grad_norm_value = (
+                        float(grad_norm.detach().item())
+                        if torch.is_tensor(grad_norm)
+                        else float(grad_norm)
+                    )
                     epoch_progress = (float(epoch) - 1.0) + (
                         float(updates_done_in_epoch) / max(float(updates_per_epoch), 1.0)
                     )
                     wandb_run.log(
                         {
-                            "train/loss/answer": float(structured["loss_answer"].detach().item()),
-                            "train/loss/object": float(structured["loss_object"].detach().item()),
-                            "train/loss/point_reg": float(structured["loss_point_reg"].detach().item()),
                             "train/loss": float(raw_loss.detach().item()),
                             "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                             "train/grad_norm": grad_norm_value,
@@ -1005,16 +789,6 @@ def main() -> None:
                 device,
                 amp_dtype,
                 loss_answer_weight=loss_answer_weight,
-                loss_point_weight=loss_point_weight,
-                loss_object_weight=loss_object_weight,
-                loss_slot_weight=loss_slot_weight,
-                loss_use_lm_fallback=loss_use_lm_fallback,
-                label_embedding_bank=train_label_embedding_bank_device,
-                object_loss_mode=object_loss_mode,
-                object_temperature=object_temperature,
-                loss_point_reg_weight=loss_point_reg_weight,
-                point_reg_loss_type=point_reg_loss_type,
-                point_head_enabled=point_head_enabled,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"Eval {epoch}/{args.epochs}",
             )
@@ -1022,8 +796,14 @@ def main() -> None:
             else {"loss": train_loss}
         )
         val_loss = float(val_metrics.get("loss", train_loss))
+
         val_gen_metrics = None
-        if val_metric_loader is not None and len(val_ds) > 0:
+        _run_val_gen = (
+            val_metric_loader is not None
+            and len(val_ds) > 0
+            and (epoch % run_val_metrics_every_n == 0 or epoch == effective_epochs)
+        )
+        if _run_val_gen:
             val_gen_metrics = run_test_metrics(
                 model=model,
                 loader=val_metric_loader,
@@ -1032,42 +812,30 @@ def main() -> None:
                 processor=processor,
                 label_embedding_bank=test_label_embedding_bank_device,
                 retrieval_label_texts=test_retrieval_texts,
-                query_text_to_label_id=retrieval_query_text_to_label_id,
                 query_id_to_label_text=id2label,
                 retrieval_top_k=int(test_retrieval_top_k),
+                clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"ValMetric {epoch}/{args.epochs}",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
-                point_head_enabled=point_head_enabled,
             )
 
         epoch_msg = (
-            f"[EPOCH {epoch}] "
-            f"train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f} "
-            f"val_point={float(val_metrics.get('loss_point', 0.0)):.6f} "
-            f"val_object={float(val_metrics.get('loss_object', 0.0)):.6f}"
+            f"[EPOCH {epoch}] train_loss={train_loss:.6f} val_loss={val_loss:.6f}"
         )
         if isinstance(val_gen_metrics, dict):
             epoch_msg += (
-                f" val_dist={float(val_gen_metrics.get('PointL2', val_gen_metrics.get('Avg L2', 0.0))):.6f} "
-                f"val_acc1={float(val_gen_metrics.get('acc@1', 0.0)):.6f} "
-                f"val_acc3={float(val_gen_metrics.get('acc@3', 0.0)):.6f}"
+                f" val_dist={float(val_gen_metrics.get('PointL2', 0.0)):.6f}"
+                f" val_acc1={float(val_gen_metrics.get('acc@1', 0.0)):.6f}"
+                f" val_acc3={float(val_gen_metrics.get('acc@3', 0.0)):.6f}"
             )
         print(epoch_msg)
 
         if wandb_run is not None:
             payload = {
-                "epoch/index": float(epoch),
-                "epoch/global_step": float(global_step),
-                "epoch/train_loss": float(train_loss),
-                "val/epoch": float(epoch),
                 "val/loss": float(val_loss),
-                "val/loss/answer": float(val_metrics.get("loss_answer", 0.0)),
-                "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
-                "val/loss/point_reg": float(val_metrics.get("loss_point_reg", 0.0)),
             }
             if isinstance(val_gen_metrics, dict):
                 payload.update(val_metric_log_payload(val_gen_metrics, epoch=float(epoch)))
@@ -1093,16 +861,6 @@ def main() -> None:
             device,
             amp_dtype,
             loss_answer_weight=loss_answer_weight,
-            loss_point_weight=loss_point_weight,
-            loss_object_weight=loss_object_weight,
-            loss_slot_weight=loss_slot_weight,
-            loss_use_lm_fallback=loss_use_lm_fallback,
-            label_embedding_bank=train_label_embedding_bank_device,
-            object_loss_mode=object_loss_mode,
-            object_temperature=object_temperature,
-            loss_point_reg_weight=loss_point_reg_weight,
-            point_reg_loss_type=point_reg_loss_type,
-            point_head_enabled=point_head_enabled,
             show_tqdm=bool(args.show_tqdm),
             desc="Eval (checkpoint)",
         )
@@ -1117,27 +875,19 @@ def main() -> None:
                 processor=processor,
                 label_embedding_bank=test_label_embedding_bank_device,
                 retrieval_label_texts=test_retrieval_texts,
-                query_text_to_label_id=retrieval_query_text_to_label_id,
                 query_id_to_label_text=id2label,
                 retrieval_top_k=int(test_retrieval_top_k),
+                clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Eval metrics (checkpoint)",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
-                point_head_enabled=point_head_enabled,
             )
-        print(
-            "[EVAL] "
-            f"val_loss={best_val_loss:.6f}"
-        )
+        print(f"[EVAL] val_loss={best_val_loss:.6f}")
         if wandb_run is not None:
             payload = {
-                "val/epoch": 0.0,
                 "val/loss": float(best_val_loss),
-                "val/loss/answer": float(val_metrics.get("loss_answer", 0.0)),
-                "val/loss/object": float(val_metrics.get("loss_object", 0.0)),
-                "val/loss/point_reg": float(val_metrics.get("loss_point_reg", 0.0)),
             }
             if isinstance(val_gen_metrics, dict):
                 payload.update(val_metric_log_payload(val_gen_metrics, epoch=0.0))
@@ -1196,15 +946,18 @@ def main() -> None:
                 fallback_target_text=args.fallback_target_text,
                 point_decimals=int(args.point_decimals),
                 visual_prompting=bool(args.visual_prompting),
+                image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
             )
             log_target_example("test", test_ds)
             test_loader = DataLoader(
                 test_ds,
                 batch_size=max(1, int(args.test_batch_size)),
                 shuffle=False,
-                num_workers=args.num_workers,
+                num_workers=_nw,
                 pin_memory=(device.type == "cuda"),
                 collate_fn=test_collator,
+                persistent_workers=_persistent,
+                prefetch_factor=_prefetch,
             )
             test_metrics = run_test_metrics(
                 model=model,
@@ -1214,15 +967,14 @@ def main() -> None:
                 processor=processor,
                 label_embedding_bank=test_label_embedding_bank_device,
                 retrieval_label_texts=test_retrieval_texts,
-                query_text_to_label_id=retrieval_query_text_to_label_id,
                 query_id_to_label_text=id2label,
                 retrieval_top_k=int(test_retrieval_top_k),
+                clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
-                point_head_enabled=point_head_enabled,
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:

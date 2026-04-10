@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -13,6 +14,28 @@ from .utils.data_utils import (
     build_prompt,
     sanitize_bbox_pixels,
 )
+
+
+class _ImageLRUCache:
+    """LRU cache for decoded PIL images, keyed by file path string."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._cache: OrderedDict[str, Image.Image] = OrderedDict()
+        self._maxsize = max(1, int(maxsize))
+
+    def get(self, path: str) -> Image.Image | None:
+        if path in self._cache:
+            self._cache.move_to_end(path)
+            return self._cache[path].copy()
+        return None
+
+    def put(self, path: str, img: Image.Image) -> None:
+        if path in self._cache:
+            self._cache.move_to_end(path)
+        else:
+            if len(self._cache) >= self._maxsize:
+                self._cache.popitem(last=False)
+            self._cache[path] = img.copy()
 
 def format_target_text(
     label_text: str,
@@ -101,6 +124,7 @@ class GazeDataset(Dataset):
         fallback_target_text: str = "unknown",
         point_decimals: int = 4,
         visual_prompting: bool = False,
+        image_cache_size: int = 0,
     ) -> None:
         self.records = records
         self.prompt_template = str(prompt_template or "")
@@ -114,14 +138,24 @@ class GazeDataset(Dataset):
         self.fallback_target_text = str(fallback_target_text)
         self.point_decimals = int(point_decimals)
         self.visual_prompting = bool(visual_prompting)
+        self._image_cache: _ImageLRUCache | None = (
+            _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
+        )
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rec = self.records[idx]
-        with Image.open(rec.image_path) as img:
-            scene = img.convert("RGB")
+        path_str = str(rec.image_path)
+        scene: Image.Image | None = None
+        if self._image_cache is not None:
+            scene = self._image_cache.get(path_str)
+        if scene is None:
+            with Image.open(rec.image_path) as img:
+                scene = img.convert("RGB")
+            if self._image_cache is not None:
+                self._image_cache.put(path_str, scene)
 
         gaze_x = float(rec.gaze_x)
         gaze_y = float(rec.gaze_y)
@@ -192,6 +226,7 @@ class GazeTestDataset(Dataset):
         fallback_target_text: str = "unknown",
         point_decimals: int = 4,
         visual_prompting: bool = False,
+        image_cache_size: int = 0,
     ) -> None:
         self.groups = groups
         self.prompt_template = str(prompt_template or "")
@@ -204,14 +239,24 @@ class GazeTestDataset(Dataset):
         self.fallback_target_text = str(fallback_target_text)
         self.point_decimals = int(point_decimals)
         self.visual_prompting = bool(visual_prompting)
+        self._image_cache: _ImageLRUCache | None = (
+            _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
+        )
 
     def __len__(self) -> int:
         return len(self.groups)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         g = self.groups[idx]
-        with Image.open(g.image_path) as img:
-            scene = img.convert("RGB")
+        path_str = str(g.image_path)
+        scene: Image.Image | None = None
+        if self._image_cache is not None:
+            scene = self._image_cache.get(path_str)
+        if scene is None:
+            with Image.open(g.image_path) as img:
+                scene = img.convert("RGB")
+            if self._image_cache is not None:
+                self._image_cache.put(path_str, scene)
         w, h = scene.size
 
         x1, y1, x2, y2 = sanitize_bbox_pixels(g.bbox_px, width=w, height=h)
