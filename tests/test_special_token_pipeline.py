@@ -7,7 +7,6 @@ import torch
 
 from model.utils.eval_utils import topk_similarity
 from model.utils.object_tokens import OBJ_SLOT, add_slot_token
-from model.utils.processor_collate import component_masks
 
 
 class DummyTokenizer:
@@ -92,34 +91,6 @@ class TestSpecialTokenPipeline(unittest.TestCase):
         self.assertIn(OBJ_SLOT, tok.get_vocab())
         added2 = add_slot_token(tok)
         self.assertEqual(added2, 0)
-
-    def test_component_masks_marks_obj_slot(self) -> None:
-        tok = DummyTokenizer()
-        proc = DummyProcessor(tok)
-        target = f"Point: 0.1000 0.2000\nObject: {OBJ_SLOT}"
-        encoded = tok(
-            target,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_offsets_mapping=True,
-        )
-        ids = torch.tensor([encoded["input_ids"]], dtype=torch.long)
-        attn = torch.ones_like(ids, dtype=torch.long)
-        joint = {"input_ids": ids, "attention_mask": attn}
-        valid = torch.tensor([1.0], dtype=torch.float32)
-
-        answer, point, obj = component_masks(
-            processor=proc,
-            joint_inputs=joint,
-            target_texts=[target],
-            target_valid=valid,
-        )
-        self.assertTrue(bool(answer.any().item()))
-        self.assertGreaterEqual(int(point.sum().item()), 2)
-        self.assertEqual(int(obj.sum().item()), 1)
-        obj_id = tok.get_vocab()[OBJ_SLOT]
-        masked_ids = ids[0][obj[0]].tolist()
-        self.assertIn(obj_id, masked_ids)
 
     def test_topk_similarity(self) -> None:
         bank = torch.tensor(

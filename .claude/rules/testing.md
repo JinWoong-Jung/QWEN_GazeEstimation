@@ -18,14 +18,13 @@ globs: ["tests/**/*.py", "tests/*.py"]
 
 순수 텍스트 생성 파이프라인의 핵심 유틸리티를 검증.
 
-| 테스트 | 검증 대상 | 핵심 케이스 |
-|--------|-----------|-------------|
-| `test_object_label_span_pure_text` | `object_label_span()` | `"Object: television"` → char span 반환 |
-| `test_object_label_span_legacy_slot` | `object_label_span()` | `"Object: <obj_emb>"` → span 반환 |
-| `test_parse_target_spans` | `parse_target_spans()` | Point x/y/object 세 span 동시 추출 |
-| `test_parse_object_text` | 생성 텍스트 파싱 | 정규식으로 "Object: <label>" 추출 |
-| `test_label_bank_topk` | `LabelBank.topk()` | cosine similarity 기반 top-k 검색 |
-| `test_format_target_text` | `format_target_text()` | 포맷 문자열 생성 및 valid 플래그 |
+| 테스트 클래스 / 함수 | 검증 대상 | 핵심 케이스 |
+|---------------------|-----------|-------------|
+| `TestObjectLabelSpan` | `object_label_span()` | pure-text / legacy slot / 빈 값 / 대소문자 |
+| `TestParseObjectText` | `parse_object_text()` | 정상 추출 / `<obj_emb>` → None / 노이즈 입력 |
+| `TestLabelBank` | `LabelBank.topk()` | cosine similarity top-k, lookup, canonicalize |
+| `TestFormatTargetText` | `format_target_text()` | 포맷 문자열 생성 및 valid 플래그 |
+| `TestIdSpaceRetrieval` | `topk_similarity()` id-space 비교 | bank 인덱스 == label id, acc@1/acc@3 계산, invalid target 제외 |
 
 ---
 
@@ -48,23 +47,19 @@ globs: ["tests/**/*.py", "tests/*.py"]
 
 | 테스트 | 케이스 |
 |--------|--------|
-| 정상 동작 | `pred_emb [2,4]`, `bank [3,4]`, `labels [0,1]` |
-| 올바른 예측 | 정답 임베딩과 동일한 query → 낮은 loss |
-| `target_object_valid=0` | valid=0 샘플 제외 → `n_valid=0` |
-| None 입력 | 안전하게 `loss=0, n=0` 반환 |
-| 차원 불일치 | 에러 없이 `loss=0` 반환 |
+| 정상 동작 | `pred_emb [2,2]`, `bank [3,2]`, `labels [0,1]` → 낮은 loss |
+| `target_object_valid=0` | valid=0 샘플 제외 → `n_valid=0`, `loss=0` |
 
 ---
 
 ### `tests/test_special_token_pipeline.py`
 
-`<obj_emb>` 특수 토큰 추가 및 tokenizer 통합 테스트.
+`<obj_emb>` 특수 토큰 추가 및 `topk_similarity` 테스트.
 
 | 테스트 | 케이스 |
 |--------|--------|
-| 토큰 추가 후 vocab 크기 확인 | `add_slot_token()` 후 `len(tokenizer)` 증가 |
-| 임베딩 레이어 resize | `model.resize_token_embeddings()` 정상 호출 |
-| 토큰 → ID 매핑 | `tokenizer("<obj_emb>")` 단일 token_id 반환 |
+| 토큰 추가 후 vocab 크기 확인 | `add_slot_token()` 후 vocab에 등록, 중복 추가 시 0 반환 |
+| `topk_similarity` | bank[0] 에 가장 가까운 query → top-1 = 0 |
 
 ---
 
@@ -91,9 +86,9 @@ labels = torch.tensor([0, 1], dtype=torch.long)
 - `None` 입력
 - 빈 텐서 (`torch.zeros(0, 512)`)
 - `valid` 플래그 모두 0인 경우
-- 차원 불일치 입력
+- `target_label = -1` (invalid) 샘플
 
-### 손실 함수 테스트 패턴
+### retrieval_ce_full_bank 테스트 패턴
 ```python
 loss, n = retrieval_ce_full_bank(
     pred_object_emb=pred_emb,
@@ -107,14 +102,14 @@ assert loss.item() >= 0.0
 assert not torch.isnan(loss)
 ```
 
-### 텍스트 파싱 테스트 패턴
+### id-space acc@1 테스트 패턴
 ```python
-text = "Point: 0.4230 0.7112\nObject: television"
-x_span, y_span, o_span = parse_target_spans(text)
-assert x_span is not None
-assert text[x_span[0]:x_span[1]] == "0.4230"
-assert text[y_span[0]:y_span[1]] == "0.7112"
-assert text[o_span[0]:o_span[1]] == "television"
+# bank[i] = label id i의 임베딩
+bank = torch.zeros(num_classes, dim)
+bank[target_id] = ...
+topk_ids = topk_similarity(query, bank, k=3, temperature=0.07)
+assert topk_ids[0] == target_id          # acc@1
+assert target_id in topk_ids[:3]         # acc@3
 ```
 
 ## 테스트하지 않는 것
@@ -127,6 +122,6 @@ assert text[o_span[0]:o_span[1]] == "television"
 ## 주의 사항
 
 - `processor`, `tokenizer` 모킹 시 `return_offsets_mapping` 지원 여부 확인 필요
-- `compute_structured_losses()` 테스트 시 `logits`의 `[B, L, V]` shape 정확히 맞출 것
 - Causal LM shift 때문에 `L >= 2` 이상이어야 의미 있는 CE 계산 가능
 - `find_subseq(from_right=True)` 사용 이유: 동일 토큰 시퀀스가 시스템 프롬프트에도 등장할 수 있어 마지막 위치를 정답으로 사용
+- `retrieval_ce_full_bank`의 분모는 `target_object_valid > 0 AND 0 <= target_label < V` 동시 만족 샘플

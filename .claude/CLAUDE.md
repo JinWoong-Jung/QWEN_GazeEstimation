@@ -18,7 +18,7 @@ QWEN_GazeEstimation/
 │   │   └── preprocess.py          # resize_scene (이미지 전처리)
 │   └── utils/
 │       ├── processor_collate.py   # QwenTrainCollator, QwenTestCollator, build_train_inputs
-│       ├── loss_utils.py          # masked_token_ce, compute_answer_loss
+│       ├── loss_utils.py          # masked_token_ce, retrieval_ce_full_bank, compute_answer_loss
 │       ├── eval_utils.py          # CLIPTextEncoder, run_eval, run_test_metrics
 │       ├── data_utils.py          # load_records, load_vocab2id, build_vocab_embedding_matrix
 │       ├── label_bank.py          # LabelBank (CLIP 임베딩 기반 객체 검색)
@@ -47,16 +47,20 @@ python main.py --config config.yaml train.lr=5e-5 train.epochs=5
 
 ## Key Configuration (`config.yaml`)
 
+config.yaml은 8개 섹션으로 구성된다. `flatten_config()`로 평탄화하여 argparse에 주입.
+
 | 섹션 | 주요 키 | 설명 |
 |------|---------|------|
-| `paths` | `model_path` | Qwen3-VL-4B-Instruct 로컬 경로 |
-| `train` | `batch_size`, `grad_accum_steps` | 실효 배치 = batch_size × grad_accum_steps |
-| `loss` | `loss_answer_weight` | 전체 답변 NLL 가중치 (유일한 학습 손실) |
-| `loss` | `object_temperature` | CLIP retrieval cosine similarity 온도 (test용) |
-| `lora` | `lora_r`, `lora_alpha` | LoRA rank/scale (attention proj만 적용) |
-| `prompt` | `visual_prompting` | 머리 바운딩박스를 이미지에 빨간 박스로 그림 |
-| `text` | `clip_model_path` | test-time CLIP 텍스트 인코더 경로 |
-| `text` | `generation_num_beams` | 추론 시 빔 서치 폭 |
+| `paths` | `model_path`, `output_dir` | 모델/출력 경로 |
+| `data` | `scene_h`, `scene_w`, `image_cache_size`, `split_prefix` | 데이터 로딩 설정 |
+| `train` | `batch_size`, `grad_accum_steps`, `epochs`, `lr` | 학습 하이퍼파라미터 |
+| `eval` | `test_batch_size`, `generation_num_beams`, `retrieval_top_k`, `clip_model_path` | 평가/추론 설정 |
+| `prompt` | `visual_prompting`, `point_decimals`, `answer_template` | 프롬프트 포맷 |
+| `model` | `attn_implementation`, `lora_r`, `lora_alpha`, `lora_target_modules` | 모델 구조 |
+| `loss` | `loss_answer_weight` | 손실 가중치 |
+| `wandb` | `enabled`, `project`, `entity` | 실험 로깅 |
+
+**샘플 개수 제한 없음**: 모든 실행은 전체 데이터셋 기준. `max_train_samples` 등 제거됨.
 
 ## Data Flow
 
@@ -76,14 +80,17 @@ Scene Image + Head BBox
   compute_answer_loss()
       └── loss_answer : 전체 답변 NLL (weight=1.0, 유일한 학습 목표)
 
-[Test time only]
+[Test/Eval time only]
   model.generate() → generated_text
       ↓
-  parse_object_text() → "television"
+  parse_object_text() → "television"   (None if "<obj_emb>" slot)
       ↓
   CLIPTextEncoder.encode(["television"]) → [512] embedding
       ↓
-  cosine similarity vs label-embeds bank → top-k retrieval
+  cosine similarity vs retrieval_label_embedding_bank  → top-k label ids
+      │  (bank[i] = embedding of vocab label id i; topk index == label id)
+      ↓
+  acc@1 / acc@3 / multiacc@1 compared against target_label (int id)
 ```
 
 ## Output Format
@@ -102,17 +109,27 @@ Object: television
 
 - **Base**: Qwen3-VL-4B-Instruct (frozen, LoRA로 일부 학습)
 - **LoRA 대상**: `q_proj`, `k_proj`, `v_proj`, `o_proj`
-- **Auxiliary heads 없음**: object projector, point head 모두 제거됨
+- **Auxiliary heads 없음**: object projector, point head 모두 없음
 
 ## Evaluation Metrics
 
 | 메트릭 | 설명 |
 |--------|------|
 | `PointL2` | 예측 좌표 ↔ GT 좌표 L2 거리 (텍스트 파싱) |
-| `ExactMatch` | 전체 생성 텍스트 정확 일치 |
-| `acc@1 / acc@3` | CLIP retrieval top-k 정확도 (primary GT) |
-| `multiacc@1` | CLIP retrieval top-1 vs 다중 GT 레이블 |
-| `ObjectParseFail` | "Object: <label>" 파싱 실패율 |
+| `ExactMatch` | 전체 생성 텍스트 정확 일치 (`target_text_valid > 0` 기준) |
+| `acc@1 / acc@3` | CLIP retrieval top-k vs `target_label` (int id) 비교. 분모: `target_label >= 0` 샘플 |
+| `multiacc@1` | CLIP retrieval top-1 vs `target_label_ids` (int set) 비교 |
+| `ObjectParseFail` | "Object: <label>" 파싱 실패율 (`target_text_valid > 0` 기준) |
+
+**id-space 평가**: acc@1/acc@3/multiacc@1은 텍스트 비교가 아닌 정수 label id 직접 비교. retrieval bank가 `vocab2id` 순서로 정렬되어 있으므로 `topk_similarity()`가 반환하는 인덱스 == label id.
+
+## Checkpoint 구조
+
+매 에폭마다 두 위치에 저장:
+- `best/` — checkpoint_monitor 기준 최고 성능 모델 (개선 시에만 덮어씀)
+- `last/` — 직전 에폭 모델 (매 에폭 덮어씀)
+
+최종 테스트(`run_test=true`)는 항상 `best/`를 로드한 뒤 실행. `best/`가 없으면 in-memory 모델로 fallback.
 
 ## Dependencies
 
@@ -126,7 +143,8 @@ Object: television
 ## Important Design Decisions
 
 1. **순수 텍스트 생성**: 분류 헤드 없이 좌표와 레이블을 자연어로 출력
-2. **단일 손실(loss_answer)**: 전체 답변 토큰에 대한 teacher-forced NLL만 사용. Point/Object에 대한 별도 auxiliary loss 없음
-3. **Test-time CLIP retrieval**: 생성된 "Object: <label>" 텍스트를 CLIP text encoder로 인코딩 → label-embeds bank와 cosine similarity → top-k 선택
-4. **VLM truncation 비활성화**: 이미지 토큰 정렬 파괴 방지를 위해 `truncation=False` 고정
-5. **label-embeds와 CLIP 모델 일치 필수**: `clip_model_path`가 label-embeds 생성에 사용된 CLIP 모델과 동일해야 retrieval이 의미 있음
+2. **단일 손실(loss_answer)**: 전체 답변 토큰에 대한 teacher-forced NLL만 사용
+3. **Test-time CLIP retrieval**: 생성된 "Object: <label>" 텍스트를 CLIP text encoder로 인코딩 → `retrieval_label_embedding_bank`와 cosine similarity → top-k label id 선택
+4. **Retrieval bank = vocab2id 순서**: `bank[i]`는 label id `i`의 임베딩. `topk_similarity()` 반환값이 곧 label id이므로 `target_label` tensor와 직접 비교 가능
+5. **VLM truncation 비활성화**: 이미지 토큰 정렬 파괴 방지를 위해 `truncation=False` 고정
+6. **label-embeds와 CLIP 모델 일치 필수**: `clip_model_path`가 label-embeds 생성에 사용된 CLIP 모델과 동일해야 retrieval이 의미 있음

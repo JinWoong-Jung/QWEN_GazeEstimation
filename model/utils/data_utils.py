@@ -558,6 +558,105 @@ def build_vocab_embedding_matrix(
     return out
 
 
+def build_split_bank(
+    label_texts: list[str],
+    canonical_ids: list[int],
+    label_embed_dir: Path | None,
+    embedding_dim: int = 512,
+    normalize: bool = True,
+) -> tuple[list[str], list[int], torch.Tensor]:
+    """Build a split-specific retrieval bank from a flat list of label texts.
+
+    Unlike :func:`build_vocab_embedding_matrix`, this function does **not** use
+    the vocab2id ordering.  Bank row ``i`` corresponds to ``label_texts[i]`` and
+    ``canonical_ids[i]`` — the bank index is **not** equal to the vocab label id.
+    Callers must keep ``bank_canonical_ids`` alongside the bank tensor and use it
+    to map a retrieved bank row back to the metric id space.
+
+    Labels whose embedding file cannot be found are silently skipped; they do
+    not appear in the returned lists or tensor.
+
+    Parameters
+    ----------
+    label_texts:
+        Ordered unique label strings for this split (e.g. val or test).
+    canonical_ids:
+        Vocab id for each entry in *label_texts* (parallel list).
+        Pass ``-1`` for labels that have no valid vocab mapping; they will be
+        included in the bank but excluded from metric evaluation by the caller.
+    label_embed_dir:
+        Directory containing ``{text}-emb.pt`` files.
+    embedding_dim:
+        Expected embedding dimensionality (default 512 for CLIP-B/32).
+    normalize:
+        L2-normalize embeddings before returning (default True).
+
+    Returns
+    -------
+    bank_texts : list[str]
+        Labels for which embeddings were found (subset of *label_texts*).
+    bank_canonical_ids : list[int]
+        Vocab ids parallel to *bank_texts*.
+    bank_embs : torch.Tensor
+        Float32 tensor of shape ``[len(bank_texts), embedding_dim]``.
+        If no embeddings are found, shape is ``[0, embedding_dim]``.
+    """
+    dim = max(1, int(embedding_dim))
+    empty = ([], [], torch.zeros((0, dim), dtype=torch.float32))
+
+    if not label_texts:
+        return empty
+    if label_embed_dir is None or not Path(label_embed_dir).exists():
+        return empty
+
+    embed_dir = Path(label_embed_dir)
+    bank_texts: list[str] = []
+    bank_ids: list[int] = []
+    vecs: list[torch.Tensor] = []
+
+    for txt, cid in zip(label_texts, canonical_ids):
+        txt = str(txt).strip()
+        if not txt:
+            continue
+
+        # Try exact name first, then lowercased variant
+        candidates_paths = [
+            embed_dir / f"{txt}-emb.pt",
+            embed_dir / f"{txt.lower()}-emb.pt",
+        ]
+        vec: torch.Tensor | None = None
+        for p in candidates_paths:
+            if not p.exists():
+                continue
+            try:
+                loaded = torch.load(p, map_location="cpu")
+                if not torch.is_tensor(loaded):
+                    continue
+                t = loaded.to(dtype=torch.float32).flatten()
+                if int(t.numel()) != dim:
+                    continue
+                vec = t
+                break
+            except Exception:
+                continue
+
+        if vec is None:
+            continue
+
+        if normalize:
+            vec = F.normalize(vec.unsqueeze(0), p=2, dim=-1).squeeze(0)
+
+        bank_texts.append(txt)
+        bank_ids.append(int(cid))
+        vecs.append(vec)
+
+    if not vecs:
+        return empty
+
+    bank_embs = torch.stack(vecs, dim=0)  # [N, dim]
+    return bank_texts, bank_ids, bank_embs
+
+
 def load_test_label_map(
     labels_csv: Path | None,
     vocab2id: dict[str, int] | None = None,
@@ -643,37 +742,6 @@ def load_test_label_map(
                 multi_id_map[path] = [int(x) for x in merged if int(x) >= 0]
 
     return id_map, text_map, multi_id_map, stats
-
-
-def load_test_vocab_texts(
-    labels_csv: Path | None,
-) -> list[str]:
-    if labels_csv is None or (not labels_csv.exists()):
-        return []
-
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def _push(raw: str) -> None:
-        txt = clean_label(raw)
-        if not txt:
-            return
-        key = txt.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(txt)
-
-    with labels_csv.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            primary = str(row.get("gaze_gt_label", "")).strip()
-            _push(primary)
-            multi = str(row.get("gaze_gt_labels", "")).strip()
-            if multi:
-                for cand in multi.split("-"):
-                    _push(cand)
-    return out
 
 
 @dataclass

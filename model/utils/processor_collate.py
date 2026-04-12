@@ -244,6 +244,7 @@ class QwenTestCollator:
         )
         return {
             "joint_inputs": joint_inputs,
+            "text_input": text_inputs,
             "target_text": [str(x["target_text"]) for x in batch],
             "target_text_valid": torch.stack(
                 [x["target_text_valid"] for x in batch], dim=0
@@ -260,5 +261,8 @@ class QwenTestCollator:
             ).to(dtype=torch.float32),
             "gt_points": [x["gt_points"] for x in batch],
             "target_label_text": [str(x.get("target_label_text", "")) for x in batch],
+            "target_object_valid": torch.stack(
+                [x.get("target_object_valid", x["target_text_valid"]) for x in batch], dim=0
+            ).to(dtype=torch.float32).flatten(),
             "image_rel": [str(x.get("image_rel", "")) for x in batch],
         }

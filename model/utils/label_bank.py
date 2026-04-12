@@ -20,8 +20,6 @@ label   = bank.id_to_label[top_ids[0]]
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
-
 import torch
 import torch.nn.functional as F
 

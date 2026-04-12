@@ -5,6 +5,14 @@ from pathlib import Path
 from typing import Any
 
 
+def train_progress_bucket(completed_updates: int, total_updates: int) -> int:
+    total = max(1, int(total_updates))
+    completed = max(0, int(completed_updates))
+    if completed <= 0:
+        return 0
+    return min(100, (completed * 100) // total)
+
+
 def parse_tags(raw: Any) -> list[str]:
     if isinstance(raw, (list, tuple)):
         return [str(x).strip() for x in raw if str(x).strip()]

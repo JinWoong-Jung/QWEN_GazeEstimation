@@ -34,26 +34,34 @@ from .datasets import GazeDataset, GazeTestDataset
 from .model import QwenTextGenerationModel
 from .utils.checkpoint import load_checkpoint_for_eval, save_checkpoint
 from .utils.common import to_device
-from .utils.config_parser import build_parser, load_yaml_config
+from .utils.config_parser import (
+    build_parser,
+    load_yaml_config,
+    normalize_run_name,
+    output_dir_from_run_name,
+)
 from .utils.data_utils import (
+    build_split_bank,
     build_vocab_embedding_matrix,
     load_label_map,
     load_label_text_map,
     load_records,
-    load_test_vocab_texts,
     load_test_groups,
     load_test_label_map,
     load_vocab2id,
 )
 from .utils.eval_utils import (
     CLIPTextEncoder,
+    collect_generation_samples,
+    print_generation_samples,
     print_test_metrics_table,
     run_eval,
     run_test_metrics,
 )
 from .utils.loss_utils import compute_answer_loss
+from .utils.point_tokens import POINT_MODE_BIN, add_point_bin_tokens, normalize_point_mode
 from .utils.processor_collate import QwenTestCollator, QwenTrainCollator
-from .utils.wandb_utils import finish_wandb, init_wandb
+from .utils.wandb_utils import finish_wandb, init_wandb, train_progress_bucket
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +71,27 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 def resolve_path(path: str) -> Path:
     p = Path(path)
     return p if p.is_absolute() else ROOT / p
+
+
+def _unique_split_bank_inputs(
+    text_map: dict[Any, str],
+    vocab2id: dict[str, int],
+    vocab2id_lower: dict[str, int],
+) -> tuple[list[str], list[int]]:
+    """Extract unique (label_text, canonical_vocab_id) pairs from a label_text_map.
+
+    Vocabulary lookup uses vocab2id first, then vocab2id_lower as fallback.
+    Labels not found in either map get canonical_id = -1; they will be included
+    in the bank embeddings but excluded from metric evaluation by the caller.
+    """
+    seen: dict[str, int] = {}
+    for txt in text_map.values():
+        txt = str(txt or "").strip()
+        if not txt or txt in seen:
+            continue
+        cid = int(vocab2id.get(txt, vocab2id_lower.get(txt.lower(), -1)))
+        seen[txt] = cid
+    return list(seen.keys()), list(seen.values())
 
 
 def set_seed(seed: int) -> None:
@@ -181,6 +210,23 @@ def init_processor(
     return AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
 
 
+def maybe_register_point_tokens(
+    *,
+    processor: Any,
+    point_mode: str,
+    point_bin_count: int,
+) -> int:
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return 0
+    if normalize_point_mode(point_mode) != POINT_MODE_BIN:
+        return 0
+    added = add_point_bin_tokens(tokenizer, point_bin_count)
+    if added > 0:
+        print(f"[INFO] registered point-bin special tokens: added={added} bins={int(point_bin_count)}")
+    return int(added)
+
+
 def init_base_model(
     *,
     model_path: Path,
@@ -189,7 +235,24 @@ def init_base_model(
     return AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
 
 
-def test_log_payload(test_metrics: dict[str, float], epoch: float) -> dict[str, float]:
+def maybe_resize_token_embeddings(model: Any, processor: Any) -> None:
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return
+    if not hasattr(model, "get_input_embeddings") or not hasattr(model, "resize_token_embeddings"):
+        return
+    try:
+        current = int(model.get_input_embeddings().weight.shape[0])
+        target = int(len(tokenizer))
+    except Exception:
+        return
+    if current == target:
+        return
+    model.resize_token_embeddings(target)
+    print(f"[INFO] resized token embeddings: {current} -> {target}")
+
+
+def test_log_payload(test_metrics: dict[str, float]) -> dict[str, float]:
     return {
         "test/Avg_L2": float(test_metrics.get("Avg L2", test_metrics.get("PointL2", 0.0))),
         "test/Min_L2": float(test_metrics.get("Min L2", 0.0)),
@@ -201,14 +264,99 @@ def test_log_payload(test_metrics: dict[str, float], epoch: float) -> dict[str, 
     }
 
 
-def val_metric_log_payload(val_metrics: dict[str, float], epoch: float) -> dict[str, float]:
+def val_metric_log_payload(val_metrics: dict[str, float]) -> dict[str, float]:
     return {
-        "val/Avg_L2": float(val_metrics.get("Avg L2", val_metrics.get("PointL2", 0.0))),
-        "val/Min_L2": float(val_metrics.get("Min L2", 0.0)),
+        "val/dist": float(val_metrics.get("Avg L2", val_metrics.get("PointL2", 0.0))),
         "val/acc@1": float(val_metrics.get("acc@1", 0.0)),
         "val/acc@3": float(val_metrics.get("acc@3", 0.0)),
         "val/multiacc@1": float(val_metrics.get("multiacc@1", 0.0)),
     }
+
+
+def maybe_save_generation_preview(
+    *,
+    args: argparse.Namespace,
+    out_dir: Path,
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    processor: Any,
+    label_embedding_bank: torch.Tensor,
+    retrieval_label_texts: list[str],
+    retrieval_top_k: int,
+    clip_encoder: CLIPTextEncoder | None,
+    object_temperature: float,
+    bank_canonical_ids: list[int] | None = None,
+) -> None:
+    preview_n = max(0, int(getattr(args, "preview_test_samples", 0)))
+    if preview_n <= 0:
+        return
+
+    preview_samples = collect_generation_samples(
+        model=model,
+        loader=loader,
+        device=device,
+        amp_dtype=amp_dtype,
+        processor=processor,
+        label_embedding_bank=label_embedding_bank,
+        retrieval_label_texts=retrieval_label_texts,
+        retrieval_top_k=int(retrieval_top_k),
+        clip_encoder=clip_encoder,
+        object_temperature=float(object_temperature),
+        show_tqdm=bool(args.show_tqdm),
+        desc="Test preview",
+        max_new_tokens=int(args.generation_max_new_tokens),
+        num_beams=int(getattr(args, "generation_num_beams", 3)),
+        repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
+        no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
+        max_samples=preview_n,
+        bank_canonical_ids=bank_canonical_ids,
+        point_decimals=int(getattr(args, "point_decimals", 4)),
+    )
+    preview_path = out_dir / "test_generation_preview.json"
+    preview_path.write_text(
+        json.dumps(preview_samples, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[TEST] saved generation preview: {preview_path} (samples={len(preview_samples)})")
+    print_generation_samples(preview_samples)
+
+
+def infer_checkpoint_monitor_mode(monitor: str, mode: str) -> str:
+    mode_norm = str(mode or "auto").strip().lower()
+    if mode_norm in {"min", "max"}:
+        return mode_norm
+    if mode_norm != "auto":
+        raise ValueError(f"checkpoint_monitor_mode must be one of auto|min|max, got: {mode}")
+    monitor_norm = str(monitor or "").strip().lower()
+    return "min" if ("loss" in monitor_norm or "dist" in monitor_norm or "l2" in monitor_norm) else "max"
+
+
+def checkpoint_monitor_value(
+    monitor: str,
+    *,
+    val_loss: float,
+    val_gen_metrics: dict[str, float] | None,
+) -> float | None:
+    monitor_norm = str(monitor or "val_loss").strip().lower().replace("/", "_")
+    monitor_norm = monitor_norm.replace("-", "_")
+    if monitor_norm in {"val_loss", "loss"}:
+        return float(val_loss)
+    if val_gen_metrics is None:
+        return None
+    if monitor_norm in {"val_dist", "dist", "pointl2", "point_l2", "avg_l2", "avg l2"}:
+        return float(val_gen_metrics.get("Avg L2", val_gen_metrics.get("PointL2", 0.0)))
+    if monitor_norm in {"val_acc@1", "acc@1"}:
+        return float(val_gen_metrics.get("acc@1", 0.0))
+    if monitor_norm in {"val_acc@3", "acc@3"}:
+        return float(val_gen_metrics.get("acc@3", 0.0))
+    if monitor_norm in {"val_multiacc@1", "multiacc@1", "multi_acc@1"}:
+        return float(val_gen_metrics.get("multiacc@1", 0.0))
+    raise ValueError(
+        "Unsupported checkpoint_monitor. Use one of: "
+        "val_loss, val_dist, val_acc@1, val_acc@3, val_multiacc@1."
+    )
 
 
 def main() -> None:
@@ -222,6 +370,14 @@ def main() -> None:
     args = build_parser(defaults=config_defaults).parse_args()
     print(f"[INFO] loaded config: {resolve_path(args.config)}")
     set_seed(args.seed)
+    args.point_mode = normalize_point_mode(getattr(args, "point_mode", "continuous"))
+    args.point_bin_count = max(2, int(getattr(args, "point_bin_count", 1000)))
+
+    run_name = normalize_run_name(getattr(args, "run_name", ""))
+    if run_name:
+        args.output_dir = output_dir_from_run_name(args.output_dir, run_name)
+        args.wandb_run_name = run_name
+        print(f"[INFO] run_name={run_name}")
 
     out_dir = resolve_path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -263,34 +419,30 @@ def main() -> None:
     )
     object_embedding_dim = int(getattr(args, "object_embedding_dim", 512))
     object_temperature = float(getattr(args, "object_temperature", 0.07))
-    test_retrieval_top_k = max(1, int(getattr(args, "test_retrieval_top_k", 3)))
+    retrieval_top_k = max(1, int(getattr(args, "test_retrieval_top_k", 3)))
     clip_model_path = str(getattr(args, "clip_model_path", "openai/clip-vit-base-patch32")).strip()
 
-    # Test label embedding bank (used only at eval/test time for CLIP retrieval)
-    test_vocab_texts = load_test_vocab_texts(test_labels)
-    test_vocab2id = {str(txt): int(i) for i, txt in enumerate(test_vocab_texts)}
-    test_label_embedding_bank_raw = build_vocab_embedding_matrix(
-        vocab2id=test_vocab2id,
+    # Retrieval label embedding bank: row i = embedding for vocab label id i (vocab2id order).
+    # topk_similarity indices on this bank are directly comparable to target_label ids.
+    retrieval_label_texts: list[str] = [id2label.get(i, "") for i in range(num_classes)]
+    retrieval_label_embedding_bank = build_vocab_embedding_matrix(
+        vocab2id=vocab2id,
         label_embed_dir=label_embed_dir,
         label_emb_dim=int(object_embedding_dim),
         normalize=True,
     )
-    if test_label_embedding_bank_raw is None:
+    if retrieval_label_embedding_bank is None:
         raise RuntimeError(
-            "Failed to build test label embedding bank for retrieval inference. "
+            "Failed to build retrieval label embedding bank. "
             f"label_embed_dir={label_embed_dir} object_embedding_dim={object_embedding_dim}"
         )
-    test_bank_norm = test_label_embedding_bank_raw.norm(dim=1)
-    keep_rows = test_bank_norm.gt(0)
-    if int(keep_rows.sum().item()) <= 0:
-        raise RuntimeError("Test label embedding bank has no valid rows after filtering zero vectors.")
-    keep_idx = [int(i) for i in torch.nonzero(keep_rows, as_tuple=False).flatten().tolist()]
-    test_retrieval_texts = [str(test_vocab_texts[i]) for i in keep_idx]
-    test_label_embedding_bank = test_label_embedding_bank_raw[keep_rows].contiguous()
+    _valid_rows = int(retrieval_label_embedding_bank.norm(dim=1).gt(0).sum().item())
+    if _valid_rows <= 0:
+        raise RuntimeError("Retrieval label embedding bank has no valid rows (all zero vectors).")
     print(
-        "[INFO] test label embedding bank: "
-        f"raw_vocab={len(test_vocab_texts)} valid_rows={len(test_retrieval_texts)} "
-        f"shape={tuple(test_label_embedding_bank.shape)} topk={test_retrieval_top_k}"
+        "[INFO] retrieval label embedding bank: "
+        f"vocab_size={num_classes} valid_rows={_valid_rows} "
+        f"shape={tuple(retrieval_label_embedding_bank.shape)} topk={retrieval_top_k}"
     )
 
     if bool(getattr(args, "test_only", False)):
@@ -323,6 +475,11 @@ def main() -> None:
             model_kwargs["dtype"] = load_dtype
 
         processor = init_processor(model_path=model_path, checkpoint_dir=checkpoint_dir)
+        maybe_register_point_tokens(
+            processor=processor,
+            point_mode=args.point_mode,
+            point_bin_count=int(args.point_bin_count),
+        )
         test_collator = QwenTestCollator(
             processor=processor,
             scene_size=(int(args.scene_h), int(args.scene_w)),
@@ -330,6 +487,7 @@ def main() -> None:
         )
 
         base_qwen = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
+        maybe_resize_token_embeddings(base_qwen, processor)
         adapter_dir = (checkpoint_dir / "lora_adapter") if checkpoint_dir is not None else None
         if adapter_dir is not None and adapter_dir.exists():
             qwen_model = PeftModel.from_pretrained(
@@ -343,8 +501,24 @@ def main() -> None:
         model = QwenTextGenerationModel(qwen_model=qwen_model).to(device)
         model.eval()
 
-        test_label_embedding_bank_device = test_label_embedding_bank.to(device=device)
         clip_encoder = CLIPTextEncoder(model_path=clip_model_path, device=device)
+
+        # Build test split-specific bank (bank row index != label id; use bank_canonical_ids to map back)
+        _test_bank_texts_raw, _test_bank_ids_raw = _unique_split_bank_inputs(
+            test_label_text_map, vocab2id, vocab2id_lower,
+        )
+        test_split_bank_texts, test_split_bank_ids, test_split_bank_embs = build_split_bank(
+            label_texts=_test_bank_texts_raw,
+            canonical_ids=_test_bank_ids_raw,
+            label_embed_dir=label_embed_dir,
+            embedding_dim=int(object_embedding_dim),
+            normalize=True,
+        )
+        print(
+            f"[INFO] test split bank: unique_labels={len(_test_bank_texts_raw)} "
+            f"with_embeddings={len(test_split_bank_texts)} "
+            f"shape={tuple(test_split_bank_embs.shape)}"
+        )
 
         test_groups = load_test_groups(
             annotation_file=test_ann,
@@ -355,22 +529,11 @@ def main() -> None:
             split_prefix=args.test_split_prefix,
             strip_split_prefix=bool(args.test_strip_split_prefix),
             bbox_round_decimals=int(args.test_bbox_round_decimals),
-            max_groups=int(args.max_test_samples),
-        )
-        start_index = max(0, int(getattr(args, "test_start_index", 0)))
-        if start_index > 0:
-            test_groups = test_groups[start_index:]
-        test_num_samples = int(getattr(args, "test_num_samples", 0))
-        if test_num_samples > 0:
-            test_groups = test_groups[: max(1, test_num_samples)]
-
+            )
         if not test_groups:
             print("[TEST] no valid test groups found.")
         else:
-            print(
-                f"[TEST] groups={len(test_groups)} "
-                f"(start={start_index}, limit={(test_num_samples if test_num_samples > 0 else 'all')})"
-            )
+            print(f"[TEST] groups={len(test_groups)}")
             test_ds = GazeTestDataset(
                 groups=test_groups,
                 prompt_template=args.prompt_template,
@@ -382,6 +545,8 @@ def main() -> None:
                 answer_template=args.answer_template,
                 fallback_target_text=args.fallback_target_text,
                 point_decimals=int(args.point_decimals),
+                point_mode=args.point_mode,
+                point_bin_count=int(args.point_bin_count),
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
             )
@@ -403,23 +568,40 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=test_label_embedding_bank_device,
-                retrieval_label_texts=test_retrieval_texts,
-                query_id_to_label_text=id2label,
-                retrieval_top_k=int(test_retrieval_top_k),
+                label_embedding_bank=test_split_bank_embs.to(device=device),
+                retrieval_label_texts=test_split_bank_texts,
+                retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
+                repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
+                no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
+                bank_canonical_ids=test_split_bank_ids,
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
-                wandb_run.log(test_log_payload(test_metrics, epoch=0.0), step=0)
+                wandb_run.log(test_log_payload(test_metrics), step=0)
             (out_dir / "test_metrics.json").write_text(
                 json.dumps(test_metrics, ensure_ascii=False, indent=2),
                 encoding="utf-8",
+            )
+            maybe_save_generation_preview(
+                args=args,
+                out_dir=out_dir,
+                model=model,
+                loader=test_loader,
+                device=device,
+                amp_dtype=amp_dtype,
+                processor=processor,
+                label_embedding_bank=test_split_bank_embs.to(device=device),
+                retrieval_label_texts=test_split_bank_texts,
+                retrieval_top_k=int(retrieval_top_k),
+                clip_encoder=clip_encoder,
+                object_temperature=object_temperature,
+                bank_canonical_ids=test_split_bank_ids,
             )
 
         elapsed = time.time() - start_time
@@ -484,6 +666,40 @@ def main() -> None:
         f"conflicts={test_label_stats['conflicts']}"
     )
 
+    # Build split-specific retrieval banks for val and test.
+    # bank row index != label id; bank_canonical_ids carries the vocab id mapping.
+    _val_bank_texts_raw, _val_bank_ids_raw = _unique_split_bank_inputs(
+        val_label_text_map, vocab2id, vocab2id_lower,
+    )
+    val_split_bank_texts, val_split_bank_ids, val_split_bank_embs = build_split_bank(
+        label_texts=_val_bank_texts_raw,
+        canonical_ids=_val_bank_ids_raw,
+        label_embed_dir=label_embed_dir,
+        embedding_dim=int(object_embedding_dim),
+        normalize=True,
+    )
+    print(
+        f"[INFO] val split bank: unique_labels={len(_val_bank_texts_raw)} "
+        f"with_embeddings={len(val_split_bank_texts)} "
+        f"shape={tuple(val_split_bank_embs.shape)}"
+    )
+
+    _test_bank_texts_raw, _test_bank_ids_raw = _unique_split_bank_inputs(
+        test_label_text_map, vocab2id, vocab2id_lower,
+    )
+    test_split_bank_texts, test_split_bank_ids, test_split_bank_embs = build_split_bank(
+        label_texts=_test_bank_texts_raw,
+        canonical_ids=_test_bank_ids_raw,
+        label_embed_dir=label_embed_dir,
+        embedding_dim=int(object_embedding_dim),
+        normalize=True,
+    )
+    print(
+        f"[INFO] test split bank: unique_labels={len(_test_bank_texts_raw)} "
+        f"with_embeddings={len(test_split_bank_texts)} "
+        f"shape={tuple(test_split_bank_embs.shape)}"
+    )
+
     train_records = load_records(
         annotation_file=train_ann,
         image_root=image_root,
@@ -491,7 +707,6 @@ def main() -> None:
         label_text_map=train_label_text_map,
         split_prefix=args.split_prefix,
         strip_split_prefix=bool(args.strip_split_prefix),
-        max_samples=int(args.max_train_samples),
     )
     val_records = load_records(
         annotation_file=val_ann,
@@ -500,7 +715,6 @@ def main() -> None:
         label_text_map=val_label_text_map,
         split_prefix=args.split_prefix,
         strip_split_prefix=bool(args.strip_split_prefix),
-        max_samples=int(args.max_val_samples),
     )
     if not train_records:
         raise RuntimeError("No train samples were loaded.")
@@ -524,6 +738,8 @@ def main() -> None:
         answer_template=args.answer_template,
         fallback_target_text=args.fallback_target_text,
         point_decimals=int(args.point_decimals),
+        point_mode=args.point_mode,
+        point_bin_count=int(args.point_bin_count),
         visual_prompting=bool(args.visual_prompting),
         image_cache_size=image_cache_size,
     )
@@ -539,6 +755,8 @@ def main() -> None:
         answer_template=args.answer_template,
         fallback_target_text=args.fallback_target_text,
         point_decimals=int(args.point_decimals),
+        point_mode=args.point_mode,
+        point_bin_count=int(args.point_bin_count),
         visual_prompting=bool(args.visual_prompting),
         image_cache_size=image_cache_size,
     )
@@ -558,6 +776,11 @@ def main() -> None:
         model_kwargs["dtype"] = load_dtype
 
     processor = init_processor(model_path=model_path, checkpoint_dir=checkpoint_dir)
+    maybe_register_point_tokens(
+        processor=processor,
+        point_mode=args.point_mode,
+        point_bin_count=int(args.point_bin_count),
+    )
 
     train_collator = QwenTrainCollator(
         processor=processor,
@@ -613,6 +836,7 @@ def main() -> None:
         )
 
     base_qwen = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
+    maybe_resize_token_embeddings(base_qwen, processor)
     if args.gradient_checkpointing and hasattr(base_qwen, "gradient_checkpointing_enable"):
         base_qwen.gradient_checkpointing_enable()
     if args.gradient_checkpointing and hasattr(base_qwen, "enable_input_require_grads"):
@@ -640,7 +864,6 @@ def main() -> None:
         qwen_lora.print_trainable_parameters()
 
     model = QwenTextGenerationModel(qwen_model=qwen_lora).to(device)
-    test_label_embedding_bank_device = test_label_embedding_bank.to(device=device)
 
     # CLIP text encoder for object retrieval at eval/test time
     clip_encoder = CLIPTextEncoder(model_path=clip_model_path, device=device)
@@ -670,7 +893,14 @@ def main() -> None:
         "[INFO] loss: answer_weight={loss_answer_weight:.4f} "
         f"(pure autoregressive NLL; CLIP retrieval for object at eval/test)"
     )
+    checkpoint_monitor = str(getattr(args, "checkpoint_monitor", "val_loss")).strip() or "val_loss"
+    checkpoint_monitor_mode = infer_checkpoint_monitor_mode(
+        checkpoint_monitor,
+        str(getattr(args, "checkpoint_monitor_mode", "auto")),
+    )
+    best_monitor_value = float("inf") if checkpoint_monitor_mode == "min" else -float("inf")
     best_val_loss = float("inf")
+    print(f"[INFO] checkpoint monitor: {checkpoint_monitor} ({checkpoint_monitor_mode})")
     global_step = 0
     start_time = time.time()
 
@@ -684,6 +914,7 @@ def main() -> None:
         sample_count = 0
         step_count = 0
         updates_done_in_epoch = 0
+        last_logged_train_bucket = 0
         skipped_all_ignore = 0
 
         optimizer.zero_grad(set_to_none=True)
@@ -743,28 +974,32 @@ def main() -> None:
                 global_step += 1
                 updates_done_in_epoch += 1
 
-                if (
-                    wandb_run is not None
-                    and int(args.wandb_log_every_steps) > 0
-                    and (global_step % int(args.wandb_log_every_steps) == 0)
-                ):
-                    grad_norm_value = (
-                        float(grad_norm.detach().item())
-                        if torch.is_tensor(grad_norm)
-                        else float(grad_norm)
+                if wandb_run is not None:
+                    current_train_bucket = train_progress_bucket(
+                        updates_done_in_epoch,
+                        updates_per_epoch,
                     )
-                    epoch_progress = (float(epoch) - 1.0) + (
-                        float(updates_done_in_epoch) / max(float(updates_per_epoch), 1.0)
-                    )
-                    wandb_run.log(
-                        {
-                            "train/loss": float(raw_loss.detach().item()),
-                            "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
-                            "train/grad_norm": grad_norm_value,
-                            "train/epoch": epoch_progress,
-                        },
-                        step=global_step,
-                    )
+                    should_log_train = current_train_bucket > last_logged_train_bucket
+                    if should_log_train:
+                        last_logged_train_bucket = current_train_bucket
+                        grad_norm_value = (
+                            float(grad_norm.detach().item())
+                            if torch.is_tensor(grad_norm)
+                            else float(grad_norm)
+                        )
+                        epoch_progress = (float(epoch) - 1.0) + (
+                            float(updates_done_in_epoch) / max(float(updates_per_epoch), 1.0)
+                        )
+                        wandb_run.log(
+                            {
+                                "train/loss": float(raw_loss.detach().item()),
+                                "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
+                                "train/grad_norm": grad_norm_value,
+                                "train/epoch": epoch_progress,
+                                "train/epoch_percent": float(current_train_bucket),
+                            },
+                            step=global_step,
+                        )
 
             sum_loss += float(raw_loss.detach().item()) * float(bsz)
             sample_count += bsz
@@ -810,16 +1045,18 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=test_label_embedding_bank_device,
-                retrieval_label_texts=test_retrieval_texts,
-                query_id_to_label_text=id2label,
-                retrieval_top_k=int(test_retrieval_top_k),
+                label_embedding_bank=val_split_bank_embs.to(device=device),
+                retrieval_label_texts=val_split_bank_texts,
+                retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"ValMetric {epoch}/{args.epochs}",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
+                repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
+                no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
+                bank_canonical_ids=val_split_bank_ids,
             )
 
         epoch_msg = (
@@ -838,12 +1075,31 @@ def main() -> None:
                 "val/loss": float(val_loss),
             }
             if isinstance(val_gen_metrics, dict):
-                payload.update(val_metric_log_payload(val_gen_metrics, epoch=float(epoch)))
+                payload.update(val_metric_log_payload(val_gen_metrics))
             wandb_run.log(payload, step=global_step)
 
-        if val_loss < best_val_loss:
+        monitor_value = checkpoint_monitor_value(
+            checkpoint_monitor,
+            val_loss=val_loss,
+            val_gen_metrics=val_gen_metrics,
+        )
+        monitor_improved = (
+            monitor_value is not None
+            and (
+                (checkpoint_monitor_mode == "min" and monitor_value < best_monitor_value)
+                or (checkpoint_monitor_mode == "max" and monitor_value > best_monitor_value)
+            )
+        )
+        if monitor_value is None:
+            print(f"[WARN] checkpoint monitor {checkpoint_monitor!r} is unavailable this epoch; skipping save.")
+        elif monitor_improved:
+            best_monitor_value = float(monitor_value)
             best_val_loss = val_loss
             best_dir = out_dir / "best"
+            print(
+                f"[INFO] new best checkpoint: {checkpoint_monitor}={best_monitor_value:.6f} "
+                f"val_loss={val_loss:.6f}"
+            )
             save_checkpoint(
                 best_dir,
                 epoch,
@@ -853,6 +1109,17 @@ def main() -> None:
                 scheduler,
                 clear_dir=True,
             )
+
+        # Always save the most recent epoch to last/
+        save_checkpoint(
+            out_dir / "last",
+            epoch,
+            model,
+            processor,
+            optimizer,
+            scheduler,
+            clear_dir=True,
+        )
 
     if bool(args.eval_only) and len(val_ds) > 0:
         val_metrics = run_eval(
@@ -873,16 +1140,18 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=test_label_embedding_bank_device,
-                retrieval_label_texts=test_retrieval_texts,
-                query_id_to_label_text=id2label,
-                retrieval_top_k=int(test_retrieval_top_k),
+                label_embedding_bank=val_split_bank_embs.to(device=device),
+                retrieval_label_texts=val_split_bank_texts,
+                retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Eval metrics (checkpoint)",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
+                repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
+                no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
+                bank_canonical_ids=val_split_bank_ids,
             )
         print(f"[EVAL] val_loss={best_val_loss:.6f}")
         if wandb_run is not None:
@@ -890,7 +1159,7 @@ def main() -> None:
                 "val/loss": float(best_val_loss),
             }
             if isinstance(val_gen_metrics, dict):
-                payload.update(val_metric_log_payload(val_gen_metrics, epoch=0.0))
+                payload.update(val_metric_log_payload(val_gen_metrics))
             wandb_run.log(payload, step=global_step)
 
     elapsed = time.time() - start_time
@@ -919,21 +1188,11 @@ def main() -> None:
             split_prefix=args.test_split_prefix,
             strip_split_prefix=bool(args.test_strip_split_prefix),
             bbox_round_decimals=int(args.test_bbox_round_decimals),
-            max_groups=int(args.max_test_samples),
         )
-        start_index = max(0, int(getattr(args, "test_start_index", 0)))
-        if start_index > 0:
-            test_groups = test_groups[start_index:]
-        test_num_samples = int(getattr(args, "test_num_samples", 0))
-        if test_num_samples > 0:
-            test_groups = test_groups[: max(1, test_num_samples)]
         if not test_groups:
             print("[TEST] no valid test groups found.")
         else:
-            print(
-                f"[TEST] groups={len(test_groups)} "
-                f"(start={start_index}, limit={(test_num_samples if test_num_samples > 0 else 'all')})"
-            )
+            print(f"[TEST] groups={len(test_groups)}")
             test_ds = GazeTestDataset(
                 groups=test_groups,
                 prompt_template=args.prompt_template,
@@ -945,6 +1204,8 @@ def main() -> None:
                 answer_template=args.answer_template,
                 fallback_target_text=args.fallback_target_text,
                 point_decimals=int(args.point_decimals),
+                point_mode=args.point_mode,
+                point_bin_count=int(args.point_bin_count),
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
             )
@@ -965,27 +1226,47 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=test_label_embedding_bank_device,
-                retrieval_label_texts=test_retrieval_texts,
-                query_id_to_label_text=id2label,
-                retrieval_top_k=int(test_retrieval_top_k),
+                label_embedding_bank=test_split_bank_embs.to(device=device),
+                retrieval_label_texts=test_split_bank_texts,
+                retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
                 num_beams=int(getattr(args, "generation_num_beams", 3)),
+                repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
+                no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
+                bank_canonical_ids=test_split_bank_ids,
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
-                wandb_run.log(test_log_payload(test_metrics, epoch=float(effective_epochs)), step=global_step)
+                wandb_run.log(test_log_payload(test_metrics), step=global_step)
             (out_dir / "test_metrics.json").write_text(
                 json.dumps(test_metrics, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            maybe_save_generation_preview(
+                args=args,
+                out_dir=out_dir,
+                model=model,
+                loader=test_loader,
+                device=device,
+                amp_dtype=amp_dtype,
+                processor=processor,
+                label_embedding_bank=test_split_bank_embs.to(device=device),
+                retrieval_label_texts=test_split_bank_texts,
+                retrieval_top_k=int(retrieval_top_k),
+                clip_encoder=clip_encoder,
+                object_temperature=object_temperature,
+                bank_canonical_ids=test_split_bank_ids,
+            )
 
     finish_wandb(wandb_run)
-    print(f"[DONE] global_step={global_step} best_val_loss={best_val_loss:.6f} elapsed_sec={elapsed:.1f}")
+    print(
+        f"[DONE] global_step={global_step} best_val_loss={best_val_loss:.6f} "
+        f"best_{checkpoint_monitor}={best_monitor_value:.6f} elapsed_sec={elapsed:.1f}"
+    )
 
 
 if __name__ == "__main__":

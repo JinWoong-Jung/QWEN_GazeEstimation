@@ -1,5 +1,6 @@
 paths:
   model_path: "model/Qwen3-VL-4B-Instruct"
+  output_dir: "checkpoints"
   image_root: "data/gazefollow_extended/train"
   train_ann: "data/gazefollow/train_annotations_new.txt"
   val_ann: "data/gazefollow/val_annotations_new.txt"
@@ -12,91 +13,84 @@ paths:
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
   label_embed_dir: "data/gazefollow/label-embeds"
-  output_dir: "checkpoints/qwen_ge"
 
 data:
+  scene_h: 512
+  scene_w: 512
+  image_cache_size: 1000
   split_prefix: "train/"
   strip_split_prefix: true
-  max_train_samples: 0
-  max_val_samples: 0
-  max_test_samples: 0
-  test_start_index: 0
-  test_num_samples: 0
-  test_only: false
   test_split_prefix: "test2/"
   test_strip_split_prefix: true
   test_bbox_round_decimals: 3
-  image_cache_size: 1000
 
 train:
-  batch_size: 8
-  test_batch_size: 8
-  epochs: 20
-  num_workers: 4
-  show_tqdm: true
-  run_test: true
-  run_val_metrics: true
-  run_val_metrics_every_n_epochs: 1
-  eval_only: false
-  lr: 1e-4
-  weight_decay: 0.01
-  warmup_ratio: 0.05
-  grad_accum_steps: 8
-  max_grad_norm: 1.0
   seed: 42
   device: "cuda"
   dtype: "bfloat16"
   gradient_checkpointing: false
+  epochs: 10
+  batch_size: 8
+  grad_accum_steps: 8
+  num_workers: 4
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
 
-image:
-  scene_h: 512
-  scene_w: 512
-
-text:
-  # NOTE: currently not applied because collator tokenization uses truncation=False.
-  max_text_length: 256
-  generation_max_new_tokens: 26
-  generation_num_beams: 3
-  object_embedding_dim: 512
+eval:
+  test_batch_size: 8
+  show_tqdm: true
+  eval_only: false
+  test_only: false
+  run_test: true
+  run_val_metrics: true
+  run_val_metrics_every_n_epochs: 1
+  checkpoint_monitor: "val_dist"  # val_loss | val_dist | val_acc@1 | val_acc@3 | val_multiacc@1
+  checkpoint_monitor_mode: "auto"  # auto | min | max
+  generation_max_new_tokens: 24
+  generation_num_beams: 1
+  repetition_penalty: 1.15
+  no_repeat_ngram_size: 2
   test_retrieval_top_k: 3
-  point_decimals: 4
-  # CLIP model used for test-time object text encoding.
-  # Must match the model used to pre-compute label-embeds/*.pt files.
-  clip_model_path: "openai/clip-vit-base-patch32"
-
-loss:
-  # Sole training objective: masked autoregressive NLL over answer tokens.
-  loss_answer_weight: 1.0
-  object_temperature: 0.07  # cosine similarity temperature for CLIP retrieval at test time
+  clip_model1_path: "openai/clip-vit-base-patch32"
+  object_embedding_dim: 512
+  object_temperature: 0.07
 
 prompt:
-  prompt_template: ""
   visual_prompting: true
+  point_decimals: 4
+  point_mode: "bin"
+  point_bin_count: 1000
+  prompt_template: ""
+  answer_template: "Point: {point_x} {point_y}\nObject: {label_text}"
+  fallback_target_text: "unknown"
   prompt_text: |
     Given the highlighted subject, estimate the gaze point and the object being looked at.
     Subject head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]
     Output EXACTLY two lines in this exact format:
-    Point: x y
-    Object: <object name>
+    Point: <pt1000_i> <pt1000_j>
+    Object: <simple object name>
+    Use one point token per coordinate, where i and j are integer bin ids from 0 to 999.
     Do not output any extra text, symbols, or lines.
-  answer_template: "Point: {point_x} {point_y}\nObject: {label_text}"
-  fallback_target_text: "unknown"
 
-lora:
+model:
+  attn_implementation: "sdpa"
+  max_text_length: 256
   lora_r: 16
   lora_alpha: 32
   lora_dropout: 0.05
   lora_bias: "none"
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-runtime:
-  attn_implementation: "sdpa"
+loss:
+  loss_answer_weight: 1.0
 
 wandb:
   enabled: true
   project: "gaze_mllm"
   entity: "semgaze"
-  run_name: "qwen_ge"
+  run_name: "baseline"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

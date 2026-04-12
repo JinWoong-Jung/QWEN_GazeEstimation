@@ -40,10 +40,31 @@ def default_value(defaults: dict[str, Any], key: str, fallback: Any) -> Any:
     return defaults.get(key, fallback)
 
 
+def normalize_run_name(raw: Any) -> str:
+    return str(raw or "").strip()
+
+
+def output_dir_from_run_name(output_dir: str, run_name: str) -> str:
+    raw_output_dir = str(output_dir or "").strip()
+    name = normalize_run_name(run_name)
+    if not raw_output_dir or not name:
+        return raw_output_dir
+
+    p = Path(raw_output_dir)
+    if p.name == name:
+        return str(p)
+
+    parent = p.parent
+    if str(parent) == ".":
+        return str(p / name)
+    return str(parent / name)
+
+
 def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
     d = defaults or {}
     p = argparse.ArgumentParser("Qwen text-generation LoRA trainer")
     p.add_argument("--config", type=str, default=str(default_value(d, "config", "config.yaml")))
+    p.add_argument("--run_name", type=str, default=normalize_run_name(default_value(d, "run_name", default_value(d, "wandb_run_name", ""))))
 
     p.add_argument("--model_path", type=str, default=str(default_value(d, "model_path", "model/Qwen3-VL-4B-Instruct")))
     p.add_argument("--image_root", type=str, default=str(default_value(d, "image_root", "data/gazefollow_extended/train")))
@@ -72,12 +93,6 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--strip_split_prefix", dest="strip_split_prefix", action="store_true")
     p.add_argument("--no_strip_split_prefix", dest="strip_split_prefix", action="store_false")
     p.set_defaults(strip_split_prefix=bool(default_value(d, "strip_split_prefix", True)))
-    p.add_argument("--max_train_samples", type=int, default=int(default_value(d, "max_train_samples", 0)))
-    p.add_argument("--max_val_samples", type=int, default=int(default_value(d, "max_val_samples", 0)))
-    p.add_argument("--max_test_samples", type=int, default=int(default_value(d, "max_test_samples", 0)))
-    p.add_argument("--test_start_index", type=int, default=int(default_value(d, "test_start_index", 0)))
-    p.add_argument("--test_num_samples", type=int, default=int(default_value(d, "test_num_samples", 0)))
-
     p.add_argument("--batch_size", type=int, default=int(default_value(d, "batch_size", 1)))
     p.add_argument("--test_batch_size", type=int, default=int(default_value(d, "test_batch_size", default_value(d, "batch_size", 1))))
     p.add_argument("--epochs", type=int, default=int(default_value(d, "epochs", 1)))
@@ -104,6 +119,8 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--no_run_val_metrics", dest="run_val_metrics", action="store_false")
     p.set_defaults(run_val_metrics=bool(default_value(d, "run_val_metrics", True)))
     p.add_argument("--run_val_metrics_every_n_epochs", type=int, default=int(default_value(d, "run_val_metrics_every_n_epochs", 5)))
+    p.add_argument("--checkpoint_monitor", type=str, default=str(default_value(d, "checkpoint_monitor", "val_loss")))
+    p.add_argument("--checkpoint_monitor_mode", type=str, default=str(default_value(d, "checkpoint_monitor_mode", "auto")))
 
     p.add_argument("--test_split_prefix", type=str, default=str(default_value(d, "test_split_prefix", "test2/")))
     p.add_argument("--test_strip_split_prefix", dest="test_strip_split_prefix", action="store_true")
@@ -116,8 +133,13 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--scene_w", type=int, default=int(default_value(d, "scene_w", 512)))
 
     p.add_argument("--max_text_length", type=int, default=int(default_value(d, "max_text_length", 256)))
+    p.add_argument("--point_mode", type=str, default=str(default_value(d, "point_mode", "continuous")))
+    p.add_argument("--point_bin_count", type=int, default=int(default_value(d, "point_bin_count", 1000)))
     p.add_argument("--generation_max_new_tokens", type=int, default=int(default_value(d, "generation_max_new_tokens", 24)))
     p.add_argument("--generation_num_beams", type=int, default=int(default_value(d, "generation_num_beams", 3)))
+    p.add_argument("--repetition_penalty", type=float, default=float(default_value(d, "repetition_penalty", 1.0)))
+    p.add_argument("--no_repeat_ngram_size", type=int, default=int(default_value(d, "no_repeat_ngram_size", 0)))
+    p.add_argument("--preview_test_samples", type=int, default=int(default_value(d, "preview_test_samples", 0)))
     p.add_argument("--object_embedding_dim", type=int, default=int(default_value(d, "object_embedding_dim", 512)))
     p.add_argument("--test_retrieval_top_k", type=int, default=int(default_value(d, "test_retrieval_top_k", 3)))
     p.add_argument("--point_decimals", type=int, default=int(default_value(d, "point_decimals", 4)))

@@ -1,20 +1,29 @@
-# Project Context
+# QWEN_GazeEstimation — Agent / Codex Context
 
-This is a python project using raw-http.
+## High-Impact Files
 
+코드 변경 시 파급 범위가 넓은 파일들:
 
-High-impact files (most imported, changes here affect many other files):
-- /model.py (imported by 2 files)
-- /utils/data_utils.py (imported by 2 files)
-- /common.py (imported by 2 files)
-- /preprocess.py (imported by 1 files)
-- /datasets.py (imported by 1 files)
-- /utils/checkpoint.py (imported by 1 files)
-- /utils/common.py (imported by 1 files)
-- /utils/config_parser.py (imported by 1 files)
+- `model/trainer.py` — 전체 학습/평가 파이프라인 진입점
+- `model/utils/data_utils.py` — datasets.py, trainer.py에서 공통 임포트
+- `model/utils/eval_utils.py` — trainer.py에서 임포트 (평가 지표 계산)
+- `model/utils/processor_collate.py` — trainer.py에서 임포트 (배치 처리)
+- `model/utils/loss_utils.py` — trainer.py에서 임포트 (손실 계산)
+- `model/model.py` — trainer.py, model/__init__.py에서 임포트
 
-Required environment variables (no defaults):
-- PYTHONHASHSEED (model/trainer.py)
+## Required Environment Variables
 
-Read .codesight/wiki/index.md for orientation (WHERE things live). Then read actual source files before implementing. Wiki articles are navigation aids, not implementation guides.
-Read .codesight/CODESIGHT.md for the complete AI context map including all routes, schema, components, libraries, config, middleware, and dependency graph.
+- `PYTHONHASHSEED` — `model/trainer.py` (재현성 보장)
+
+## Key Conventions
+
+- config.yaml은 `flatten_config()`로 평탄화 후 argparse에 주입 → 모든 섹션 키가 최상위로 올라옴
+- Retrieval bank: `build_vocab_embedding_matrix(vocab2id=vocab2id)` 결과, `bank[i]` = label id `i`의 임베딩
+- acc@1/acc@3/multiacc@1은 text 비교가 아닌 int label id 직접 비교
+- 체크포인트: `best/` (최고 성능) + `last/` (최신 에폭) 두 곳에 저장
+
+## Navigation
+
+- 구현 로직 상세: `.claude/rules/code-style.md`
+- 테스트 규칙: `.claude/rules/testing.md`
+- 전체 개요: `.claude/CLAUDE.md`
