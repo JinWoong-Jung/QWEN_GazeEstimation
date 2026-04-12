@@ -11,7 +11,6 @@ from tqdm.auto import tqdm
 
 from .common import normalize_text, to_device
 from .loss_utils import compute_answer_loss
-from .point_tokens import parse_point_token_pair, render_point_text_human
 
 
 # ---------------------------------------------------------------------------
@@ -193,15 +192,6 @@ def parse_object_text(text: str) -> str | None:
 
 
 def parse_point(text: str) -> tuple[float, float] | None:
-    m_tok = re.search(
-        r"(?im)^\s*point\s*:\s*(<pt\d+_\d+>)\s*[,\s]+\s*(<pt\d+_\d+>)\s*$",
-        str(text or ""),
-    )
-    if m_tok is not None:
-        parsed = parse_point_token_pair(m_tok.group(1), m_tok.group(2))
-        if parsed is not None:
-            return parsed
-
     num = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
     m = re.search(rf"(?im)^\s*point\s*:\s*({num})\s*[,\s]+\s*({num})\b", str(text or ""))
     if m is None:
@@ -600,7 +590,6 @@ def collect_generation_samples(
     no_repeat_ngram_size: int = 0,
     max_samples: int = 8,
     bank_canonical_ids: list[int] | None = None,
-    point_decimals: int = 4,
 ) -> list[dict[str, Any]]:
     """Collect a small number of human-readable generation previews."""
     limit = max(0, int(max_samples))
@@ -749,25 +738,18 @@ def collect_generation_samples(
                     if i < int(target_valid.numel())
                     else False
                 )
-                target_text_raw = target_texts[i] if i < len(target_texts) else ""
-                generated_text_raw = pred
-                target_text = render_point_text_human(target_text_raw, point_decimals=point_decimals)
-                generated_text = render_point_text_human(
-                    generated_text_raw,
-                    point_decimals=point_decimals,
-                )
+                target_text = target_texts[i] if i < len(target_texts) else ""
+                generated_text = pred
                 previews.append(
                     {
                         "sample_index": int(len(previews)),
                         "image_rel": image_rels[i] if i < len(image_rels) else "",
                         "prompt_text": prompt_texts[i] if i < len(prompt_texts) else "",
                         "target_text": target_text,
-                        "target_text_raw": target_text_raw,
                         "target_text_valid": target_is_valid,
                         "generated_text": generated_text,
-                        "generated_text_raw": generated_text_raw,
                         "exact_match": (
-                            bool(normalize_text(pred) == normalize_text(target_text_raw))
+                            bool(normalize_text(pred) == normalize_text(target_text))
                             if target_is_valid
                             else None
                         ),

@@ -59,7 +59,6 @@ from .utils.eval_utils import (
     run_test_metrics,
 )
 from .utils.loss_utils import compute_answer_loss
-from .utils.point_tokens import POINT_MODE_BIN, add_point_bin_tokens, normalize_point_mode
 from .utils.processor_collate import QwenTestCollator, QwenTrainCollator
 from .utils.wandb_utils import finish_wandb, init_wandb, train_progress_bucket
 
@@ -210,46 +209,12 @@ def init_processor(
     return AutoProcessor.from_pretrained(str(processor_path), trust_remote_code=True)
 
 
-def maybe_register_point_tokens(
-    *,
-    processor: Any,
-    point_mode: str,
-    point_bin_count: int,
-) -> int:
-    tokenizer = getattr(processor, "tokenizer", None)
-    if tokenizer is None:
-        return 0
-    if normalize_point_mode(point_mode) != POINT_MODE_BIN:
-        return 0
-    added = add_point_bin_tokens(tokenizer, point_bin_count)
-    if added > 0:
-        print(f"[INFO] registered point-bin special tokens: added={added} bins={int(point_bin_count)}")
-    return int(added)
-
-
 def init_base_model(
     *,
     model_path: Path,
     model_kwargs: dict[str, Any],
 ) -> Any:
     return AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
-
-
-def maybe_resize_token_embeddings(model: Any, processor: Any) -> None:
-    tokenizer = getattr(processor, "tokenizer", None)
-    if tokenizer is None:
-        return
-    if not hasattr(model, "get_input_embeddings") or not hasattr(model, "resize_token_embeddings"):
-        return
-    try:
-        current = int(model.get_input_embeddings().weight.shape[0])
-        target = int(len(tokenizer))
-    except Exception:
-        return
-    if current == target:
-        return
-    model.resize_token_embeddings(target)
-    print(f"[INFO] resized token embeddings: {current} -> {target}")
 
 
 def test_log_payload(test_metrics: dict[str, float]) -> dict[str, float]:
@@ -312,7 +277,6 @@ def maybe_save_generation_preview(
         no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
         max_samples=preview_n,
         bank_canonical_ids=bank_canonical_ids,
-        point_decimals=int(getattr(args, "point_decimals", 4)),
     )
     preview_path = out_dir / "test_generation_preview.json"
     preview_path.write_text(
@@ -370,8 +334,6 @@ def main() -> None:
     args = build_parser(defaults=config_defaults).parse_args()
     print(f"[INFO] loaded config: {resolve_path(args.config)}")
     set_seed(args.seed)
-    args.point_mode = normalize_point_mode(getattr(args, "point_mode", "continuous"))
-    args.point_bin_count = max(2, int(getattr(args, "point_bin_count", 1000)))
 
     run_name = normalize_run_name(getattr(args, "run_name", ""))
     if run_name:
@@ -475,11 +437,6 @@ def main() -> None:
             model_kwargs["dtype"] = load_dtype
 
         processor = init_processor(model_path=model_path, checkpoint_dir=checkpoint_dir)
-        maybe_register_point_tokens(
-            processor=processor,
-            point_mode=args.point_mode,
-            point_bin_count=int(args.point_bin_count),
-        )
         test_collator = QwenTestCollator(
             processor=processor,
             scene_size=(int(args.scene_h), int(args.scene_w)),
@@ -487,7 +444,6 @@ def main() -> None:
         )
 
         base_qwen = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
-        maybe_resize_token_embeddings(base_qwen, processor)
         adapter_dir = (checkpoint_dir / "lora_adapter") if checkpoint_dir is not None else None
         if adapter_dir is not None and adapter_dir.exists():
             qwen_model = PeftModel.from_pretrained(
@@ -545,8 +501,6 @@ def main() -> None:
                 answer_template=args.answer_template,
                 fallback_target_text=args.fallback_target_text,
                 point_decimals=int(args.point_decimals),
-                point_mode=args.point_mode,
-                point_bin_count=int(args.point_bin_count),
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
             )
@@ -738,8 +692,6 @@ def main() -> None:
         answer_template=args.answer_template,
         fallback_target_text=args.fallback_target_text,
         point_decimals=int(args.point_decimals),
-        point_mode=args.point_mode,
-        point_bin_count=int(args.point_bin_count),
         visual_prompting=bool(args.visual_prompting),
         image_cache_size=image_cache_size,
     )
@@ -755,8 +707,6 @@ def main() -> None:
         answer_template=args.answer_template,
         fallback_target_text=args.fallback_target_text,
         point_decimals=int(args.point_decimals),
-        point_mode=args.point_mode,
-        point_bin_count=int(args.point_bin_count),
         visual_prompting=bool(args.visual_prompting),
         image_cache_size=image_cache_size,
     )
@@ -776,11 +726,6 @@ def main() -> None:
         model_kwargs["dtype"] = load_dtype
 
     processor = init_processor(model_path=model_path, checkpoint_dir=checkpoint_dir)
-    maybe_register_point_tokens(
-        processor=processor,
-        point_mode=args.point_mode,
-        point_bin_count=int(args.point_bin_count),
-    )
 
     train_collator = QwenTrainCollator(
         processor=processor,
@@ -836,7 +781,6 @@ def main() -> None:
         )
 
     base_qwen = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
-    maybe_resize_token_embeddings(base_qwen, processor)
     if args.gradient_checkpointing and hasattr(base_qwen, "gradient_checkpointing_enable"):
         base_qwen.gradient_checkpointing_enable()
     if args.gradient_checkpointing and hasattr(base_qwen, "enable_input_require_grads"):
@@ -1204,8 +1148,6 @@ def main() -> None:
                 answer_template=args.answer_template,
                 fallback_target_text=args.fallback_target_text,
                 point_decimals=int(args.point_decimals),
-                point_mode=args.point_mode,
-                point_bin_count=int(args.point_bin_count),
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
             )

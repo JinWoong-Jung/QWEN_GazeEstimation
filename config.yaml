@@ -60,8 +60,6 @@ eval:
 prompt:
   visual_prompting: true
   point_decimals: 4
-  point_mode: "bin"
-  point_bin_count: 1000
   prompt_template: ""
   answer_template: "Point: {point_x} {point_y}\nObject: {label_text}"
   fallback_target_text: "unknown"
@@ -69,9 +67,8 @@ prompt:
     Given the highlighted subject, estimate the gaze point and the object being looked at.
     Subject head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]
     Output EXACTLY two lines in this exact format:
-    Point: <pt1000_i> <pt1000_j>
+    Point: x y
     Object: <simple object name>
-    Use one point token per coordinate, where i and j are integer bin ids from 0 to 999.
     Do not output any extra text, symbols, or lines.
 
 model:

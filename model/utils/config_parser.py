@@ -133,8 +133,6 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--scene_w", type=int, default=int(default_value(d, "scene_w", 512)))
 
     p.add_argument("--max_text_length", type=int, default=int(default_value(d, "max_text_length", 256)))
-    p.add_argument("--point_mode", type=str, default=str(default_value(d, "point_mode", "continuous")))
-    p.add_argument("--point_bin_count", type=int, default=int(default_value(d, "point_bin_count", 1000)))
     p.add_argument("--generation_max_new_tokens", type=int, default=int(default_value(d, "generation_max_new_tokens", 24)))
     p.add_argument("--generation_num_beams", type=int, default=int(default_value(d, "generation_num_beams", 3)))
     p.add_argument("--repetition_penalty", type=float, default=float(default_value(d, "repetition_penalty", 1.0)))

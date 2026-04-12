@@ -14,7 +14,6 @@ from .utils.data_utils import (
     build_prompt,
     sanitize_bbox_pixels,
 )
-from .utils.point_tokens import POINT_MODE_CONTINUOUS, format_point_value
 
 
 class _ImageLRUCache:
@@ -50,8 +49,6 @@ def format_target_text(
     point_x: float,
     point_y: float,
     point_decimals: int,
-    point_mode: str = POINT_MODE_CONTINUOUS,
-    point_bin_count: int = 1000,
 ) -> tuple[str, float]:
     raw = str(label_text or "").strip()
     if not raw and (id2label is not None) and int(label_id) >= 0:
@@ -74,18 +71,9 @@ def format_target_text(
         is_valid_obj = int(obj_id) >= 0
     is_valid = 1.0 if is_valid_obj else 0.0
 
-    px = format_point_value(
-        point_x,
-        point_mode=point_mode,
-        point_decimals=point_decimals,
-        point_bin_count=point_bin_count,
-    )
-    py = format_point_value(
-        point_y,
-        point_mode=point_mode,
-        point_decimals=point_decimals,
-        point_bin_count=point_bin_count,
-    )
+    dec = max(0, int(point_decimals))
+    px = f"{float(point_x):.{dec}f}"
+    py = f"{float(point_y):.{dec}f}"
     tpl = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
     try:
         text = tpl.format(label_text=raw, point_x=px, point_y=py)
@@ -132,8 +120,6 @@ class GazeDataset(Dataset):
         answer_template: str = "Point: {point_x} {point_y}\nObject: {label_text}",
         fallback_target_text: str = "unknown",
         point_decimals: int = 4,
-        point_mode: str = POINT_MODE_CONTINUOUS,
-        point_bin_count: int = 1000,
         visual_prompting: bool = False,
         image_cache_size: int = 0,
     ) -> None:
@@ -148,8 +134,6 @@ class GazeDataset(Dataset):
         self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
         self.fallback_target_text = str(fallback_target_text)
         self.point_decimals = int(point_decimals)
-        self.point_mode = str(point_mode)
-        self.point_bin_count = int(point_bin_count)
         self.visual_prompting = bool(visual_prompting)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
@@ -202,8 +186,6 @@ class GazeDataset(Dataset):
             point_x=float(gaze_x),
             point_y=float(gaze_y),
             point_decimals=self.point_decimals,
-            point_mode=self.point_mode,
-            point_bin_count=self.point_bin_count,
         )
 
         return {
@@ -240,8 +222,6 @@ class GazeTestDataset(Dataset):
         answer_template: str = "Point: {point_x} {point_y}\nObject: {label_text}",
         fallback_target_text: str = "unknown",
         point_decimals: int = 4,
-        point_mode: str = POINT_MODE_CONTINUOUS,
-        point_bin_count: int = 1000,
         visual_prompting: bool = False,
         image_cache_size: int = 0,
     ) -> None:
@@ -255,8 +235,6 @@ class GazeTestDataset(Dataset):
         self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
         self.fallback_target_text = str(fallback_target_text)
         self.point_decimals = int(point_decimals)
-        self.point_mode = str(point_mode)
-        self.point_bin_count = int(point_bin_count)
         self.visual_prompting = bool(visual_prompting)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
@@ -300,8 +278,6 @@ class GazeTestDataset(Dataset):
             point_x=px,
             point_y=py,
             point_decimals=self.point_decimals,
-            point_mode=self.point_mode,
-            point_bin_count=self.point_bin_count,
         )
 
         return {
