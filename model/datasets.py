@@ -50,12 +50,16 @@ def format_target_text(
     point_y: float,
     point_decimals: int,
 ) -> tuple[str, float]:
+    def clamp01(x: float) -> float:
+        return max(0.0, min(1.0, float(x)))
+
     raw = str(label_text or "").strip()
     if not raw and (id2label is not None) and int(label_id) >= 0:
         raw = str(id2label.get(int(label_id), "")).strip()
     if not raw:
         raw = str(fallback_target_text)
 
+    # Vocab-ID lookup uses the raw label so it matches vocab2id keys exactly.
     obj_id = int(label_id)
     if obj_id < 0:
         v = vocab2id or {}
@@ -71,14 +75,21 @@ def format_target_text(
         is_valid_obj = int(obj_id) >= 0
     is_valid = 1.0 if is_valid_obj else 0.0
 
+    # Keep the raw dataset label text so train-time text generation matches the
+    # semgaze-style direct vocab lookup path instead of an extra canonicalizer.
+    template_label = raw
+
     dec = max(0, int(point_decimals))
-    px = f"{float(point_x):.{dec}f}"
-    py = f"{float(point_y):.{dec}f}"
-    tpl = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
+    px = f"{clamp01(point_x):.{dec}f}"
+    py = f"{clamp01(point_y):.{dec}f}"
+    tpl = str(answer_template or "Point:{point_x},{point_y}\nObject:{label_text}")
+    required_fields = ("{point_x}", "{point_y}", "{label_text}")
+    if any(field not in tpl for field in required_fields):
+        tpl = "Point:{point_x},{point_y}\nObject:{label_text}"
     try:
-        text = tpl.format(label_text=raw, point_x=px, point_y=py)
+        text = tpl.format(label_text=template_label, point_x=px, point_y=py)
     except Exception:
-        text = f"Point: {px} {py}\nObject: {raw}"
+        text = f"Point:{px},{py}\nObject:{template_label}"
     return str(text), float(is_valid)
 
 

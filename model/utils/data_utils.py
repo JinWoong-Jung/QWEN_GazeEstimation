@@ -248,8 +248,107 @@ def vocab_id(
     return -100
 
 
+def direct_vocab_id(
+    label_text: str,
+    vocab2id: dict[str, int] | None = None,
+) -> int:
+    if not label_text:
+        return -100
+    txt = str(label_text).strip()
+    if not txt:
+        return -100
+    v = vocab2id or {}
+    return int(v.get(txt, -100))
+
+
 def clean_label(txt: str) -> str:
     return " ".join(str(txt or "").strip().split())
+
+
+# ---------------------------------------------------------------------------
+# Canonical noun-phrase normaliser for training / answer-template targets
+# ---------------------------------------------------------------------------
+
+# Leading articles to strip from the start of a label.
+_ARTICLE_PREFIXES: tuple[str, ...] = ("a ", "an ", "the ")
+
+# Prepositions that mark the start of a trailing prepositional phrase.
+# We drop everything from the first preposition token onward so that
+# "hand on mouse" → "hand" and "glass of water" → "glass".
+# Note: "of" is intentionally included even though it appears in some
+# compound labels (e.g. "pair of scissors") because we already apply a
+# 3-token hard-truncation below, which handles those cases gracefully.
+_PREP_TOKENS: frozenset[str] = frozenset({
+    "on", "in", "at", "by", "with", "near", "from", "to", "into", "onto",
+    "inside", "outside", "over", "under", "through", "of", "for", "about",
+    "up", "down", "beside", "behind", "between", "among", "around",
+})
+
+# Maximum number of whitespace-delimited tokens kept in the canonical form.
+_CANONICAL_MAX_TOKENS: int = 3
+
+
+def canonicalize_label_text(raw: str) -> str:
+    """Normalise a raw label string into a compact 1-3 word canonical noun phrase.
+
+    Applied steps (in order):
+
+    1. Collapse whitespace and strip leading/trailing spaces.
+    2. Strip a single leading article (a / an / the), case-insensitive.
+    3. Drop all tokens from the first preposition onward (removes
+       trailing prepositional phrases such as "on the table").
+    4. Hard-truncate to at most :data:`_CANONICAL_MAX_TOKENS` tokens.
+    5. Re-join and return the result.
+
+    The original case is preserved (not lowercased) so the result can be
+    matched directly against ``vocab2id`` whose keys retain original case.
+    An empty input or a label that reduces to nothing returns the
+    original (stripped) value unchanged so the caller can still look up
+    the ID.
+
+    Examples
+    --------
+    >>> canonicalize_label_text("the laptop computer")
+    'laptop computer'
+    >>> canonicalize_label_text("a hand on mouse")
+    'hand'
+    >>> canonicalize_label_text("glass of water")
+    'glass'
+    >>> canonicalize_label_text("baseball bat")
+    'baseball bat'
+    >>> canonicalize_label_text("television")
+    'television'
+    """
+    txt = " ".join(str(raw or "").strip().split())
+    if not txt:
+        return txt
+
+    # 1. Strip leading article (case-insensitive compare, preserve original case).
+    lower = txt.lower()
+    for art in _ARTICLE_PREFIXES:
+        if lower.startswith(art):
+            txt = txt[len(art):].lstrip()
+            lower = txt.lower()
+            break  # only strip one article
+
+    if not txt:
+        return str(raw or "").strip()
+
+    # 2. Tokenise and drop from first preposition onward.
+    tokens: list[str] = txt.split()
+    keep: list[str] = []
+    for tok in tokens:
+        if tok.lower() in _PREP_TOKENS:
+            break
+        keep.append(tok)
+
+    if not keep:
+        # Preposition was the very first token (unusual); fall back to full phrase.
+        keep = tokens
+
+    # 3. Hard-truncate to _CANONICAL_MAX_TOKENS tokens.
+    canonical = " ".join(keep[:_CANONICAL_MAX_TOKENS])
+    return canonical if canonical else str(raw or "").strip()
 
 
 def annotation_candidates(raw: str) -> list[str]:
@@ -425,21 +524,6 @@ def load_label_map(
         return {}, stats
 
     v = vocab2id or {}
-    vl = vocab2id_lower or {}
-    embed_mapper = (
-        build_embed_id_mapper(
-            vocab2id=v,
-            label_embed_dir=label_embed_dir,
-            label_emb_dim=int(label_emb_dim),
-        )
-        if bool(use_embed_fallback)
-        else None
-    )
-    fallback_map = build_fallback_map(
-        fallback_csvs=fallback_csvs,
-        fallback_text_key=fallback_text_key,
-        split_name=split_name,
-    )
     out: dict[tuple[str, int], int] = {}
     with labels_csv.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -456,30 +540,11 @@ def load_label_map(
             if not label_text:
                 stats["missing_text"] += 1
             else:
-                label_id = vocab_id(label_text, v, vl)
+                label_id = direct_vocab_id(label_text, v)
                 if label_id >= 0:
                     stats["primary_mapped"] += 1
                 else:
                     stats["primary_unknown"] += 1
-
-            if label_id < 0:
-                if (embed_mapper is not None) and bool(label_text):
-                    stats["embed_fallback_considered"] += 1
-                    mapped = int(embed_mapper(label_text))
-                    if mapped >= 0:
-                        label_id = int(mapped)
-                        stats["embed_fallback_mapped"] += 1
-
-            if label_id < 0:
-                cands = fallback_map.get(key, [])
-                if cands:
-                    stats["fallback_considered"] += 1
-                    for cand in cands:
-                        cand_id = vocab_id(cand, v, vl)
-                        if cand_id >= 0:
-                            label_id = int(cand_id)
-                            stats["fallback_mapped"] += 1
-                            break
 
             if label_id >= 0:
                 stats["mapped"] += 1
@@ -673,7 +738,6 @@ def load_test_label_map(
         return {}, {}, {}, stats
 
     v = vocab2id or {}
-    vl = vocab2id_lower or {}
     id_map: dict[str, int] = {}
     text_map: dict[str, str] = {}
     multi_id_map: dict[str, list[int]] = {}
@@ -692,7 +756,7 @@ def load_test_label_map(
             t_multi = str(row.get("gaze_gt_labels", "")).strip()
 
             chosen_text = t_primary
-            chosen_id = vocab_id(t_primary, v, vl)
+            chosen_id = direct_vocab_id(t_primary, v)
             if not t_primary:
                 stats["missing_text"] += 1
                 chosen_id = -100
@@ -702,16 +766,11 @@ def load_test_label_map(
                 stats["mapped"] += 1
                 chosen_id = int(chosen_id)
 
-            # Parse multi-labels independently of primary mapping result so that
-            # samples with a failed primary lookup can still contribute to multiacc@1.
             parsed_multi: list[int] = []
-            if t_multi:
-                parsed = [vocab_id(x.strip(), v, vl) for x in t_multi.split("-") if x.strip()]
+            if t_multi and chosen_id >= 0:
+                parsed = [direct_vocab_id(x.strip(), v) for x in t_multi.split("-") if x.strip()]
                 parsed_multi = sorted({int(x) for x in parsed if int(x) >= 0})
-            # Always include the primary ID when valid (ensures acc@1 ⊆ multiacc@1).
             if chosen_id >= 0:
-                if chosen_id not in parsed_multi:
-                    parsed_multi = sorted(set(parsed_multi) | {int(chosen_id)})
                 if not parsed_multi:
                     parsed_multi = [int(chosen_id)]
 
@@ -877,11 +936,23 @@ def load_test_groups(
                 image_path=image_path,
                 bbox_px=bbox,
                 gt_points=[],
-                label_id=int((test_label_map or {}).get(image_rel, -100)),
-                label_text=str((test_label_text_map or {}).get(image_rel, "")),
-                label_ids=list((test_label_ids_map or {}).get(image_rel, [])),
             )
         grouped[key].gt_points.append((gaze_x, gaze_y))
+
+    # test label CSV is keyed only by image path. To avoid cross-head label
+    # contamination, only attach those path-level labels when the annotation
+    # file contains exactly one bbox-group for that image. If multiple bbox
+    # groups exist under the same image path, leave labels unset (-100 / empty).
+    group_counts_by_image: dict[str, int] = {}
+    for image_rel, _bbox_key in grouped.keys():
+        group_counts_by_image[image_rel] = int(group_counts_by_image.get(image_rel, 0)) + 1
+
+    for (image_rel, _bbox_key), group in grouped.items():
+        if int(group_counts_by_image.get(image_rel, 0)) != 1:
+            continue
+        group.label_id = int((test_label_map or {}).get(image_rel, -100))
+        group.label_text = str((test_label_text_map or {}).get(image_rel, ""))
+        group.label_ids = list((test_label_ids_map or {}).get(image_rel, []))
 
     groups = [g for g in grouped.values() if g.gt_points]
     for g in groups:

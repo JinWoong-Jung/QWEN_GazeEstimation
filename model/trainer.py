@@ -41,7 +41,6 @@ from .utils.config_parser import (
     output_dir_from_run_name,
 )
 from .utils.data_utils import (
-    build_split_bank,
     build_vocab_embedding_matrix,
     load_label_map,
     load_label_text_map,
@@ -70,27 +69,6 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 def resolve_path(path: str) -> Path:
     p = Path(path)
     return p if p.is_absolute() else ROOT / p
-
-
-def _unique_split_bank_inputs(
-    text_map: dict[Any, str],
-    vocab2id: dict[str, int],
-    vocab2id_lower: dict[str, int],
-) -> tuple[list[str], list[int]]:
-    """Extract unique (label_text, canonical_vocab_id) pairs from a label_text_map.
-
-    Vocabulary lookup uses vocab2id first, then vocab2id_lower as fallback.
-    Labels not found in either map get canonical_id = -1; they will be included
-    in the bank embeddings but excluded from metric evaluation by the caller.
-    """
-    seen: dict[str, int] = {}
-    for txt in text_map.values():
-        txt = str(txt or "").strip()
-        if not txt or txt in seen:
-            continue
-        cid = int(vocab2id.get(txt, vocab2id_lower.get(txt.lower(), -1)))
-        seen[txt] = cid
-    return list(seen.keys()), list(seen.values())
 
 
 def set_seed(seed: int) -> None:
@@ -272,7 +250,7 @@ def maybe_save_generation_preview(
         show_tqdm=bool(args.show_tqdm),
         desc="Test preview",
         max_new_tokens=int(args.generation_max_new_tokens),
-        num_beams=int(getattr(args, "generation_num_beams", 3)),
+        num_beams=int(getattr(args, "generation_num_beams", 1)),
         repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
         no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
         max_samples=preview_n,
@@ -459,21 +437,9 @@ def main() -> None:
 
         clip_encoder = CLIPTextEncoder(model_path=clip_model_path, device=device)
 
-        # Build test split-specific bank (bank row index != label id; use bank_canonical_ids to map back)
-        _test_bank_texts_raw, _test_bank_ids_raw = _unique_split_bank_inputs(
-            test_label_text_map, vocab2id, vocab2id_lower,
-        )
-        test_split_bank_texts, test_split_bank_ids, test_split_bank_embs = build_split_bank(
-            label_texts=_test_bank_texts_raw,
-            canonical_ids=_test_bank_ids_raw,
-            label_embed_dir=label_embed_dir,
-            embedding_dim=int(object_embedding_dim),
-            normalize=True,
-        )
         print(
-            f"[INFO] test split bank: unique_labels={len(_test_bank_texts_raw)} "
-            f"with_embeddings={len(test_split_bank_texts)} "
-            f"shape={tuple(test_split_bank_embs.shape)}"
+            "[INFO] object evaluation bank: "
+            f"global_vocab={num_classes} shape={tuple(retrieval_label_embedding_bank.shape)}"
         )
 
         test_groups = load_test_groups(
@@ -522,18 +488,17 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=test_split_bank_embs.to(device=device),
-                retrieval_label_texts=test_split_bank_texts,
+                label_embedding_bank=retrieval_label_embedding_bank.to(device=device),
+                retrieval_label_texts=retrieval_label_texts,
                 retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
-                num_beams=int(getattr(args, "generation_num_beams", 3)),
+                num_beams=int(getattr(args, "generation_num_beams", 1)),
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
-                bank_canonical_ids=test_split_bank_ids,
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
@@ -550,12 +515,11 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=test_split_bank_embs.to(device=device),
-                retrieval_label_texts=test_split_bank_texts,
+                label_embedding_bank=retrieval_label_embedding_bank.to(device=device),
+                retrieval_label_texts=retrieval_label_texts,
                 retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
-                bank_canonical_ids=test_split_bank_ids,
             )
 
         elapsed = time.time() - start_time
@@ -568,24 +532,14 @@ def main() -> None:
         vocab2id=vocab2id,
         vocab2id_lower=vocab2id_lower,
         text_key="gaze_pseudo_label",
-        label_embed_dir=label_embed_dir,
-        label_emb_dim=int(object_embedding_dim),
-        use_embed_fallback=True,
-        fallback_csvs=[labels_rgs, labels_ssa],
-        fallback_text_key="annotation",
-        split_name="train",
+        use_embed_fallback=False,
     )
     val_label_map, val_label_stats = load_label_map(
         val_labels,
         vocab2id=vocab2id,
         vocab2id_lower=vocab2id_lower,
         text_key="gaze_pseudo_label",
-        label_embed_dir=label_embed_dir,
-        label_emb_dim=int(object_embedding_dim),
-        use_embed_fallback=True,
-        fallback_csvs=[labels_rgs, labels_ssa],
-        fallback_text_key="annotation",
-        split_name="validation",
+        use_embed_fallback=False,
     )
 
     train_label_text_map, train_label_text_stats = load_label_text_map(
@@ -604,9 +558,7 @@ def main() -> None:
         "[INFO] train label id coverage: "
         f"rows={train_label_stats['rows']} mapped={train_label_stats['mapped']} "
         f"missing_text={train_label_stats['missing_text']} unknown_text={train_label_stats['unknown_text']} "
-        f"primary_mapped={train_label_stats.get('primary_mapped', 0)} "
-        f"embed_fallback_mapped={train_label_stats.get('embed_fallback_mapped', 0)} "
-        f"csv_fallback_mapped={train_label_stats.get('fallback_mapped', 0)}"
+        f"primary_mapped={train_label_stats.get('primary_mapped', 0)}"
     )
     print(
         "[INFO] val label id coverage: "
@@ -619,39 +571,9 @@ def main() -> None:
         f"missing_text={test_label_stats['missing_text']} unknown_text={test_label_stats['unknown_text']} "
         f"conflicts={test_label_stats['conflicts']}"
     )
-
-    # Build split-specific retrieval banks for val and test.
-    # bank row index != label id; bank_canonical_ids carries the vocab id mapping.
-    _val_bank_texts_raw, _val_bank_ids_raw = _unique_split_bank_inputs(
-        val_label_text_map, vocab2id, vocab2id_lower,
-    )
-    val_split_bank_texts, val_split_bank_ids, val_split_bank_embs = build_split_bank(
-        label_texts=_val_bank_texts_raw,
-        canonical_ids=_val_bank_ids_raw,
-        label_embed_dir=label_embed_dir,
-        embedding_dim=int(object_embedding_dim),
-        normalize=True,
-    )
     print(
-        f"[INFO] val split bank: unique_labels={len(_val_bank_texts_raw)} "
-        f"with_embeddings={len(val_split_bank_texts)} "
-        f"shape={tuple(val_split_bank_embs.shape)}"
-    )
-
-    _test_bank_texts_raw, _test_bank_ids_raw = _unique_split_bank_inputs(
-        test_label_text_map, vocab2id, vocab2id_lower,
-    )
-    test_split_bank_texts, test_split_bank_ids, test_split_bank_embs = build_split_bank(
-        label_texts=_test_bank_texts_raw,
-        canonical_ids=_test_bank_ids_raw,
-        label_embed_dir=label_embed_dir,
-        embedding_dim=int(object_embedding_dim),
-        normalize=True,
-    )
-    print(
-        f"[INFO] test split bank: unique_labels={len(_test_bank_texts_raw)} "
-        f"with_embeddings={len(test_split_bank_texts)} "
-        f"shape={tuple(test_split_bank_embs.shape)}"
+        "[INFO] object evaluation bank: "
+        f"global_vocab={num_classes} shape={tuple(retrieval_label_embedding_bank.shape)}"
     )
 
     train_records = load_records(
@@ -940,7 +862,6 @@ def main() -> None:
                                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "train/grad_norm": grad_norm_value,
                                 "train/epoch": epoch_progress,
-                                "train/epoch_percent": float(current_train_bucket),
                             },
                             step=global_step,
                         )
@@ -989,18 +910,17 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=val_split_bank_embs.to(device=device),
-                retrieval_label_texts=val_split_bank_texts,
+                label_embedding_bank=retrieval_label_embedding_bank.to(device=device),
+                retrieval_label_texts=retrieval_label_texts,
                 retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"ValMetric {epoch}/{args.epochs}",
                 max_new_tokens=int(args.generation_max_new_tokens),
-                num_beams=int(getattr(args, "generation_num_beams", 3)),
+                num_beams=int(getattr(args, "generation_num_beams", 1)),
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
-                bank_canonical_ids=val_split_bank_ids,
             )
 
         epoch_msg = (
@@ -1084,18 +1004,17 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=val_split_bank_embs.to(device=device),
-                retrieval_label_texts=val_split_bank_texts,
+                label_embedding_bank=retrieval_label_embedding_bank.to(device=device),
+                retrieval_label_texts=retrieval_label_texts,
                 retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Eval metrics (checkpoint)",
                 max_new_tokens=int(args.generation_max_new_tokens),
-                num_beams=int(getattr(args, "generation_num_beams", 3)),
+                num_beams=int(getattr(args, "generation_num_beams", 1)),
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
-                bank_canonical_ids=val_split_bank_ids,
             )
         print(f"[EVAL] val_loss={best_val_loss:.6f}")
         if wandb_run is not None:
@@ -1168,18 +1087,17 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=test_split_bank_embs.to(device=device),
-                retrieval_label_texts=test_split_bank_texts,
+                label_embedding_bank=retrieval_label_embedding_bank.to(device=device),
+                retrieval_label_texts=retrieval_label_texts,
                 retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
-                num_beams=int(getattr(args, "generation_num_beams", 3)),
+                num_beams=int(getattr(args, "generation_num_beams", 1)),
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
-                bank_canonical_ids=test_split_bank_ids,
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
@@ -1196,12 +1114,11 @@ def main() -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 processor=processor,
-                label_embedding_bank=test_split_bank_embs.to(device=device),
-                retrieval_label_texts=test_split_bank_texts,
+                label_embedding_bank=retrieval_label_embedding_bank.to(device=device),
+                retrieval_label_texts=retrieval_label_texts,
                 retrieval_top_k=int(retrieval_top_k),
                 clip_encoder=clip_encoder,
                 object_temperature=object_temperature,
-                bank_canonical_ids=test_split_bank_ids,
             )
 
     finish_wandb(wandb_run)

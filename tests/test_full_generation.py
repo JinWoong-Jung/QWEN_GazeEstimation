@@ -1,12 +1,10 @@
-"""Tests for the full-generation + retrieval-auxiliary refactoring.
+"""Tests for the full-generation + CLIP-retrieval evaluation path.
 
 Covers:
 - object_label_span() finds pure-text label spans
-- parse_target_spans() uses object_label_span (not just slot_span)
 - format_target_text() produces pure-text answers
-- answer_mask covers the full answer; object_mask covers just the label
 - parse_object_text() extracts generated label strings
-- label_bank canonicalization helpers
+- generated object text is CLIP-encoded and retrieved against the label bank
 """
 from __future__ import annotations
 
@@ -19,13 +17,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+from PIL import Image
 
 from model.utils.object_tokens import OBJ_SLOT, object_label_span
-from model.utils.data_utils import build_split_bank
+from model.utils.data_utils import (
+    build_split_bank,
+    load_label_map,
+    load_test_groups,
+    load_test_label_map,
+)
 from model.utils.eval_utils import (
-    clean_retrieval_text,
     collect_generation_samples,
-    expand_retrieval_candidates,
     parse_object_text,
     run_test_metrics,
     topk_similarity,
@@ -96,54 +98,6 @@ class TestParseObjectText(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Retrieval text cleaning / candidate expansion
-# ---------------------------------------------------------------------------
-
-class TestRetrievalTextCleaning(unittest.TestCase):
-
-    def test_clean_removes_duplicate_tokens(self) -> None:
-        self.assertEqual(clean_retrieval_text("chair chair chair"), "chair")
-
-    def test_clean_removes_repeated_ngram_cycle(self) -> None:
-        self.assertEqual(
-            clean_retrieval_text("laptop screen laptop screen"),
-            "laptop screen",
-        )
-
-    def test_clean_handles_special_cases(self) -> None:
-        self.assertEqual(clean_retrieval_text("  !!!  "), "")
-        self.assertEqual(clean_retrieval_text("  CHAIR, chair.  "), "chair")
-
-
-class TestExpandRetrievalCandidates(unittest.TestCase):
-
-    def test_candidate_count_for_three_tokens(self) -> None:
-        cands = expand_retrieval_candidates("computer laptop screen")
-        # full(1) + uni(3) + bi(2) + tri(1, duplicate of full) = 6 unique
-        self.assertEqual(len(cands), 6)
-        self.assertEqual(
-            cands,
-            [
-                "computer laptop screen",
-                "computer",
-                "laptop",
-                "screen",
-                "computer laptop",
-                "laptop screen",
-            ],
-        )
-
-    def test_sliding_ngrams_present(self) -> None:
-        cands = expand_retrieval_candidates("red green blue yellow")
-        self.assertEqual(len(cands), 10)  # 1 + 4 + 3 + 2
-        self.assertIn("red green", cands)
-        self.assertIn("green blue", cands)
-        self.assertIn("blue yellow", cands)
-        self.assertIn("red green blue", cands)
-        self.assertIn("green blue yellow", cands)
-
-
-# ---------------------------------------------------------------------------
 # Split bank construction
 # ---------------------------------------------------------------------------
 
@@ -176,6 +130,82 @@ class TestBuildSplitBank(unittest.TestCase):
         self.assertEqual(len(bank_ids), int(bank_embs.shape[0]))
         norms = bank_embs.norm(dim=1)
         self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=1e-5))
+
+
+# ---------------------------------------------------------------------------
+# Test group loading
+# ---------------------------------------------------------------------------
+
+class TestLoadTestGroups(unittest.TestCase):
+
+    def test_path_level_label_attached_for_single_bbox_group(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            image_root = root / "images"
+            img_rel = "test2/00000000/00000001.jpg"
+            img_path = image_root / "00000000/00000001.jpg"
+            img_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (32, 32), color="white").save(img_path)
+
+            ann = root / "test_ann.txt"
+            ann.write_text(
+                (
+                    "test2/00000000/00000001.jpg,1,0,0,0,0,0,0,0.25,0.75,10,20,30,40,pascal,img.jpg\n"
+                    "test2/00000000/00000001.jpg,2,0,0,0,0,0,0,0.35,0.65,10,20,30,40,pascal,img.jpg\n"
+                ),
+                encoding="utf-8",
+            )
+
+            groups = load_test_groups(
+                annotation_file=ann,
+                image_root=image_root,
+                test_label_map={img_rel: 42},
+                test_label_text_map={img_rel: "laptop"},
+                test_label_ids_map={img_rel: [42, 99]},
+                split_prefix="test2/",
+                strip_split_prefix=True,
+                bbox_round_decimals=3,
+            )
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].label_id, 42)
+        self.assertEqual(groups[0].label_text, "laptop")
+        self.assertEqual(groups[0].label_ids, [42, 99])
+        self.assertEqual(len(groups[0].gt_points), 2)
+
+    def test_path_level_label_dropped_for_ambiguous_multi_bbox_image(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            image_root = root / "images"
+            img_rel = "test2/00000000/00000002.jpg"
+            img_path = image_root / "00000000/00000002.jpg"
+            img_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (32, 32), color="white").save(img_path)
+
+            ann = root / "test_ann.txt"
+            ann.write_text(
+                (
+                    "test2/00000000/00000002.jpg,1,0,0,0,0,0,0,0.25,0.75,10,20,30,40,pascal,img.jpg\n"
+                    "test2/00000000/00000002.jpg,2,0,0,0,0,0,0,0.35,0.65,11,21,31,41,pascal,img.jpg\n"
+                ),
+                encoding="utf-8",
+            )
+
+            groups = load_test_groups(
+                annotation_file=ann,
+                image_root=image_root,
+                test_label_map={img_rel: 7},
+                test_label_text_map={img_rel: "chair"},
+                test_label_ids_map={img_rel: [7, 8]},
+                split_prefix="test2/",
+                strip_split_prefix=True,
+                bbox_round_decimals=3,
+            )
+
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(int(g.label_id) < 0 for g in groups))
+        self.assertTrue(all(str(g.label_text) == "" for g in groups))
+        self.assertTrue(all(list(g.label_ids) == [] for g in groups))
 
 
 # ---------------------------------------------------------------------------
@@ -243,14 +273,14 @@ class TestFormatTargetText(unittest.TestCase):
             vocab2id={"television": 0},
             vocab2id_lower={"television": 0},
             num_classes=5,
-            answer_template="Point: {point_x} {point_y}\nObject: {label_text}",
+            answer_template="Point:{point_x},{point_y}\nObject:{label_text}",
             fallback_target_text="unknown",
             point_x=0.423,
             point_y=0.711,
             point_decimals=4,
         )
         self.assertIn("Point:", text)
-        self.assertIn("Object: television", text)
+        self.assertIn("Object:television", text)
         self.assertNotIn("<obj_emb>", text)
         self.assertEqual(valid, 1.0)
 
@@ -273,6 +303,90 @@ class TestFormatTargetText(unittest.TestCase):
         # fallback should include "chair", not OBJ_SLOT
         self.assertIn("chair", text)
         self.assertNotIn("<obj_emb>", text)
+
+    def test_missing_required_template_fields_falls_back_to_default_format(self) -> None:
+        from model.datasets import format_target_text
+        text, _ = format_target_text(
+            label_text="chair",
+            label_id=1,
+            id2label=None,
+            vocab2id={"chair": 1},
+            vocab2id_lower={"chair": 1},
+            num_classes=10,
+            answer_template="Point:<x>,<y>\nObject:{label_text}",
+            fallback_target_text="unknown",
+            point_x=0.5,
+            point_y=0.25,
+            point_decimals=4,
+        )
+        self.assertEqual(text, "Point:0.5000,0.2500\nObject:chair")
+
+    def test_raw_label_text_is_preserved(self) -> None:
+        from model.datasets import format_target_text
+        text, _ = format_target_text(
+            label_text="the laptop computer",
+            label_id=-100,
+            id2label=None,
+            vocab2id={},
+            vocab2id_lower={},
+            num_classes=346,
+            answer_template="Point:{point_x},{point_y}\nObject:{label_text}",
+            fallback_target_text="unknown",
+            point_x=0.5,
+            point_y=0.25,
+            point_decimals=4,
+        )
+        self.assertEqual(text, "Point:0.5000,0.2500\nObject:the laptop computer")
+
+
+class TestSemgazeStyleLabelMapping(unittest.TestCase):
+
+    def test_train_label_map_uses_direct_vocab_lookup_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            labels_csv = root / "gaze-labels-train.csv"
+            labels_csv.write_text(
+                "path,id,split,gaze_pseudo_label,label_id\n"
+                "train/a.jpg,1,train,chair,0\n"
+                "train/b.jpg,2,train,Chair,0\n",
+                encoding="utf-8",
+            )
+
+            label_map, stats = load_label_map(
+                labels_csv=labels_csv,
+                vocab2id={"chair": 7},
+                vocab2id_lower={"chair": 7},
+                text_key="gaze_pseudo_label",
+                use_embed_fallback=False,
+            )
+
+        self.assertEqual(label_map[("train/a.jpg", 1)], 7)
+        self.assertEqual(label_map[("train/b.jpg", 2)], -100)
+        self.assertEqual(int(stats["mapped"]), 1)
+        self.assertEqual(int(stats["unknown_text"]), 1)
+        self.assertEqual(int(stats["embed_fallback_mapped"]), 0)
+        self.assertEqual(int(stats["fallback_mapped"]), 0)
+
+    def test_test_label_map_keeps_multi_labels_without_forcing_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            labels_csv = root / "gaze-labels-test.csv"
+            labels_csv.write_text(
+                "path,eyes_closed,outside_frame,uncertain,gaze_gt_labels,gaze_gt_label,label_id,test_label_id\n"
+                "test2/a.jpg,False,False,False,book-table,chair,0,0\n",
+                encoding="utf-8",
+            )
+
+            id_map, text_map, multi_id_map, stats = load_test_label_map(
+                labels_csv=labels_csv,
+                vocab2id={"chair": 1, "book": 2, "table": 3},
+                vocab2id_lower={"chair": 1, "book": 2, "table": 3},
+            )
+
+        self.assertEqual(id_map["test2/a.jpg"], 1)
+        self.assertEqual(text_map["test2/a.jpg"], "chair")
+        self.assertEqual(multi_id_map["test2/a.jpg"], [2, 3])
+        self.assertEqual(int(stats["mapped"]), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +445,7 @@ class _PreviewTokenizer:
         del skip_special_tokens
         seq = ids.tolist() if torch.is_tensor(ids) else list(ids)
         if seq == [10, 11, 12, 13, 14]:
-            return "Point: 0.1000 0.2000\nObject: chair"
+            return "Point:0.1000,0.2000\nObject:chair"
         return ""
 
 
@@ -360,35 +474,31 @@ class _PreviewClipEncoder:
         return torch.stack(rows, dim=0)
 
 
-class _CandidateE2ETokenizer:
+class _RetrievalE2ETokenizer:
     def decode(self, ids: torch.Tensor, skip_special_tokens: bool = False) -> str:
         del skip_special_tokens
         seq = ids.tolist() if torch.is_tensor(ids) else list(ids)
         if seq == [10, 11, 12, 13, 14]:
-            # "computer laptop" alone is biased to wrong bank row in mock encoder.
-            # Candidate expansion must include "laptop" unigram to recover acc@1.
-            return "Point: 0.1000 0.2000\nObject: computer laptop laptop"
+            return "Point:0.1000,0.2000\nObject:laptop"
         return ""
 
 
-class _CandidateE2EProcessor:
+class _RetrievalE2EProcessor:
     def __init__(self) -> None:
-        self.tokenizer = _CandidateE2ETokenizer()
+        self.tokenizer = _RetrievalE2ETokenizer()
 
 
-class _CandidateE2EModel(torch.nn.Module):
+class _RetrievalE2EModel(torch.nn.Module):
     def generate(self, joint_inputs: dict[str, torch.Tensor], **_: object) -> torch.Tensor:
         bsz = int(joint_inputs["input_ids"].shape[0])
         rows = [[1, 2, 10, 11, 12, 13, 14] for _ in range(bsz)]
         return torch.tensor(rows, dtype=torch.long)
 
 
-class _CandidateE2EClipEncoder:
+class _RetrievalE2EClipEncoder:
     def encode(self, texts: list[str | None]) -> torch.Tensor:
         mapping = {
-            "computer laptop": torch.tensor([1.0, 0.0], dtype=torch.float32),  # wrong row if alone
-            "computer": torch.tensor([0.9, 0.0], dtype=torch.float32),
-            "laptop": torch.tensor([0.0, 2.0], dtype=torch.float32),  # rescuing candidate
+            "laptop": torch.tensor([0.0, 2.0], dtype=torch.float32),
         }
         rows = [mapping.get(str(text), torch.zeros(2, dtype=torch.float32)) for text in texts]
         return torch.stack(rows, dim=0)
@@ -403,7 +513,7 @@ class TestGenerationPreview(unittest.TestCase):
                     "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
                 },
                 "text_input": ["Locate the gaze target."],
-                "target_text": ["Point: 0.1000 0.2000\nObject: chair"],
+                "target_text": ["Point:0.1000,0.2000\nObject:chair"],
                 "target_text_valid": torch.tensor([1.0], dtype=torch.float32),
                 "target_label": torch.tensor([1], dtype=torch.long),
                 "target_label_ids": [[1]],
@@ -436,7 +546,7 @@ class TestGenerationPreview(unittest.TestCase):
         )
         self.assertEqual(len(samples), 1)
         sample = samples[0]
-        self.assertEqual(sample["generated_text"], "Point: 0.1000 0.2000\nObject: chair")
+        self.assertEqual(sample["generated_text"], "Point:0.1000,0.2000\nObject:chair")
         self.assertEqual(sample["parsed_object_text"], "chair")
         self.assertEqual(sample["retrieved_topk_ids"][0], 1)
         self.assertEqual(sample["retrieved_topk_labels"][0], "chair")
@@ -445,16 +555,16 @@ class TestGenerationPreview(unittest.TestCase):
         self.assertTrue(bool(sample["exact_match"]))
 
 
-class TestSplitBankCandidateExpansionE2E(unittest.TestCase):
+class TestObjectRetrievalE2E(unittest.TestCase):
 
-    def test_acc1_uses_split_bank_ids_with_candidate_expansion(self) -> None:
+    def test_acc1_uses_bank_canonical_ids(self) -> None:
         loader = [
             {
                 "joint_inputs": {
                     "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
                     "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
                 },
-                "target_text": ["Point: 0.1000 0.2000\nObject: laptop"],
+                "target_text": ["Point:0.1000,0.2000\nObject:laptop"],
                 "target_text_valid": torch.tensor([1.0], dtype=torch.float32),
                 "target_label": torch.tensor([42], dtype=torch.long),  # canonical label id
                 "target_label_ids": [[42]],
@@ -463,11 +573,11 @@ class TestSplitBankCandidateExpansionE2E(unittest.TestCase):
         ]
 
         metrics = run_test_metrics(
-            model=_CandidateE2EModel(),
+            model=_RetrievalE2EModel(),
             loader=loader,
             device=torch.device("cpu"),
             amp_dtype=torch.float32,
-            processor=_CandidateE2EProcessor(),
+            processor=_RetrievalE2EProcessor(),
             label_embedding_bank=torch.tensor(
                 [
                     [1.0, 0.0],  # bank row 0 -> canonical id 7
@@ -477,7 +587,7 @@ class TestSplitBankCandidateExpansionE2E(unittest.TestCase):
             ),
             retrieval_label_texts=["mug", "laptop"],
             retrieval_top_k=2,
-            clip_encoder=_CandidateE2EClipEncoder(),
+            clip_encoder=_RetrievalE2EClipEncoder(),
             object_temperature=0.07,
             show_tqdm=False,
             max_new_tokens=8,
