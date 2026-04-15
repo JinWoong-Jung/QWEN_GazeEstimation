@@ -128,9 +128,13 @@ def parse_point(text: str) -> tuple[float, float] | None:
     if m is None:
         return None
     try:
-        return float(m.group(1)), float(m.group(2))
+        x = float(m.group(1))
+        y = float(m.group(2))
     except Exception:
         return None
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+        return None
+    return x, y
 
 
 def decode_generated(
@@ -408,8 +412,8 @@ def run_test_metrics(
                     gt_id = int(target_label[i].item())
 
                 gt_multi_ids: set[int] = set()
-                if isinstance(target_label_ids, list) and i < len(target_label_ids):
-                    gt_multi_ids = {int(x) for x in target_label_ids[i] if int(x) >= 0}
+                if torch.is_tensor(target_label_ids) and i < int(target_label_ids.shape[0]):
+                    gt_multi_ids = {int(x) for x in target_label_ids[i].tolist() if int(x) >= 0}
                 if not gt_multi_ids and gt_id >= 0:
                     gt_multi_ids = {gt_id}
 
@@ -588,8 +592,8 @@ def collect_generation_samples(
                     gt_id = int(target_label[i].item())
 
                 gt_multi_ids: set[int] = set()
-                if isinstance(target_label_ids, list) and i < len(target_label_ids):
-                    gt_multi_ids = {int(x) for x in target_label_ids[i] if int(x) >= 0}
+                if torch.is_tensor(target_label_ids) and i < int(target_label_ids.shape[0]):
+                    gt_multi_ids = {int(x) for x in target_label_ids[i].tolist() if int(x) >= 0}
                 if not gt_multi_ids and gt_id >= 0:
                     gt_multi_ids = {gt_id}
 

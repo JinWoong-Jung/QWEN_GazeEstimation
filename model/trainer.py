@@ -116,7 +116,7 @@ def build_id2label(vocab2id: dict[str, int]) -> dict[int, str]:
 def count_valid_targets(records: list[Any]) -> int:
     n = 0
     for r in records:
-        label_id = int(getattr(r, "label_id", -100))
+        label_id = int(getattr(r, "label_id", -1))
         txt = str(getattr(r, "label_text", "") or "").strip()
         if (label_id >= 0) or bool(txt):
             n += 1

@@ -21,6 +21,7 @@ from PIL import Image
 
 from model.utils.object_tokens import OBJ_SLOT, object_label_span
 from model.utils.data_utils import (
+    build_prompt,
     build_split_bank,
     load_label_map,
     load_test_groups,
@@ -95,6 +96,18 @@ class TestParseObjectText(unittest.TestCase):
         # Extra whitespace / casing should still parse
         result = parse_object_text("  Point: 0.4 0.5  \n  Object:   chair  ")
         self.assertEqual(result, "chair")
+
+
+class TestBuildPrompt(unittest.TestCase):
+
+    def test_prompt_formats_bbox_and_point_decimals(self) -> None:
+        prompt = build_prompt(
+            (0.1, 0.2, 0.3, 0.4),
+            "",
+            "bbox=[{xmin:.2f}, {ymin:.2f}, {xmax:.2f}, {ymax:.2f}] decimals={point_decimals}",
+            point_decimals=2,
+        )
+        self.assertEqual(prompt, "bbox=[0.10, 0.20, 0.30, 0.40] decimals=2")
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +338,7 @@ class TestFormatTargetText(unittest.TestCase):
         from model.datasets import format_target_text
         text, _ = format_target_text(
             label_text="the laptop computer",
-            label_id=-100,
+            label_id=-1,
             id2label=None,
             vocab2id={},
             vocab2id_lower={},
@@ -337,6 +350,23 @@ class TestFormatTargetText(unittest.TestCase):
             point_decimals=4,
         )
         self.assertEqual(text, "Point:0.5000,0.2500\nObject:the laptop computer")
+
+    def test_answer_template_can_reference_point_decimals(self) -> None:
+        from model.datasets import format_target_text
+        text, _ = format_target_text(
+            label_text="chair",
+            label_id=1,
+            id2label=None,
+            vocab2id={"chair": 1},
+            vocab2id_lower={"chair": 1},
+            num_classes=10,
+            answer_template="Point:{point_x},{point_y}\nDecimals:{point_decimals}\nObject:{label_text}",
+            fallback_target_text="unknown",
+            point_x=0.5,
+            point_y=0.25,
+            point_decimals=2,
+        )
+        self.assertEqual(text, "Point:0.50,0.25\nDecimals:2\nObject:chair")
 
 
 class TestSemgazeStyleLabelMapping(unittest.TestCase):
@@ -361,7 +391,7 @@ class TestSemgazeStyleLabelMapping(unittest.TestCase):
             )
 
         self.assertEqual(label_map[("train/a.jpg", 1)], 7)
-        self.assertEqual(label_map[("train/b.jpg", 2)], -100)
+        self.assertEqual(label_map[("train/b.jpg", 2)], -1)
         self.assertEqual(int(stats["mapped"]), 1)
         self.assertEqual(int(stats["unknown_text"]), 1)
         self.assertEqual(int(stats["embed_fallback_mapped"]), 0)
@@ -516,7 +546,7 @@ class TestGenerationPreview(unittest.TestCase):
                 "target_text": ["Point:0.1000,0.2000\nObject:chair"],
                 "target_text_valid": torch.tensor([1.0], dtype=torch.float32),
                 "target_label": torch.tensor([1], dtype=torch.long),
-                "target_label_ids": [[1]],
+                "target_label_ids": torch.tensor([[1, -1, -1, -1, -1]], dtype=torch.long),
                 "gt_points": [torch.tensor([[0.1, 0.2]], dtype=torch.float32)],
                 "target_label_text": ["chair"],
                 "image_rel": ["test/image_0001.jpg"],
@@ -567,7 +597,7 @@ class TestObjectRetrievalE2E(unittest.TestCase):
                 "target_text": ["Point:0.1000,0.2000\nObject:laptop"],
                 "target_text_valid": torch.tensor([1.0], dtype=torch.float32),
                 "target_label": torch.tensor([42], dtype=torch.long),  # canonical label id
-                "target_label_ids": [[42]],
+                "target_label_ids": torch.tensor([[42, -1, -1, -1, -1]], dtype=torch.long),
                 "gt_points": [torch.tensor([[0.1, 0.2]], dtype=torch.float32)],
             }
         ]

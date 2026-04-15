@@ -8,6 +8,22 @@ from ..modules.preprocess import resize_scene
 from .common import chat_text
 
 
+_LABEL_IDS_PAD_LEN: int = 5
+
+
+def _pad_label_ids(ids_list: list[list[int]]) -> torch.Tensor:
+    """Convert a list of valid label-id lists to a [B, 5] tensor padded with -1.
+
+    Matches semgaze's fixed-length gaze_label_ids convention.
+    """
+    rows: list[list[int]] = []
+    for ids in ids_list:
+        truncated = ids[:_LABEL_IDS_PAD_LEN]
+        padded = truncated + [-1] * (_LABEL_IDS_PAD_LEN - len(truncated))
+        rows.append(padded)
+    return torch.tensor(rows, dtype=torch.long)
+
+
 def mask_padding_labels(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None,
@@ -252,10 +268,9 @@ class QwenTestCollator:
             "target_label": torch.tensor(
                 [int(x["target_label"]) for x in batch], dtype=torch.long
             ),
-            "target_label_ids": [
-                [int(v) for v in x.get("target_label_ids", []) if int(v) >= 0]
-                for x in batch
-            ],
+            "target_label_ids": _pad_label_ids(
+                [[int(v) for v in x.get("target_label_ids", []) if int(v) >= 0] for x in batch]
+            ),
             "target_point": torch.stack(
                 [x["target_point"] for x in batch], dim=0
             ).to(dtype=torch.float32),

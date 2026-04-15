@@ -48,13 +48,23 @@ def build_prompt(
     bbox_norm: tuple[float, float, float, float],
     prompt_template: str,
     prompt_text: str = "",
+    *,
+    point_decimals: int | None = None,
 ) -> str:
     xmin, ymin, xmax, ymax = bbox_norm
+    format_vars: dict[str, Any] = {
+        "xmin": float(xmin),
+        "ymin": float(ymin),
+        "xmax": float(xmax),
+        "ymax": float(ymax),
+    }
+    if point_decimals is not None:
+        format_vars["point_decimals"] = int(point_decimals)
     if prompt_template.strip():
-        return prompt_template.format(xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
+        return prompt_template.format(**format_vars)
     if prompt_text.strip():
         try:
-            return prompt_text.format(xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
+            return prompt_text.format(**format_vars)
         except Exception:
             return prompt_text
     raise ValueError(
@@ -234,10 +244,10 @@ def vocab_id(
     vocab2id_lower: dict[str, int] | None = None,
 ) -> int:
     if not label_text:
-        return -100
+        return -1
     txt = str(label_text).strip()
     if not txt:
-        return -100
+        return -1
     v = vocab2id or {}
     vl = vocab2id_lower or {}
     if txt in v:
@@ -245,7 +255,7 @@ def vocab_id(
     t2 = txt.lower()
     if t2 in vl:
         return int(vl[t2])
-    return -100
+    return -1
 
 
 def direct_vocab_id(
@@ -253,12 +263,12 @@ def direct_vocab_id(
     vocab2id: dict[str, int] | None = None,
 ) -> int:
     if not label_text:
-        return -100
+        return -1
     txt = str(label_text).strip()
     if not txt:
-        return -100
+        return -1
     v = vocab2id or {}
-    return int(v.get(txt, -100))
+    return int(v.get(txt, -1))
 
 
 def clean_label(txt: str) -> str:
@@ -467,31 +477,31 @@ def build_embed_id_mapper(
     def _map(label_text: str) -> int:
         txt = clean_label(label_text)
         if not txt:
-            return -100
+            return -1
         if txt in cache:
             return int(cache[txt])
         emb_path = embed_dir / f"{txt}-emb.pt"
         if not emb_path.exists():
-            cache[txt] = -100
-            return -100
+            cache[txt] = -1
+            return -1
         try:
             vec = torch.load(emb_path, map_location="cpu")
             if not torch.is_tensor(vec):
-                cache[txt] = -100
-                return -100
+                cache[txt] = -1
+                return -1
             q = vec.to(dtype=torch.float32).flatten()
             if int(q.numel()) != int(valid_bank.shape[1]):
-                cache[txt] = -100
-                return -100
+                cache[txt] = -1
+                return -1
             q = F.normalize(q.unsqueeze(0), p=2, dim=-1)
             sim = q @ valid_bank.t()
             j = int(torch.argmax(sim, dim=1).item())
-            mapped = int(valid_ids[j]) if 0 <= j < len(valid_ids) else -100
+            mapped = int(valid_ids[j]) if 0 <= j < len(valid_ids) else -1
             cache[txt] = int(mapped)
             return int(mapped)
         except Exception:
-            cache[txt] = -100
-            return -100
+            cache[txt] = -1
+            return -1
 
     return _map
 
@@ -536,7 +546,7 @@ def load_label_map(
             stats["rows"] += 1
             key = (path, sample_id)
             label_text = clean_label(str(row.get(text_key, "")))
-            label_id = -100
+            label_id = -1
             if not label_text:
                 stats["missing_text"] += 1
             else:
@@ -759,7 +769,7 @@ def load_test_label_map(
             chosen_id = direct_vocab_id(t_primary, v)
             if not t_primary:
                 stats["missing_text"] += 1
-                chosen_id = -100
+                chosen_id = -1
             elif chosen_id < 0:
                 stats["unknown_text"] += 1
             else:
@@ -821,7 +831,7 @@ class TestGroup:
     image_path: Path
     bbox_px: tuple[float, float, float, float]
     gt_points: list[tuple[float, float]]
-    label_id: int = -100
+    label_id: int = -1
     label_text: str = ""
     label_ids: list[int] = field(default_factory=list)
 
@@ -863,9 +873,9 @@ def load_records(
         if not is_normalized_point(gaze_x, gaze_y):
             continue
 
-        label_id = -100
+        label_id = -1
         if label_map is not None:
-            label_id = int(label_map.get((image_rel, sample_id), -100))
+            label_id = int(label_map.get((image_rel, sample_id), -1))
         label_text = ""
         if label_text_map is not None:
             label_text = str(label_text_map.get((image_rel, sample_id), "")).strip()
@@ -942,7 +952,7 @@ def load_test_groups(
     # test label CSV is keyed only by image path. To avoid cross-head label
     # contamination, only attach those path-level labels when the annotation
     # file contains exactly one bbox-group for that image. If multiple bbox
-    # groups exist under the same image path, leave labels unset (-100 / empty).
+    # groups exist under the same image path, leave labels unset (-1 / empty).
     group_counts_by_image: dict[str, int] = {}
     for image_rel, _bbox_key in grouped.keys():
         group_counts_by_image[image_rel] = int(group_counts_by_image.get(image_rel, 0)) + 1
@@ -950,7 +960,7 @@ def load_test_groups(
     for (image_rel, _bbox_key), group in grouped.items():
         if int(group_counts_by_image.get(image_rel, 0)) != 1:
             continue
-        group.label_id = int((test_label_map or {}).get(image_rel, -100))
+        group.label_id = int((test_label_map or {}).get(image_rel, -1))
         group.label_text = str((test_label_text_map or {}).get(image_rel, ""))
         group.label_ids = list((test_label_ids_map or {}).get(image_rel, []))
 

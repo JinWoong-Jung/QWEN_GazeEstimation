@@ -50,8 +50,8 @@ eval:
   checkpoint_monitor_mode: "auto"  # auto | min | max
   generation_max_new_tokens: 26   # April 9 point path used a slightly longer budget for the two-line answer
   generation_num_beams: 1        # single-pass generation for the two-line answer
-  repetition_penalty: 1.15
-  no_repeat_ngram_size: 2
+  repetition_penalty: 1.0
+  no_repeat_ngram_size: 0
   test_retrieval_top_k: 3
   clip_model1_path: "openai/clip-vit-base-patch32"
   object_embedding_dim: 512
@@ -59,19 +59,17 @@ eval:
 
 prompt:
   visual_prompting: true
-  point_decimals: 4
+  point_decimals: 2
   prompt_template: ""
-  answer_template: "Point:{point_x},{point_y}\nObject:{label_text}"
+  answer_template: "Point: {point_x} {point_y}\nObject: {label_text}"
   fallback_target_text: "unknown"
   prompt_text: |
-    Given the highlighted subject, estimate the gaze point and the object being looked at.
-    Subject head bbox [xmin,ymin,xmax,ymax] (normalized): [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]
+    Given the highlighted subject([{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]), estimate the gaze point and the object being looked at.
     Predict x and y as normalized coordinates between 0 and 1, each rounded to exactly {point_decimals} decimal places.
-    Answer the object as a simple noun or short noun phrase only.
-    Output EXACTLY two lines in this exact format:
+    For the object, output only one simple object name, and must be a short noun phrase of at most 2 words.
+    Output EXACTLY two lines:
     Point:x,y
     Object:<object name>
-    Do not output any extra text, symbols, or lines.
 
 model:
   attn_implementation: "sdpa"
@@ -89,7 +87,7 @@ wandb:
   enabled: true
   project: "gaze_mllm"
   entity: "semgaze"
-  run_name: "baseline"
+  run_name: "base_2decimals"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

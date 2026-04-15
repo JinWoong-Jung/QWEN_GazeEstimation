@@ -87,7 +87,12 @@ def format_target_text(
     if any(field not in tpl for field in required_fields):
         tpl = "Point:{point_x},{point_y}\nObject:{label_text}"
     try:
-        text = tpl.format(label_text=template_label, point_x=px, point_y=py)
+        text = tpl.format(
+            label_text=template_label,
+            point_x=px,
+            point_y=py,
+            point_decimals=dec,
+        )
     except Exception:
         text = f"Point:{px},{py}\nObject:{template_label}"
     return str(text), float(is_valid)
@@ -181,7 +186,12 @@ class GazeDataset(Dataset):
         if self.visual_prompting:
             scene = draw_head_bbox_prompt(scene, x1=x1, y1=y1, x2=x2, y2=y2)
         bbox_norm = (x1 / w, y1 / h, x2 / w, y2 / h)
-        prompt = build_prompt(bbox_norm, self.prompt_template, self.prompt_text)
+        prompt = build_prompt(
+            bbox_norm,
+            self.prompt_template,
+            self.prompt_text,
+            point_decimals=self.point_decimals,
+        )
         resolved_label_text = str(rec.label_text or "").strip()
         if (not resolved_label_text) and int(rec.label_id) >= 0:
             resolved_label_text = str(self.id2label.get(int(rec.label_id), "")).strip()
@@ -271,7 +281,12 @@ class GazeTestDataset(Dataset):
         if self.visual_prompting:
             scene = draw_head_bbox_prompt(scene, x1=x1, y1=y1, x2=x2, y2=y2)
         bbox_norm = (x1 / w, y1 / h, x2 / w, y2 / h)
-        prompt = build_prompt(bbox_norm, self.prompt_template, self.prompt_text)
+        prompt = build_prompt(
+            bbox_norm,
+            self.prompt_template,
+            self.prompt_text,
+            point_decimals=self.point_decimals,
+        )
         if g.gt_points:
             px = sum(float(x) for x, _ in g.gt_points) / float(len(g.gt_points))
             py = sum(float(y) for _, y in g.gt_points) / float(len(g.gt_points))
