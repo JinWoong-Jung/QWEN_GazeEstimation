@@ -1,5 +1,5 @@
 paths:
-  model_path: "model/Qwen3-VL-4B-Instruct"
+  model_path: "model/Qwen3-VL-4B-Instruct" # model/Qwen3-VL-4B-Instruct or model/Qwen3-VL-2B-Instruct
   output_dir: "checkpoints"
   image_root: "data/gazefollow_extended/train"
   train_ann: "data/gazefollow/train_annotations_new.txt"
@@ -12,11 +12,13 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
-  label_embed_dir: "data/gazefollow/label-embeds_new"
 
 data:
+  image_resize_mode: "fixed"  # "native" | "fixed"
   scene_h: 512
   scene_w: 512
+  min_pixels: 12544
+  max_pixels: 524288   # 2560 * 28 * 28 / 4 ≈ 512-tile budget
   image_cache_size: 1000
   split_prefix: "train/"
   strip_split_prefix: true
@@ -37,6 +39,8 @@ train:
   weight_decay: 0.01
   warmup_ratio: 0.05
   max_grad_norm: 1.0
+  train_stage: "sft"  # sft | rl
+  filter_invalid_object_samples: false
 
 eval:
   test_batch_size: 8
@@ -46,30 +50,27 @@ eval:
   run_test: true
   run_val_metrics: true
   run_val_metrics_every_n_epochs: 1
-  checkpoint_monitor: "val_dist"  # val_loss | val_dist | val_acc@1 | val_acc@3 | val_multiacc@1
-  checkpoint_monitor_mode: "auto"  # auto | min | max
-  generation_max_new_tokens: 26   # April 9 point path used a slightly longer budget for the two-line answer
-  generation_num_beams: 1        # single-pass generation for the two-line answer
+  checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
+  checkpoint_monitor_mode: "auto"     # auto | min | max
+  generation_max_new_tokens: 16       # <|im_start|> Point: <loc><loc>\nObject: <obj><|im_end|> ≈ 12 tokens + buffer
+  generation_num_beams: 1
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
-  test_retrieval_top_k: 3
-  clip_model1_path: "openai/clip-vit-base-patch32"
-  object_embedding_dim: 512
-  object_temperature: 0.07
+  generation_stop_at_object_end: true
 
 prompt:
   visual_prompting: true
-  point_decimals: 2
   prompt_template: ""
-  answer_template: "Point: {point_x} {point_y}\nObject: {label_text}"
-  fallback_target_text: "unknown"
   prompt_text: |
-    Given the highlighted subject([{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]), estimate the gaze point and the object being looked at.
-    Predict x and y as normalized coordinates between 0 and 1, each rounded to exactly {point_decimals} decimal places.
-    For the object, output only one simple object name, and must be a short noun phrase of at most 2 words.
-    Output EXACTLY two lines:
-    Point:x,y
-    Object:<object name>
+    The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
+    Predict the gaze point that this person is looking at, and the object located at that gaze point.
+    Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
+    Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
+    Wrap the answer with the existing special tokens <|im_start|> and <|im_end|>.
+    Return exactly the two-line format below, with no extra text before or after it.
+    Return exactly:
+    <|im_start|>Point: <loc_NNN><loc_MMM>
+    Object: <obj_KKK><|im_end|>
 
 model:
   attn_implementation: "sdpa"
@@ -81,13 +82,29 @@ model:
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 loss:
-  loss_answer_weight: 1.0
+  loss_point_weight: 1.0
+  loss_object_weight: 1.0
+  loss_format_weight: 0.25
+
+rl:
+  rl_enabled: false
+  rl_group_size: 4
+  rl_clip_eps: 0.2
+  rl_kl_beta: 0.02
+  rl_lr: 1e-5
+  reward_point_weight: 1.0
+  reward_object_weight: 0.75
+  reward_joint_bonus: 0.25     # bonus when both point and object are correct
+  reward_extra_penalty: 0.5    # penalty for extra text in output
+  reward_point_beta: 10.0      # beta in exp(-beta * min_l2)
+  rl_temperature: 0.7          # sampling temperature during rollout
+  rl_top_p: 0.9                # top-p for rollout sampling
 
 wandb:
   enabled: true
-  project: "gaze_mllm"
+  project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "base_2decimals"
+  run_name: "baseline"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

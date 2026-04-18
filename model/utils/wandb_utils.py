@@ -64,11 +64,22 @@ def init_wandb(args: Any, root: Path):
         run = wandb.init(**wb_kwargs)
         print(f"[INFO] wandb enabled (project={args.wandb_project}, run={run.name}).")
         try:
+            wandb.define_metric("train/FormatValidRate", summary="max")
             wandb.define_metric("val/loss", summary="min")
             wandb.define_metric("val/dist", summary="min")
-            wandb.define_metric("val/acc@1", summary="max")
-            wandb.define_metric("val/acc@3", summary="max")
-            wandb.define_metric("val/multiacc@1", summary="max")
+            wandb.define_metric("val/object_acc", summary="max")
+            wandb.define_metric("val/joint_exact", summary="max")
+            wandb.define_metric("val/format_valid", summary="max")
+            wandb.define_metric("val/point_l2_valid_frac", summary="max")
+            # RL metrics
+            wandb.define_metric("rl/reward_mean", summary="max")
+            wandb.define_metric("rl/reward_point_mean", summary="max")
+            wandb.define_metric("rl/reward_object_mean", summary="max")
+            wandb.define_metric("rl/reward_joint_mean", summary="max")
+            wandb.define_metric("rl/invalid_format_rate", summary="min")
+            wandb.define_metric("rl/extra_text_rate", summary="min")
+            wandb.define_metric("rl/kl_mean", summary="last")
+            wandb.define_metric("rl/policy_loss", summary="last")
         except Exception:
             pass
         return run

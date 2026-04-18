@@ -25,18 +25,19 @@ from model.trainer import (
     init_base_model,
     init_processor,
     parse_dtype,
+    resolve_model_source,
     resolve_path,
     set_seed,
     to_autocast_dtype,
 )
 from model.utils.config_parser import build_parser, load_yaml_config
 from model.utils.data_utils import (
-    build_vocab_embedding_matrix,
     load_test_groups,
     load_test_label_map,
     load_vocab2id,
 )
-from model.utils.eval_utils import CLIPTextEncoder, collect_generation_samples
+from model.utils.eval_utils import collect_generation_samples
+from model.utils.gaze_tokens import register_gaze_special_tokens
 from model.utils.processor_collate import QwenTestCollator
 
 
@@ -124,12 +125,13 @@ def annotate_sample(
     for gx, gy in list(getattr(group, "gt_points", []) or []):
         _draw_point(draw, _clamp01(gx) * w, _clamp01(gy) * h, (32, 196, 96), gt_r)
 
-    parsed_point = sample.get("parsed_point")
-    if isinstance(parsed_point, list) and len(parsed_point) == 2:
+    parsed = sample.get("parsed", {})
+    point_xy = parsed.get("point_xy")
+    if isinstance(point_xy, (list, tuple)) and len(point_xy) == 2:
         _draw_point(
             draw,
-            _clamp01(float(parsed_point[0])) * w,
-            _clamp01(float(parsed_point[1])) * h,
+            _clamp01(float(point_xy[0])) * w,
+            _clamp01(float(point_xy[1])) * h,
             (230, 57, 70),
             pred_r,
         )
@@ -145,20 +147,25 @@ def annotate_sample(
     x0 = w + 18
     y = 18
 
-    title = f"Sample {index:02d}"
-    panel.text((x0, y), title, fill=(18, 18, 18), font=title_font)
+    panel.text((x0, y), f"Sample {index:02d}", fill=(18, 18, 18), font=title_font)
     y += 34
 
+    object_id = parsed.get("object_id")
+    gt_obj_id = sample.get("gt_object_id", "")
+    exact_match = (
+        sample.get("generated_text", "") == sample.get("target_text", "")
+        if sample.get("target_text_valid") else None
+    )
     items = [
         f"image: {sample.get('image_rel', '')}",
-        f"gt object: {sample.get('target_label_text', '')}",
-        f"pred object text: {sample.get('parsed_object_text', None)}",
-        f"retrieved top1: {(sample.get('retrieved_topk_labels') or [''])[0] if sample.get('retrieved_topk_labels') else ''}",
-        f"retrieved topk: {', '.join(sample.get('retrieved_topk_labels', []))}",
-        f"pred point: {sample.get('parsed_point', None)}",
-        f"avg_l2: {sample.get('avg_l2', None)}",
-        f"min_l2: {sample.get('min_l2', None)}",
-        f"exact_match: {sample.get('exact_match', None)}",
+        f"gt label: {sample.get('target_label_text', '')}  (id={gt_obj_id})",
+        f"pred object id: {object_id}",
+        f"pred point xy: {[round(float(v), 4) for v in point_xy] if point_xy else None}",
+        f"pred point bins: {parsed.get('point_bins')}",
+        f"avg_l2: {sample.get('avg_l2')}",
+        f"min_l2: {sample.get('min_l2')}",
+        f"fmt_valid: {parsed.get('valid_format', False)}  exact: {exact_match}",
+        f"generated: {sample.get('generated_text', '')}",
         "legend: green=GT gaze, red=pred gaze",
     ]
     max_text_w = panel_w - 30
@@ -247,17 +254,29 @@ def main() -> None:
         raise RuntimeError("CUDA requested but no GPU is available.")
     device = torch.device(args.device)
 
-    model_path = resolve_path(args.model_path)
+    model_path = resolve_model_source(args.model_path)
     checkpoint_dir = resolve_path(args.checkpoint_dir) if str(args.checkpoint_dir).strip() else None
     test_ann = resolve_path(args.test_ann)
     test_image_root = resolve_path(args.test_image_root)
     test_labels = resolve_path(args.test_labels)
     vocab2id_path = resolve_path(args.vocab2id)
-    label_embed_dir = resolve_path(args.label_embed_dir)
 
     vocab2id, vocab2id_lower = load_vocab2id(vocab2id_path)
     num_classes = infer_num_classes(vocab2id, vocab2id_path)
     id2label = build_id2label(vocab2id)
+
+    _resize_mode = str(getattr(args, "image_resize_mode", "native")).strip().lower()
+    _fixed_resize = (_resize_mode == "fixed")
+    _scene_size: tuple[int, int] | None = (
+        (int(args.scene_h), int(args.scene_w)) if _fixed_resize else None
+    )
+    processor = init_processor(
+        model_path=model_path,
+        checkpoint_dir=checkpoint_dir,
+        min_pixels=None if _fixed_resize else int(getattr(args, "min_pixels", 12544)),
+        max_pixels=None if _fixed_resize else int(getattr(args, "max_pixels", 2007040)),
+    )
+    register_gaze_special_tokens(processor.tokenizer, num_classes=num_classes)
 
     test_label_map, test_label_text_map, test_label_ids_map, _ = load_test_label_map(
         test_labels,
@@ -288,16 +307,13 @@ def main() -> None:
         vocab2id=vocab2id,
         vocab2id_lower=vocab2id_lower,
         num_classes=int(num_classes),
-        answer_template=args.answer_template,
-        fallback_target_text=args.fallback_target_text,
-        point_decimals=int(args.point_decimals),
         visual_prompting=bool(args.visual_prompting),
         image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
     )
     collator = QwenTestCollator(
-        processor=init_processor(model_path=model_path, checkpoint_dir=checkpoint_dir),
-        scene_size=(int(args.scene_h), int(args.scene_w)),
+        processor=processor,
         max_text_length=int(args.max_text_length),
+        scene_size=_scene_size,
     )
 
     load_dtype = parse_dtype(args.dtype)
@@ -313,6 +329,7 @@ def main() -> None:
         model_kwargs["dtype"] = load_dtype
 
     base_qwen = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
+    base_qwen.resize_token_embeddings(len(processor.tokenizer))
     adapter_dir = (checkpoint_dir / "lora_adapter") if checkpoint_dir is not None else None
     if adapter_dir is not None and adapter_dir.exists():
         qwen_model = PeftModel.from_pretrained(base_qwen, model_id=str(adapter_dir), is_trainable=False)
@@ -320,18 +337,6 @@ def main() -> None:
         qwen_model = base_qwen
     model = QwenTextGenerationModel(qwen_model=qwen_model).to(device)
     model.eval()
-
-    retrieval_label_texts = [id2label.get(i, "") for i in range(num_classes)]
-    retrieval_label_embedding_bank = build_vocab_embedding_matrix(
-        vocab2id=vocab2id,
-        label_embed_dir=label_embed_dir,
-        label_emb_dim=int(args.object_embedding_dim),
-        normalize=True,
-    )
-    if retrieval_label_embedding_bank is None:
-        raise RuntimeError("Failed to build retrieval label embedding bank.")
-
-    clip_encoder = CLIPTextEncoder(model_path=str(args.clip_model_path), device=device)
 
     batch_size = max(1, min(int(args.test_batch_size), len(dataset)))
     num_workers = max(0, int(args.num_workers))
@@ -352,17 +357,14 @@ def main() -> None:
         device=device,
         amp_dtype=amp_dtype,
         processor=collator.processor,
-        label_embedding_bank=retrieval_label_embedding_bank.to(device=device),
-        retrieval_label_texts=retrieval_label_texts,
-        retrieval_top_k=int(args.test_retrieval_top_k),
-        clip_encoder=clip_encoder,
-        object_temperature=float(args.object_temperature),
+        num_classes=int(num_classes),
         show_tqdm=bool(args.show_tqdm),
         desc="Visualize",
         max_new_tokens=int(args.generation_max_new_tokens),
         num_beams=int(args.generation_num_beams),
         repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
         no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
+        stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
         max_samples=len(dataset),
     )
 

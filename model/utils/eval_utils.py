@@ -10,29 +10,24 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
-from .common import normalize_text, to_device
+from .common import to_device
+from .gaze_tokens import (
+    ANSWER_END,
+    parse_structured_output_text,
+)
 from .loss_utils import compute_answer_loss
 
 
 # ---------------------------------------------------------------------------
-# Two-line stopping criteria — stop after "Point: …\nObject: …" is complete
+# Stopping criteria — stop when <gaze_obj_end> is generated
 # ---------------------------------------------------------------------------
 
-class _TwoLineStoppingCriteria(StoppingCriteria):
-    """Stop generation once ≥2 newline tokens appear in the generated portion.
+class _GazeObjEndStoppingCriteria(StoppingCriteria):
+    """Stop generation once <gaze_obj_end> token appears in generated portion."""
 
-    The expected output format is:
-        Point:X,Y\\n
-        Object:Z
-
-    We stop as soon as a second newline is produced, preventing the model
-    from appending explanations or repeated lines beyond the two-line answer.
-    Works with beam search (input_ids shape: [batch*num_beams, seq_len]).
-    """
-
-    def __init__(self, prompt_len: int, newline_ids: frozenset[int]) -> None:
+    def __init__(self, prompt_len: int, obj_end_id: int) -> None:
         self.prompt_len = int(prompt_len)
-        self.newline_ids = newline_ids
+        self.obj_end_id = int(obj_end_id)
 
     def __call__(
         self,
@@ -42,32 +37,27 @@ class _TwoLineStoppingCriteria(StoppingCriteria):
     ) -> bool:
         for row in input_ids:
             generated = row[self.prompt_len :].tolist()
-            nl_count = sum(1 for t in generated if t in self.newline_ids)
-            if nl_count < 2:
+            if self.obj_end_id not in generated:
                 return False
         return True
 
 
-def make_two_line_stopping_criteria(
+def make_gaze_obj_end_stopping_criteria(
     processor: Any,
     prompt_len: int,
+    stop_at_object_end: bool = True,
 ) -> StoppingCriteriaList | None:
-    """Build a :class:`StoppingCriteriaList` for two-line output termination.
-
-    Returns ``None`` if the newline token IDs cannot be resolved (in which case
-    the caller falls back to ``max_new_tokens`` alone).
-    """
+    if not stop_at_object_end:
+        return None
     try:
         tok = getattr(processor, "tokenizer", None) or processor
-        nl_ids: set[int] = set()
-        for txt in ("\n", "\n\n"):
-            ids = tok.encode(txt, add_special_tokens=False)
-            nl_ids.update(int(i) for i in ids if int(i) > 0)
-        if not nl_ids:
+        ids = tok.encode(ANSWER_END, add_special_tokens=False)
+        if not ids:
             return None
-        criteria = _TwoLineStoppingCriteria(
+        obj_end_id = int(ids[-1])
+        criteria = _GazeObjEndStoppingCriteria(
             prompt_len=int(prompt_len),
-            newline_ids=frozenset(nl_ids),
+            obj_end_id=obj_end_id,
         )
         return StoppingCriteriaList([criteria])
     except Exception:
@@ -75,67 +65,8 @@ def make_two_line_stopping_criteria(
 
 
 # ---------------------------------------------------------------------------
-# CLIP text encoder
+# Decode helpers
 # ---------------------------------------------------------------------------
-
-class CLIPTextEncoder:
-    """Encode free-form text strings into L2-normalized CLIP embeddings.
-
-    The CLIP model must be the same one used to pre-compute the label bank
-    embeddings in ``data/gazefollow/label-embeds/``.
-    """
-
-    def __init__(self, model_path: str, device: torch.device) -> None:
-        from transformers import CLIPModel, CLIPTokenizer  # lazy import
-        print(f"[INFO] loading CLIP text encoder from: {model_path}")
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_path)
-        self.model = CLIPModel.from_pretrained(model_path).to(device)
-        self.model.eval()
-        self.device = device
-
-    def encode(self, texts: list[str]) -> torch.Tensor:
-        """Encode texts → L2-normalized [N, D] float32 tensor."""
-        if not texts:
-            return torch.zeros((0,), device=self.device, dtype=torch.float32)
-        inputs = self.tokenizer(
-            texts, padding=True, truncation=True, max_length=77, return_tensors="pt"
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            feats = self.model.get_text_features(**inputs)  # [N, D]
-        return F.normalize(feats.float(), p=2, dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# Parsing helpers
-# ---------------------------------------------------------------------------
-
-_OBJ_SLOT_TOKEN = "<obj_emb>"
-def parse_object_text(text: str) -> str | None:
-    """Extract label from 'Object: <label>' line. Returns None if absent or slot token."""
-    m = re.search(r"(?im)^\s*object\s*:\s*(\S.*?)\s*$", str(text or ""))
-    if m is None:
-        return None
-    val = str(m.group(1)).strip()
-    if not val or val == _OBJ_SLOT_TOKEN:
-        return None
-    return val
-
-
-def parse_point(text: str) -> tuple[float, float] | None:
-    num = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
-    m = re.search(rf"(?im)^\s*point\s*:\s*({num})\s*[,\s]+\s*({num})\b", str(text or ""))
-    if m is None:
-        return None
-    try:
-        x = float(m.group(1))
-        y = float(m.group(2))
-    except Exception:
-        return None
-    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
-        return None
-    return x, y
-
 
 def decode_generated(
     processor: Any,
@@ -166,8 +97,10 @@ def decode_generated(
             if tok is not None
             else str(new_tokens.tolist())
         )
-        txt = re.sub(r"<\|[^>]+?\|>", " ", str(txt))
-        out.append(str(txt).strip())
+        # Keep <|im_start|> / <|im_end|> intact — the structured parser requires them.
+        # Only strip other Qwen chat markers that are not part of the answer content.
+        txt = re.sub(r"<\|(?!im_start\||im_end\|)[^>]+?\|>", "", str(txt)).strip()
+        out.append(str(txt))
     return out
 
 
@@ -187,53 +120,19 @@ def l2_stats(pred_xy: tuple[float, float], gt_points: torch.Tensor) -> tuple[flo
     return float(sum(dists) / len(dists)), float(min(dists))
 
 
-def topk_similarity(
-    query: torch.Tensor, bank: torch.Tensor, k: int, temperature: float
-) -> list[int]:
-    if (not torch.is_tensor(query)) or query.dim() != 1:
+def valid_label_ids(label_ids: torch.Tensor | list[int] | tuple[int, ...] | None) -> list[int]:
+    if label_ids is None:
         return []
-    if (not torch.is_tensor(bank)) or bank.dim() != 2 or int(bank.shape[0]) <= 0:
-        return []
-    q = F.normalize(query.unsqueeze(0), p=2, dim=-1)
-    b = F.normalize(bank, p=2, dim=-1)
-    t = max(float(temperature), 1e-6)
-    sim = (q @ b.t()) / t
-    kk = min(max(1, int(k)), int(b.shape[0]))
-    return [int(x) for x in torch.topk(sim.squeeze(0), k=kk, largest=True, sorted=True).indices.tolist()]
-
-
-def retrieve_topk_from_object_texts(
-    object_texts: list[str | None],
-    *,
-    clip_encoder: CLIPTextEncoder | None,
-    bank: torch.Tensor,
-    retrieval_top_k: int,
-    object_temperature: float,
-    bank_canonical_ids: list[int] | None = None,
-) -> list[list[int]]:
-    per_sample_topk_ids: list[list[int]] = [[] for _ in range(len(object_texts))]
-    if clip_encoder is None or (not torch.is_tensor(bank)) or bank.dim() != 2 or int(bank.shape[0]) <= 0:
-        return per_sample_topk_ids
-
-    valid_pairs = [(i, str(txt).strip()) for i, txt in enumerate(object_texts) if str(txt or "").strip()]
-    if not valid_pairs:
-        return per_sample_topk_ids
-
-    sample_indices = [i for i, _ in valid_pairs]
-    texts = [txt for _, txt in valid_pairs]
-    query_embs = clip_encoder.encode(texts).to(device=bank.device, dtype=torch.float32)
-    if query_embs.dim() != 2 or int(query_embs.shape[0]) != len(sample_indices):
-        return per_sample_topk_ids
-
-    b = F.normalize(bank, p=2, dim=-1)
-    t = max(float(object_temperature), 1e-6)
-    sim = (query_embs @ b.t()) / t
-    kk = min(max(1, int(retrieval_top_k)), int(b.shape[0]))
-    topk_indices = torch.topk(sim, k=kk, dim=1, largest=True, sorted=True).indices.tolist()
-    bank_ids = bank_canonical_ids if bank_canonical_ids is not None else list(range(int(b.shape[0])))
-    for row_i, sample_i in enumerate(sample_indices):
-        per_sample_topk_ids[sample_i] = [int(bank_ids[int(j)]) for j in topk_indices[row_i]]
-    return per_sample_topk_ids
+    if torch.is_tensor(label_ids):
+        vals = label_ids.detach().cpu().flatten().tolist()
+    else:
+        vals = list(label_ids)
+    out: list[int] = []
+    for v in vals:
+        iv = int(v)
+        if iv >= 0 and iv not in out:
+            out.append(iv)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +144,18 @@ def run_eval(
     loader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype,
-    loss_answer_weight: float = 1.0,
+    loss_weights: dict[str, float] | None = None,
     show_tqdm: bool = True,
     desc: str = "Eval",
 ) -> dict[str, float]:
     model.eval()
+    if loss_weights is None:
+        loss_weights = {"point": 1.0, "object": 1.0, "format": 0.25}
+
     loss_sum = 0.0
-    answer_sum = 0.0
+    pt_sum = 0.0
+    obj_sum = 0.0
+    fmt_sum = 0.0
     count = 0
 
     with torch.no_grad():
@@ -271,21 +175,29 @@ def run_eval(
             losses = compute_answer_loss(
                 logits=out.get("logits", None),
                 labels=labels,
-                loss_mask_answer=batch.get("loss_mask_answer", None),
-                weight_answer=float(loss_answer_weight),
+                loss_mask_point=batch.get("loss_mask_point", None),
+                loss_mask_object=batch.get("loss_mask_object", None),
+                loss_mask_format=batch.get("loss_mask_format", None),
+                weight_point=float(loss_weights.get("point", 1.0)),
+                weight_object=float(loss_weights.get("object", 1.0)),
+                weight_format=float(loss_weights.get("format", 0.25)),
             )
             loss_sum += float(losses["loss"].detach().item()) * float(bsz)
-            answer_sum += float(losses["loss_answer"].detach().item()) * float(bsz)
+            pt_sum += float(losses["loss_point"].detach().item()) * float(bsz)
+            obj_sum += float(losses["loss_object"].detach().item()) * float(bsz)
+            fmt_sum += float(losses["loss_format"].detach().item()) * float(bsz)
             count += bsz
             if show_tqdm:
                 it.set_postfix(loss=f"{(loss_sum / max(count, 1)):.4f}")
 
     if count <= 0:
-        return {"loss": 0.0, "loss_answer": 0.0}
+        return {"loss": 0.0, "loss_point": 0.0, "loss_object": 0.0, "loss_format": 0.0}
     d = float(count)
     return {
         "loss": float(loss_sum / d),
-        "loss_answer": float(answer_sum / d),
+        "loss_point": float(pt_sum / d),
+        "loss_object": float(obj_sum / d),
+        "loss_format": float(fmt_sum / d),
     }
 
 
@@ -295,45 +207,32 @@ def run_test_metrics(
     device: torch.device,
     amp_dtype: torch.dtype,
     processor: Any,
-    label_embedding_bank: torch.Tensor,
-    retrieval_label_texts: list[str],
-    retrieval_top_k: int = 3,
-    clip_encoder: CLIPTextEncoder | None = None,
-    object_temperature: float = 0.07,
+    num_classes: int,
     show_tqdm: bool = True,
     desc: str = "Test",
-    max_new_tokens: int = 16,
+    max_new_tokens: int = 8,
     num_beams: int = 1,
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 0,
-    bank_canonical_ids: list[int] | None = None,
+    stop_at_object_end: bool = True,
 ) -> dict[str, float]:
     model.eval()
-    if (not torch.is_tensor(label_embedding_bank)) or label_embedding_bank.dim() != 2:
-        raise RuntimeError("label_embedding_bank must be a [N, D] tensor.")
-    if not isinstance(retrieval_label_texts, list):
-        raise RuntimeError("retrieval_label_texts must be a list[str].")
 
-    bank_n = int(label_embedding_bank.shape[0])
-    text_n = int(len(retrieval_label_texts))
-    keep = min(bank_n, text_n)
-    if keep <= 0:
-        raise RuntimeError("retrieval label bank is empty.")
-    bank = label_embedding_bank[:keep].to(device=device, dtype=torch.float32)
-    _bank_ids: list[int] = bank_canonical_ids if bank_canonical_ids is not None else list(range(keep))
-
-    total = 0
-    valid_total = 0
-    exact = 0
+    total = 0           # all samples
+    valid_total = 0     # samples with target_text_valid > 0
+    format_valid_total = 0  # samples with target_format_valid > 0 (denominator for FormatValid/ExtraTextRate)
+    point_bin_den = 0   # samples with target_point_valid > 0 (denominator for PointBinExact)
+    format_valid_count = 0
+    extra_text_count = 0
     avg_l2_sum = 0.0
     min_l2_sum = 0.0
     l2_den = 0
-    acc1_den = 0
-    multiacc1_den = 0
-    retrieval_acc1 = 0
-    retrieval_acc3 = 0
-    retrieval_multiacc1 = 0
-    parse_fail = 0
+    point_bin_exact = 0
+    object_acc = 0
+    multi_acc_at_1 = 0
+    joint_exact = 0
+    obj_den = 0
+    multi_obj_den = 0
     beam_k = max(1, int(num_beams))
 
     with torch.no_grad():
@@ -342,15 +241,30 @@ def run_test_metrics(
             joint = to_device(batch["joint_inputs"], device=device)
             target_texts = [str(x) for x in batch.get("target_text", [])]
             target_valid = batch.get("target_text_valid", None)
-            target_label = batch.get("target_label", None)
+            target_point_valid = batch.get("target_point_valid", None)
+            target_object_valid = batch.get("target_object_valid", None)
+            target_format_valid = batch.get("target_format_valid", None)
+            target_point_bin = batch.get("target_point_bin", None)
+            target_object_id = batch.get("target_object_id", None)
             target_label_ids = batch.get("target_label_ids", None)
             gt_points = batch.get("gt_points", None)
             if target_valid is None:
                 target_valid = torch.ones((len(target_texts),), dtype=torch.float32)
             target_valid = target_valid.to(dtype=torch.float32)
+            if target_point_valid is None:
+                target_point_valid = target_valid
+            if target_object_valid is None:
+                target_object_valid = target_valid
+            if target_format_valid is None:
+                target_format_valid = target_valid
+            target_point_valid = target_point_valid.to(dtype=torch.float32)
+            target_object_valid = target_object_valid.to(dtype=torch.float32)
+            target_format_valid = target_format_valid.to(dtype=torch.float32)
 
             prompt_len = int(joint["input_ids"].shape[1])
-            stopping = make_two_line_stopping_criteria(processor, prompt_len)
+            stopping = make_gaze_obj_end_stopping_criteria(
+                processor, prompt_len, stop_at_object_end=bool(stop_at_object_end)
+            )
 
             with torch.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
@@ -381,96 +295,118 @@ def run_test_metrics(
             )
             bsz = len(target_texts)
             preds = preds[:bsz]
-            gen_obj_texts: list[str | None] = [parse_object_text(preds[i]) if i < len(preds) else None for i in range(bsz)]
-            per_sample_topk_ids = retrieve_topk_from_object_texts(
-                gen_obj_texts,
-                clip_encoder=clip_encoder,
-                bank=bank,
-                retrieval_top_k=int(retrieval_top_k),
-                object_temperature=float(object_temperature),
-                bank_canonical_ids=_bank_ids,
-            )
 
             for i in range(bsz):
                 total += 1
                 pred = preds[i] if i < len(preds) else ""
+                parsed = parse_structured_output_text(pred, int(num_classes))
+                is_text_valid = i < int(target_valid.numel()) and float(target_valid[i].item()) > 0.0
+                is_point_valid = i < int(target_point_valid.numel()) and float(target_point_valid[i].item()) > 0.0
+                is_object_valid = i < int(target_object_valid.numel()) and float(target_object_valid[i].item()) > 0.0
+                is_format_valid_gt = i < int(target_format_valid.numel()) and float(target_format_valid[i].item()) > 0.0
+                if is_text_valid:
+                    valid_total += 1
+                if is_format_valid_gt:
+                    format_valid_total += 1
+                if is_point_valid:
+                    point_bin_den += 1
 
-                pt = parse_point(pred)
-                if pt is not None and isinstance(gt_points, list) and i < len(gt_points):
-                    stats = l2_stats(pt, gt_points[i])
+                # FormatValid / ExtraTextRate: denominator = format_valid_total
+                if is_format_valid_gt:
+                    if parsed["has_extra_text"]:
+                        extra_text_count += 1
+                    if parsed["valid_format"]:
+                        format_valid_count += 1
+
+                # point L2: valid-GT samples only (point GT is meaningful)
+                if is_point_valid and parsed["point_xy"] is not None and isinstance(gt_points, list) and i < len(gt_points):
+                    stats = l2_stats(parsed["point_xy"], gt_points[i])
                     if stats is not None:
                         avg_l2_sum += float(stats[0])
                         min_l2_sum += float(stats[1])
                         l2_den += 1
 
-                if float(target_valid[i].item()) > 0.0:
-                    valid_total += 1
-                    exact += int(normalize_text(pred) == normalize_text(target_texts[i]))
+                # point bin exact match: denominator = point_bin_den (all is_point_valid samples,
+                # format failures count as misses — consistent with ObjectAcc gating on obj_den)
+                if (
+                    is_point_valid
+                    and parsed["point_bins"] is not None
+                    and torch.is_tensor(target_point_bin)
+                    and i < int(target_point_bin.shape[0])
+                ):
+                    gt_bx = int(target_point_bin[i, 0].item())
+                    gt_by = int(target_point_bin[i, 1].item())
+                    px, py = parsed["point_bins"]
+                    if int(px) == gt_bx and int(py) == gt_by:
+                        point_bin_exact += 1
 
-                gt_id = -1
-                if torch.is_tensor(target_label) and i < int(target_label.shape[0]):
-                    gt_id = int(target_label[i].item())
+                # object accuracy: valid-GT samples only
+                if is_object_valid and torch.is_tensor(target_object_id) and i < int(target_object_id.shape[0]):
+                    gt_obj = int(target_object_id[i].item())
+                    obj_den += 1
+                    if parsed["object_id"] is not None and int(parsed["object_id"]) == gt_obj:
+                        object_acc += 1
 
-                gt_multi_ids: set[int] = set()
-                if torch.is_tensor(target_label_ids) and i < int(target_label_ids.shape[0]):
-                    gt_multi_ids = {int(x) for x in target_label_ids[i].tolist() if int(x) >= 0}
-                if not gt_multi_ids and gt_id >= 0:
-                    gt_multi_ids = {gt_id}
+                if is_object_valid and torch.is_tensor(target_label_ids) and i < int(target_label_ids.shape[0]):
+                    gt_obj_ids = valid_label_ids(target_label_ids[i])
+                    if gt_obj_ids:
+                        multi_obj_den += 1
+                        if parsed["object_id"] is not None and int(parsed["object_id"]) in gt_obj_ids:
+                            multi_acc_at_1 += 1
 
-                if gt_id >= 0:
-                    acc1_den += 1
-                if gt_multi_ids:
-                    multiacc1_den += 1
-
-                if gen_obj_texts[i] is None:
-                    if float(target_valid[i].item()) > 0.0:
-                        parse_fail += 1
-                    continue
-
-                topk_label_ids = per_sample_topk_ids[i]
-                if not topk_label_ids:
-                    if float(target_valid[i].item()) > 0.0:
-                        parse_fail += 1
-                    continue
-
-                pred_label_id = int(topk_label_ids[0])
-                if gt_id >= 0:
-                    retrieval_acc1 += int(pred_label_id == gt_id)
-                    retrieval_acc3 += int(gt_id in topk_label_ids[:3])
-                if gt_multi_ids:
-                    retrieval_multiacc1 += int(pred_label_id in gt_multi_ids)
+                # joint exact: valid-GT samples only
+                if (
+                    is_point_valid
+                    and is_object_valid
+                    and parsed["valid_format"]
+                    and parsed["point_bins"] is not None
+                    and parsed["object_id"] is not None
+                    and torch.is_tensor(target_point_bin)
+                    and torch.is_tensor(target_object_id)
+                    and i < int(target_point_bin.shape[0])
+                    and i < int(target_object_id.shape[0])
+                ):
+                    gt_bx = int(target_point_bin[i, 0].item())
+                    gt_by = int(target_point_bin[i, 1].item())
+                    gt_obj = int(target_object_id[i].item())
+                    px, py = parsed["point_bins"]
+                    if int(px) == gt_bx and int(py) == gt_by and int(parsed["object_id"]) == gt_obj:
+                        joint_exact += 1
 
             if show_tqdm and l2_den > 0:
                 it.set_postfix(
                     l2=f"{(avg_l2_sum / max(l2_den, 1)):.4f}",
-                    acc1=f"{(retrieval_acc1 / max(acc1_den, 1)):.4f}",
+                    fmt=f"{(format_valid_count / max(format_valid_total, 1)):.3f}",
                 )
 
+    _L2_SENTINEL = math.sqrt(2.0)  # max possible L2 for normalized coords (0,0)→(1,1)
     if total <= 0:
         return {
-            "ExactMatch": 0.0,
-            "Avg L2": 0.0,
-            "Min L2": 0.0,
-            "PointL2": 0.0,
-            "acc@1": 0.0,
-            "acc@3": 0.0,
-            "multiacc@1": 0.0,
-            "ObjectParseFail": 0.0,
+            "FormatValid": 0.0,
+            "Avg L2": _L2_SENTINEL,
+            "Min L2": _L2_SENTINEL,
+            "PointBinExact": 0.0,
+            "ObjectAcc": 0.0,
+            "MultiAcc@1": 0.0,
+            "JointExact": 0.0,
+            "ExtraTextRate": 0.0,
+            "PointL2ValidFrac": 0.0,
             "num_samples": 0.0,
-            "num_valid_targets": 0.0,
+            "num_valid_samples": 0.0,
         }
 
     return {
-        "ExactMatch": float(exact / max(valid_total, 1)),
-        "Avg L2": float(avg_l2_sum / max(l2_den, 1)),
-        "Min L2": float(min_l2_sum / max(l2_den, 1)),
-        "PointL2": float(avg_l2_sum / max(l2_den, 1)),
-        "acc@1": float(retrieval_acc1 / max(acc1_den, 1)),
-        "acc@3": float(retrieval_acc3 / max(acc1_den, 1)),
-        "multiacc@1": float(retrieval_multiacc1 / max(multiacc1_den, 1)),
-        "ObjectParseFail": float(parse_fail / max(valid_total, 1)),
+        "FormatValid": float(format_valid_count / max(format_valid_total, 1)),
+        "Avg L2": float(avg_l2_sum / l2_den) if l2_den > 0 else _L2_SENTINEL,
+        "Min L2": float(min_l2_sum / l2_den) if l2_den > 0 else _L2_SENTINEL,
+        "PointBinExact": float(point_bin_exact / max(point_bin_den, 1)),
+        "ObjectAcc": float(object_acc / max(obj_den, 1)),
+        "MultiAcc@1": float(multi_acc_at_1 / max(multi_obj_den, 1)),
+        "JointExact": float(joint_exact / max(obj_den, 1)),
+        "ExtraTextRate": float(extra_text_count / max(format_valid_total, 1)),
+        "PointL2ValidFrac": float(l2_den / max(point_bin_den, 1)),
         "num_samples": float(total),
-        "num_valid_targets": float(valid_total),
+        "num_valid_samples": float(valid_total),
     }
 
 
@@ -480,39 +416,21 @@ def collect_generation_samples(
     device: torch.device,
     amp_dtype: torch.dtype,
     processor: Any,
-    label_embedding_bank: torch.Tensor,
-    retrieval_label_texts: list[str],
-    retrieval_top_k: int = 3,
-    clip_encoder: CLIPTextEncoder | None = None,
-    object_temperature: float = 0.07,
+    num_classes: int,
     show_tqdm: bool = True,
     desc: str = "GenerationPreview",
-    max_new_tokens: int = 16,
+    max_new_tokens: int = 8,
     num_beams: int = 1,
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 0,
     max_samples: int = 8,
-    bank_canonical_ids: list[int] | None = None,
+    stop_at_object_end: bool = True,
 ) -> list[dict[str, Any]]:
     limit = max(0, int(max_samples))
     if limit <= 0:
         return []
 
     model.eval()
-    if (not torch.is_tensor(label_embedding_bank)) or label_embedding_bank.dim() != 2:
-        raise RuntimeError("label_embedding_bank must be a [N, D] tensor.")
-    if not isinstance(retrieval_label_texts, list):
-        raise RuntimeError("retrieval_label_texts must be a list[str].")
-
-    bank_n = int(label_embedding_bank.shape[0])
-    text_n = int(len(retrieval_label_texts))
-    keep = min(bank_n, text_n)
-    if keep <= 0:
-        raise RuntimeError("retrieval label bank is empty.")
-    bank = label_embedding_bank[:keep].to(device=device, dtype=torch.float32)
-    labels = [str(x) for x in retrieval_label_texts[:keep]]
-    _bank_ids: list[int] = bank_canonical_ids if bank_canonical_ids is not None else list(range(keep))
-
     previews: list[dict[str, Any]] = []
     beam_k = max(1, int(num_beams))
 
@@ -523,7 +441,8 @@ def collect_generation_samples(
             target_texts = [str(x) for x in batch.get("target_text", [])]
             target_valid = batch.get("target_text_valid", None)
             target_label = batch.get("target_label", None)
-            target_label_ids = batch.get("target_label_ids", None)
+            target_object_id = batch.get("target_object_id", None)
+            target_point_bin = batch.get("target_point_bin", None)
             gt_points = batch.get("gt_points", None)
             prompt_texts = [str(x) for x in batch.get("text_input", [])]
             target_label_texts = [str(x) for x in batch.get("target_label_text", [])]
@@ -533,7 +452,9 @@ def collect_generation_samples(
             target_valid = target_valid.to(dtype=torch.float32)
 
             prompt_len = int(joint["input_ids"].shape[1])
-            stopping = make_two_line_stopping_criteria(processor, prompt_len)
+            stopping = make_gaze_obj_end_stopping_criteria(
+                processor, prompt_len, stop_at_object_end=bool(stop_at_object_end)
+            )
             with torch.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
             ):
@@ -563,23 +484,16 @@ def collect_generation_samples(
             )
             bsz = len(target_texts)
             preds = preds[:bsz]
-            gen_obj_texts: list[str | None] = [parse_object_text(preds[i]) if i < len(preds) else None for i in range(bsz)]
-            per_sample_topk_ids = retrieve_topk_from_object_texts(
-                gen_obj_texts,
-                clip_encoder=clip_encoder,
-                bank=bank,
-                retrieval_top_k=int(retrieval_top_k),
-                object_temperature=float(object_temperature),
-                bank_canonical_ids=_bank_ids,
-            )
 
             for i in range(bsz):
                 pred = preds[i] if i < len(preds) else ""
-                pt = parse_point(pred)
-                stats = None
+                parsed = parse_structured_output_text(pred, int(num_classes))
+
                 serialized_gt_points: list[list[float]] = []
+                stats = None
                 if isinstance(gt_points, list) and i < len(gt_points):
-                    stats = l2_stats(pt, gt_points[i]) if pt is not None else None
+                    if parsed["point_xy"] is not None:
+                        stats = l2_stats(parsed["point_xy"], gt_points[i])
                     if torch.is_tensor(gt_points[i]) and gt_points[i].numel() >= 2:
                         pts = gt_points[i].detach().cpu().to(dtype=torch.float32).view(-1, 2)
                         serialized_gt_points = [
@@ -587,49 +501,45 @@ def collect_generation_samples(
                             for j in range(int(pts.shape[0]))
                         ]
 
-                gt_id = -1
+                gt_obj_id = -1
+                if torch.is_tensor(target_object_id) and i < int(target_object_id.shape[0]):
+                    gt_obj_id = int(target_object_id[i].item())
+                gt_label_id = -1
                 if torch.is_tensor(target_label) and i < int(target_label.shape[0]):
-                    gt_id = int(target_label[i].item())
+                    gt_label_id = int(target_label[i].item())
+                gt_pt_bins: list[int] = []
+                if torch.is_tensor(target_point_bin) and i < int(target_point_bin.shape[0]):
+                    gt_pt_bins = [int(target_point_bin[i, 0].item()), int(target_point_bin[i, 1].item())]
 
-                gt_multi_ids: set[int] = set()
-                if torch.is_tensor(target_label_ids) and i < int(target_label_ids.shape[0]):
-                    gt_multi_ids = {int(x) for x in target_label_ids[i].tolist() if int(x) >= 0}
-                if not gt_multi_ids and gt_id >= 0:
-                    gt_multi_ids = {gt_id}
-
-                topk_ids = per_sample_topk_ids[i]
-                topk_labels = [labels[int(idx)] for idx in topk_ids if 0 <= int(idx) < len(labels)]
                 target_is_valid = (
                     bool(float(target_valid[i].item()) > 0.0)
                     if i < int(target_valid.numel())
                     else False
                 )
-                target_text = target_texts[i] if i < len(target_texts) else ""
                 previews.append(
                     {
                         "sample_index": int(len(previews)),
                         "image_rel": image_rels[i] if i < len(image_rels) else "",
                         "prompt_text": prompt_texts[i] if i < len(prompt_texts) else "",
-                        "target_text": target_text,
+                        "target_text": target_texts[i] if i < len(target_texts) else "",
                         "target_text_valid": target_is_valid,
                         "generated_text": pred,
-                        "exact_match": (
-                            bool(normalize_text(pred) == normalize_text(target_text))
-                            if target_is_valid
-                            else None
-                        ),
-                        "parsed_point": [float(pt[0]), float(pt[1])] if pt is not None else None,
+                        "parsed": {
+                            "valid_format": bool(parsed["valid_format"]),
+                            "has_extra_text": bool(parsed["has_extra_text"]),
+                            "point_bins": list(parsed["point_bins"]) if parsed["point_bins"] else None,
+                            "point_xy": list(parsed["point_xy"]) if parsed["point_xy"] else None,
+                            "object_id": int(parsed["object_id"]) if parsed["object_id"] is not None else None,
+                        },
+                        "avg_l2": float(stats[0]) if stats is not None else None,
+                        "min_l2": float(stats[1]) if stats is not None else None,
                         "gt_points": serialized_gt_points,
-                        "avg_l2": (float(stats[0]) if stats is not None else None),
-                        "min_l2": (float(stats[1]) if stats is not None else None),
-                        "parsed_object_text": gen_obj_texts[i],
+                        "gt_point_bins": gt_pt_bins,
+                        "gt_object_id": gt_obj_id,
+                        "gt_label_id": gt_label_id,
                         "target_label_text": (
                             target_label_texts[i] if i < len(target_label_texts) else ""
                         ),
-                        "target_label_id": gt_id,
-                        "target_label_ids": sorted(gt_multi_ids),
-                        "retrieved_topk_ids": topk_ids,
-                        "retrieved_topk_labels": topk_labels,
                     }
                 )
                 if len(previews) >= limit:
@@ -646,31 +556,32 @@ def print_generation_samples(samples: list[dict[str, Any]]) -> None:
     for sample in samples:
         idx = int(sample.get("sample_index", -1))
         image_rel = str(sample.get("image_rel", ""))
+        parsed = sample.get("parsed", {})
         print(f"[SAMPLE {idx}] image={image_rel}")
-        print(f"  prompt   : {sample.get('prompt_text', '')}")
         print(f"  target   : {sample.get('target_text', '')}")
         print(f"  generated: {sample.get('generated_text', '')}")
-        print(f"  exact    : {sample.get('exact_match', None)}")
-        print(f"  gt_label : {sample.get('target_label_text', '')} ({sample.get('target_label_id', -1)})")
-        print(f"  pred_obj : {sample.get('parsed_object_text', None)}")
-        print(f"  topk_obj : {sample.get('retrieved_topk_labels', [])}")
-        print(f"  gt_points: {sample.get('gt_points', [])}")
-        print(f"  pred_pt  : {sample.get('parsed_point', None)}")
-        print(f"  avg_l2   : {sample.get('avg_l2', None)}")
-        print(f"  min_l2   : {sample.get('min_l2', None)}")
+        print(f"  fmt_valid: {parsed.get('valid_format', False)}  "
+              f"extra_text: {parsed.get('has_extra_text', False)}")
+        print(f"  pred_bins: {parsed.get('point_bins', None)}  "
+              f"pred_xy: {parsed.get('point_xy', None)}")
+        print(f"  pred_obj : {parsed.get('object_id', None)}  "
+              f"gt_obj: {sample.get('gt_object_id', -1)}")
+        print(f"  gt_points: {sample.get('gt_points', [])}  "
+              f"avg_l2: {sample.get('avg_l2', None)}  "
+              f"min_l2: {sample.get('min_l2', None)}")
 
 
 def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
     rows = [
-        ("ExactMatch", float(test_metrics.get("ExactMatch", 0.0))),
-        ("Avg L2 (text)", float(test_metrics.get("Avg L2", test_metrics.get("PointL2", 0.0)))),
-        ("Min L2 (text)", float(test_metrics.get("Min L2", 0.0))),
-        ("acc@1", float(test_metrics.get("acc@1", 0.0))),
-        ("acc@3", float(test_metrics.get("acc@3", 0.0))),
-        ("multiacc@1", float(test_metrics.get("multiacc@1", 0.0))),
-        ("ObjectParseFail", float(test_metrics.get("ObjectParseFail", 0.0))),
+        ("FormatValid", float(test_metrics.get("FormatValid", 0.0))),
+        ("Avg L2", float(test_metrics.get("Avg L2", 0.0))),
+        ("Min L2", float(test_metrics.get("Min L2", 0.0))),
+        ("PointBinExact", float(test_metrics.get("PointBinExact", 0.0))),
+        ("ObjectAcc", float(test_metrics.get("ObjectAcc", 0.0))),
+        ("MultiAcc@1", float(test_metrics.get("MultiAcc@1", 0.0))),
+        ("JointExact", float(test_metrics.get("JointExact", 0.0))),
+        ("ExtraTextRate", float(test_metrics.get("ExtraTextRate", 0.0))),
         ("num_samples", float(test_metrics.get("num_samples", 0.0))),
-        ("num_valid_targets", float(test_metrics.get("num_valid_targets", 0.0))),
     ]
     key_w = max(len(k) for k, _ in rows)
     val_w = 12
@@ -680,7 +591,7 @@ def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
     print(f"| {'Metric'.ljust(key_w)} | {'Value'.rjust(val_w)} |")
     print(line)
     for k, v in rows:
-        if k.startswith("num_") or "Den" in k:
+        if k.startswith("num_"):
             print(f"| {k.ljust(key_w)} | {v:>{val_w}.0f} |")
         else:
             print(f"| {k.ljust(key_w)} | {v:>{val_w}.6f} |")

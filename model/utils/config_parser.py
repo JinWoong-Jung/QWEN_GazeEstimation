@@ -62,10 +62,11 @@ def output_dir_from_run_name(output_dir: str, run_name: str) -> str:
 
 def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
     d = defaults or {}
-    p = argparse.ArgumentParser("Qwen text-generation LoRA trainer")
+    p = argparse.ArgumentParser("Qwen structured-token gaze LoRA trainer")
     p.add_argument("--config", type=str, default=str(default_value(d, "config", "config.yaml")))
     p.add_argument("--run_name", type=str, default=normalize_run_name(default_value(d, "run_name", default_value(d, "wandb_run_name", ""))))
 
+    # --- paths ---
     p.add_argument("--model_path", type=str, default=str(default_value(d, "model_path", "model/Qwen3-VL-4B-Instruct")))
     p.add_argument("--image_root", type=str, default=str(default_value(d, "image_root", "data/gazefollow_extended/train")))
     p.add_argument("--train_ann", type=str, default=str(default_value(d, "train_ann", "data/gazefollow/train_annotations_new.txt")))
@@ -76,12 +77,12 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--labels_rgs", type=str, default=str(default_value(d, "labels_rgs", "data/gazefollow/gaze-labels-rgs.csv")))
     p.add_argument("--labels_ssa", type=str, default=str(default_value(d, "labels_ssa", "data/gazefollow/gaze-labels-ssa.csv")))
     p.add_argument("--vocab2id", type=str, default=str(default_value(d, "vocab2id", "data/gazefollow/vocab2id.json")))
-    p.add_argument("--label_embed_dir", type=str, default=str(default_value(d, "label_embed_dir", "data/gazefollow/label-embeds")))
     p.add_argument("--test_ann", type=str, default=str(default_value(d, "test_ann", "data/gazefollow_extended/test_annotations_release.txt")))
     p.add_argument("--test_image_root", type=str, default=str(default_value(d, "test_image_root", "data/gazefollow_extended/test2")))
     p.add_argument("--output_dir", type=str, default=str(default_value(d, "output_dir", "checkpoints/qwen_text_only")))
     p.add_argument("--checkpoint_dir", type=str, default=str(default_value(d, "checkpoint_dir", "")))
 
+    # --- eval mode flags ---
     p.add_argument("--eval_only", dest="eval_only", action="store_true")
     p.add_argument("--no_eval_only", dest="eval_only", action="store_false")
     p.set_defaults(eval_only=bool(default_value(d, "eval_only", False)))
@@ -89,6 +90,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--no_test_only", dest="test_only", action="store_false")
     p.set_defaults(test_only=bool(default_value(d, "test_only", False)))
 
+    # --- data ---
     p.add_argument("--split_prefix", type=str, default=str(default_value(d, "split_prefix", "train/")))
     p.add_argument("--strip_split_prefix", dest="strip_split_prefix", action="store_true")
     p.add_argument("--no_strip_split_prefix", dest="strip_split_prefix", action="store_false")
@@ -112,6 +114,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--no_show_tqdm", dest="show_tqdm", action="store_false")
     p.set_defaults(show_tqdm=bool(default_value(d, "show_tqdm", True)))
 
+    # --- val/test control ---
     p.add_argument("--run_test", dest="run_test", action="store_true")
     p.add_argument("--no_run_test", dest="run_test", action="store_false")
     p.set_defaults(run_test=bool(default_value(d, "run_test", True)))
@@ -119,52 +122,69 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--no_run_val_metrics", dest="run_val_metrics", action="store_false")
     p.set_defaults(run_val_metrics=bool(default_value(d, "run_val_metrics", True)))
     p.add_argument("--run_val_metrics_every_n_epochs", type=int, default=int(default_value(d, "run_val_metrics_every_n_epochs", 5)))
-    p.add_argument("--checkpoint_monitor", type=str, default=str(default_value(d, "checkpoint_monitor", "val_loss")))
+    p.add_argument("--checkpoint_monitor", type=str, default=str(default_value(d, "checkpoint_monitor", "val_dist")))
     p.add_argument("--checkpoint_monitor_mode", type=str, default=str(default_value(d, "checkpoint_monitor_mode", "auto")))
 
+    # --- image/data ---
     p.add_argument("--test_split_prefix", type=str, default=str(default_value(d, "test_split_prefix", "test2/")))
     p.add_argument("--test_strip_split_prefix", dest="test_strip_split_prefix", action="store_true")
     p.add_argument("--no_test_strip_split_prefix", dest="test_strip_split_prefix", action="store_false")
     p.set_defaults(test_strip_split_prefix=bool(default_value(d, "test_strip_split_prefix", True)))
     p.add_argument("--test_bbox_round_decimals", type=int, default=int(default_value(d, "test_bbox_round_decimals", 3)))
     p.add_argument("--image_cache_size", type=int, default=int(default_value(d, "image_cache_size", 1000)))
-
+    p.add_argument("--image_resize_mode", type=str, default=str(default_value(d, "image_resize_mode", "native")))
     p.add_argument("--scene_h", type=int, default=int(default_value(d, "scene_h", 512)))
     p.add_argument("--scene_w", type=int, default=int(default_value(d, "scene_w", 512)))
+    p.add_argument("--min_pixels", type=int, default=int(default_value(d, "min_pixels", 12544)))
+    p.add_argument("--max_pixels", type=int, default=int(default_value(d, "max_pixels", 2007040)))
 
+    # --- model/generation ---
     p.add_argument("--max_text_length", type=int, default=int(default_value(d, "max_text_length", 256)))
-    p.add_argument("--generation_max_new_tokens", type=int, default=int(default_value(d, "generation_max_new_tokens", 24)))
-    p.add_argument("--generation_num_beams", type=int, default=int(default_value(d, "generation_num_beams", 3)))
+    p.add_argument("--generation_max_new_tokens", type=int, default=int(default_value(d, "generation_max_new_tokens", 8)))
+    p.add_argument("--generation_num_beams", type=int, default=int(default_value(d, "generation_num_beams", 1)))
     p.add_argument("--repetition_penalty", type=float, default=float(default_value(d, "repetition_penalty", 1.0)))
     p.add_argument("--no_repeat_ngram_size", type=int, default=int(default_value(d, "no_repeat_ngram_size", 0)))
     p.add_argument("--preview_test_samples", type=int, default=int(default_value(d, "preview_test_samples", 0)))
-    p.add_argument("--object_embedding_dim", type=int, default=int(default_value(d, "object_embedding_dim", 512)))
-    p.add_argument("--test_retrieval_top_k", type=int, default=int(default_value(d, "test_retrieval_top_k", 3)))
-    p.add_argument("--point_decimals", type=int, default=int(default_value(d, "point_decimals", 4)))
-    p.add_argument("--loss_answer_weight", type=float, default=float(default_value(d, "loss_answer_weight", 1.0)))
-    p.add_argument(
-        "--object_temperature",
-        type=float,
-        default=float(default_value(d, "object_temperature", 0.07)),
-    )
-    p.add_argument(
-        "--clip_model_path",
-        type=str,
-        default=str(default_value(d, "clip_model_path", "openai/clip-vit-base-patch32")),
-    )
+    p.add_argument("--generation_stop_at_object_end", dest="generation_stop_at_object_end", action="store_true")
+    p.add_argument("--no_generation_stop_at_object_end", dest="generation_stop_at_object_end", action="store_false")
+    p.set_defaults(generation_stop_at_object_end=bool(default_value(d, "generation_stop_at_object_end", True)))
 
+    # --- prompt ---
     p.add_argument("--prompt_template", type=str, default=str(default_value(d, "prompt_template", "")))
     p.add_argument("--prompt_text", type=str, default=str(default_value(d, "prompt_text", "")))
     p.add_argument("--visual_prompting", dest="visual_prompting", action="store_true")
     p.add_argument("--no_visual_prompting", dest="visual_prompting", action="store_false")
     p.set_defaults(visual_prompting=bool(default_value(d, "visual_prompting", False)))
-    p.add_argument(
-        "--answer_template",
-        type=str,
-        default=str(default_value(d, "answer_template", "Point: {point_x} {point_y}\nObject: {label_text}")),
-    )
-    p.add_argument("--fallback_target_text", type=str, default=str(default_value(d, "fallback_target_text", "unknown")))
 
+    # --- structured token pipeline ---
+    p.add_argument("--train_stage", type=str, default=str(default_value(d, "train_stage", "sft")))
+    p.add_argument("--filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_true")
+    p.add_argument("--no_filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_false")
+    p.set_defaults(filter_invalid_object_samples=bool(default_value(d, "filter_invalid_object_samples", True)))
+
+    # --- structured loss weights ---
+    p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 1.0)))
+    p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 1.0)))
+    p.add_argument("--loss_format_weight", type=float, default=float(default_value(d, "loss_format_weight", 0.25)))
+
+    # --- RL (disabled by default) ---
+    p.add_argument("--rl_enabled", dest="rl_enabled", action="store_true")
+    p.add_argument("--no_rl_enabled", dest="rl_enabled", action="store_false")
+    p.set_defaults(rl_enabled=bool(default_value(d, "rl_enabled", False)))
+    p.add_argument("--rl_group_size", type=int, default=int(default_value(d, "rl_group_size", 4)))
+    p.add_argument("--rl_clip_eps", type=float, default=float(default_value(d, "rl_clip_eps", 0.2)))
+    p.add_argument("--rl_kl_beta", type=float, default=float(default_value(d, "rl_kl_beta", 0.02)))
+    p.add_argument("--rl_lr", type=float, default=float(default_value(d, "rl_lr", 1e-5)))
+    p.add_argument("--reward_point_weight", type=float, default=float(default_value(d, "reward_point_weight", 1.0)))
+    p.add_argument("--reward_object_weight", type=float, default=float(default_value(d, "reward_object_weight", 1.0)))
+    p.add_argument("--reward_joint_bonus", type=float, default=float(default_value(d, "reward_joint_bonus", 0.25)))
+    p.add_argument("--reward_extra_penalty", type=float, default=float(default_value(d, "reward_extra_penalty", 0.5)))
+    p.add_argument("--reward_format_weight", type=float, default=float(default_value(d, "reward_format_weight", 0.5)))
+    p.add_argument("--reward_point_beta", type=float, default=float(default_value(d, "reward_point_beta", 10.0)))
+    p.add_argument("--rl_temperature", type=float, default=float(default_value(d, "rl_temperature", 0.7)))
+    p.add_argument("--rl_top_p", type=float, default=float(default_value(d, "rl_top_p", 0.9)))
+
+    # --- LoRA ---
     p.add_argument("--lora_r", type=int, default=int(default_value(d, "lora_r", 16)))
     p.add_argument("--lora_alpha", type=int, default=int(default_value(d, "lora_alpha", 32)))
     p.add_argument("--lora_dropout", type=float, default=float(default_value(d, "lora_dropout", 0.05)))
@@ -175,6 +195,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--lora_target_modules", type=str, default=str(lora_target_default))
     p.add_argument("--attn_implementation", type=str, default=str(default_value(d, "attn_implementation", "sdpa")))
 
+    # --- wandb ---
     p.add_argument("--wandb_enabled", dest="wandb_enabled", action="store_true")
     p.add_argument("--no_wandb_enabled", dest="wandb_enabled", action="store_false")
     p.set_defaults(wandb_enabled=bool(default_value(d, "wandb_enabled", default_value(d, "enabled", False))))

@@ -1,10 +1,12 @@
-"""Tests for the full-generation + CLIP-retrieval evaluation path.
+"""Tests for data utilities and label bank used in the structured-token pipeline.
 
 Covers:
 - object_label_span() finds pure-text label spans
-- format_target_text() produces pure-text answers
-- parse_object_text() extracts generated label strings
-- generated object text is CLIP-encoded and retrieved against the label bank
+- build_prompt() formats bbox into prompt strings
+- build_split_bank() constructs embedding bank from label dir
+- load_test_groups() loads and groups test annotations
+- LabelBank topk retrieval
+- load_label_map() / load_test_label_map() vocab lookup
 """
 from __future__ import annotations
 
@@ -26,12 +28,6 @@ from model.utils.data_utils import (
     load_label_map,
     load_test_groups,
     load_test_label_map,
-)
-from model.utils.eval_utils import (
-    collect_generation_samples,
-    parse_object_text,
-    run_test_metrics,
-    topk_similarity,
 )
 from model.utils.label_bank import LabelBank, canonicalize
 
@@ -67,36 +63,13 @@ class TestObjectLabelSpan(unittest.TestCase):
         self.assertIsNone(object_label_span("Point: 0.1 0.2"))
 
     def test_empty_object_value(self) -> None:
-        # "Object:" with no content after colon should return None
-        # (OBJECT_LABEL_CONTENT_RE requires \S at start of group)
         result = object_label_span("Point: 0.1 0.2\nObject:   ")
         self.assertIsNone(result)
 
 
 # ---------------------------------------------------------------------------
-# parse_object_text (eval helper)
+# build_prompt
 # ---------------------------------------------------------------------------
-
-class TestParseObjectText(unittest.TestCase):
-
-    def test_simple(self) -> None:
-        self.assertEqual(parse_object_text("Point: 0.4 0.5\nObject: television"), "television")
-
-    def test_multi_word(self) -> None:
-        self.assertEqual(parse_object_text("Point: 0.4 0.5\nObject: tv set"), "tv set")
-
-    def test_missing(self) -> None:
-        self.assertIsNone(parse_object_text("Point: 0.4 0.5"))
-
-    def test_legacy_slot_returns_none(self) -> None:
-        # <obj_emb> is not useful as a parsed label
-        self.assertIsNone(parse_object_text(f"Point: 0.4 0.5\nObject: {OBJ_SLOT}"))
-
-    def test_noisy_generation(self) -> None:
-        # Extra whitespace / casing should still parse
-        result = parse_object_text("  Point: 0.4 0.5  \n  Object:   chair  ")
-        self.assertEqual(result, "chair")
-
 
 class TestBuildPrompt(unittest.TestCase):
 
@@ -139,8 +112,6 @@ class TestBuildSplitBank(unittest.TestCase):
         self.assertEqual(bank_texts, ["chair", "book"])
         self.assertEqual(bank_ids, [10, 20])
         self.assertEqual(tuple(bank_embs.shape), (2, 4))
-        self.assertEqual(len(bank_texts), len(bank_ids))
-        self.assertEqual(len(bank_ids), int(bank_embs.shape[0]))
         norms = bank_embs.norm(dim=1)
         self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=1e-5))
 
@@ -272,102 +243,8 @@ class TestLabelBank(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# datasets.format_target_text pure-text output
+# Label map loading
 # ---------------------------------------------------------------------------
-
-class TestFormatTargetText(unittest.TestCase):
-
-    def test_pure_text_template(self) -> None:
-        from model.datasets import format_target_text
-        text, valid = format_target_text(
-            label_text="television",
-            label_id=0,
-            id2label={0: "television"},
-            vocab2id={"television": 0},
-            vocab2id_lower={"television": 0},
-            num_classes=5,
-            answer_template="Point:{point_x},{point_y}\nObject:{label_text}",
-            fallback_target_text="unknown",
-            point_x=0.423,
-            point_y=0.711,
-            point_decimals=4,
-        )
-        self.assertIn("Point:", text)
-        self.assertIn("Object:television", text)
-        self.assertNotIn("<obj_emb>", text)
-        self.assertEqual(valid, 1.0)
-
-    def test_fallback_uses_label_text_not_slot(self) -> None:
-        from model.datasets import format_target_text
-        # Use a template with a typo to trigger the except branch
-        text, _ = format_target_text(
-            label_text="chair",
-            label_id=1,
-            id2label=None,
-            vocab2id=None,
-            vocab2id_lower=None,
-            num_classes=0,
-            answer_template="{broken_key}",
-            fallback_target_text="unknown",
-            point_x=0.5,
-            point_y=0.5,
-            point_decimals=2,
-        )
-        # fallback should include "chair", not OBJ_SLOT
-        self.assertIn("chair", text)
-        self.assertNotIn("<obj_emb>", text)
-
-    def test_missing_required_template_fields_falls_back_to_default_format(self) -> None:
-        from model.datasets import format_target_text
-        text, _ = format_target_text(
-            label_text="chair",
-            label_id=1,
-            id2label=None,
-            vocab2id={"chair": 1},
-            vocab2id_lower={"chair": 1},
-            num_classes=10,
-            answer_template="Point:<x>,<y>\nObject:{label_text}",
-            fallback_target_text="unknown",
-            point_x=0.5,
-            point_y=0.25,
-            point_decimals=4,
-        )
-        self.assertEqual(text, "Point:0.5000,0.2500\nObject:chair")
-
-    def test_raw_label_text_is_preserved(self) -> None:
-        from model.datasets import format_target_text
-        text, _ = format_target_text(
-            label_text="the laptop computer",
-            label_id=-1,
-            id2label=None,
-            vocab2id={},
-            vocab2id_lower={},
-            num_classes=346,
-            answer_template="Point:{point_x},{point_y}\nObject:{label_text}",
-            fallback_target_text="unknown",
-            point_x=0.5,
-            point_y=0.25,
-            point_decimals=4,
-        )
-        self.assertEqual(text, "Point:0.5000,0.2500\nObject:the laptop computer")
-
-    def test_answer_template_can_reference_point_decimals(self) -> None:
-        from model.datasets import format_target_text
-        text, _ = format_target_text(
-            label_text="chair",
-            label_id=1,
-            id2label=None,
-            vocab2id={"chair": 1},
-            vocab2id_lower={"chair": 1},
-            num_classes=10,
-            answer_template="Point:{point_x},{point_y}\nDecimals:{point_decimals}\nObject:{label_text}",
-            fallback_target_text="unknown",
-            point_x=0.5,
-            point_y=0.25,
-            point_decimals=2,
-        )
-        self.assertEqual(text, "Point:0.50,0.25\nDecimals:2\nObject:chair")
-
 
 class TestSemgazeStyleLabelMapping(unittest.TestCase):
 
@@ -417,218 +294,6 @@ class TestSemgazeStyleLabelMapping(unittest.TestCase):
         self.assertEqual(text_map["test2/a.jpg"], "chair")
         self.assertEqual(multi_id_map["test2/a.jpg"], [2, 3])
         self.assertEqual(int(stats["mapped"]), 1)
-
-
-# ---------------------------------------------------------------------------
-# ID-space acc@1 via topk_similarity
-# ---------------------------------------------------------------------------
-
-class TestIdSpaceRetrieval(unittest.TestCase):
-    """Verify that topk_similarity on a vocab2id-ordered bank returns label ids."""
-
-    def _make_bank_and_vocab(self) -> tuple[torch.Tensor, dict[str, int]]:
-        # bank row i = embedding for label id i
-        vocab2id = {"television": 0, "chair": 1, "book": 2}
-        bank = torch.zeros(3, 4, dtype=torch.float32)
-        bank[0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
-        bank[1] = torch.tensor([0.0, 1.0, 0.0, 0.0])
-        bank[2] = torch.tensor([0.0, 0.0, 1.0, 0.0])
-        return bank, vocab2id
-
-    def test_topk_returns_label_id(self) -> None:
-        bank, _ = self._make_bank_and_vocab()
-        # query close to "television" embedding (id=0)
-        query = torch.tensor([0.95, 0.0, 0.0, 0.0], dtype=torch.float32)
-        topk_ids = topk_similarity(query, bank, k=1, temperature=0.07)
-        self.assertEqual(topk_ids[0], 0)  # top-1 id == target_label id for "television"
-
-    def test_acc1_correct_when_topk_matches_target_label(self) -> None:
-        bank, _ = self._make_bank_and_vocab()
-        # Simulate: generated "book" → query near id=2
-        query = torch.tensor([0.0, 0.0, 0.95, 0.0], dtype=torch.float32)
-        topk_ids = topk_similarity(query, bank, k=3, temperature=0.07)
-        target_label_id = 2  # "book"
-        retrieval_acc1 = int(topk_ids[0] == target_label_id)
-        retrieval_acc3 = int(target_label_id in topk_ids[:3])
-        self.assertEqual(retrieval_acc1, 1)
-        self.assertEqual(retrieval_acc3, 1)
-
-    def test_invalid_target_label_excluded_from_denominator(self) -> None:
-        # target_label=-1 → acc1_den should NOT increment
-        target_label_id = -1
-        acc1_den = 0
-        if target_label_id >= 0:
-            acc1_den += 1
-        self.assertEqual(acc1_den, 0)
-
-    def test_multiacc_uses_id_set(self) -> None:
-        bank, _ = self._make_bank_and_vocab()
-        query = torch.tensor([0.0, 0.95, 0.0, 0.0], dtype=torch.float32)
-        topk_ids = topk_similarity(query, bank, k=1, temperature=0.07)
-        pred_id = topk_ids[0]  # should be 1 ("chair")
-        gt_multi_ids = {0, 1}  # multiple valid GT ids
-        self.assertIn(pred_id, gt_multi_ids)
-
-
-class _PreviewTokenizer:
-    def decode(self, ids: torch.Tensor, skip_special_tokens: bool = False) -> str:
-        del skip_special_tokens
-        seq = ids.tolist() if torch.is_tensor(ids) else list(ids)
-        if seq == [10, 11, 12, 13, 14]:
-            return "Point:0.1000,0.2000\nObject:chair"
-        return ""
-
-
-class _PreviewProcessor:
-    def __init__(self) -> None:
-        self.tokenizer = _PreviewTokenizer()
-
-
-class _PreviewModel(torch.nn.Module):
-    def generate(self, joint_inputs: dict[str, torch.Tensor], **_: object) -> torch.Tensor:
-        bsz = int(joint_inputs["input_ids"].shape[0])
-        rows = [
-            [1, 2, 10, 11, 12, 13, 14]
-            for _ in range(bsz)
-        ]
-        return torch.tensor(rows, dtype=torch.long)
-
-
-class _PreviewClipEncoder:
-    def encode(self, texts: list[str | None]) -> torch.Tensor:
-        mapping = {
-            "book": torch.tensor([1.0, 0.0], dtype=torch.float32),
-            "chair": torch.tensor([0.0, 1.0], dtype=torch.float32),
-        }
-        rows = [mapping[str(text)] for text in texts]
-        return torch.stack(rows, dim=0)
-
-
-class _RetrievalE2ETokenizer:
-    def decode(self, ids: torch.Tensor, skip_special_tokens: bool = False) -> str:
-        del skip_special_tokens
-        seq = ids.tolist() if torch.is_tensor(ids) else list(ids)
-        if seq == [10, 11, 12, 13, 14]:
-            return "Point:0.1000,0.2000\nObject:laptop"
-        return ""
-
-
-class _RetrievalE2EProcessor:
-    def __init__(self) -> None:
-        self.tokenizer = _RetrievalE2ETokenizer()
-
-
-class _RetrievalE2EModel(torch.nn.Module):
-    def generate(self, joint_inputs: dict[str, torch.Tensor], **_: object) -> torch.Tensor:
-        bsz = int(joint_inputs["input_ids"].shape[0])
-        rows = [[1, 2, 10, 11, 12, 13, 14] for _ in range(bsz)]
-        return torch.tensor(rows, dtype=torch.long)
-
-
-class _RetrievalE2EClipEncoder:
-    def encode(self, texts: list[str | None]) -> torch.Tensor:
-        mapping = {
-            "laptop": torch.tensor([0.0, 2.0], dtype=torch.float32),
-        }
-        rows = [mapping.get(str(text), torch.zeros(2, dtype=torch.float32)) for text in texts]
-        return torch.stack(rows, dim=0)
-
-
-class TestGenerationPreview(unittest.TestCase):
-    def test_collect_generation_samples(self) -> None:
-        loader = [
-            {
-                "joint_inputs": {
-                    "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
-                    "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
-                },
-                "text_input": ["Locate the gaze target."],
-                "target_text": ["Point:0.1000,0.2000\nObject:chair"],
-                "target_text_valid": torch.tensor([1.0], dtype=torch.float32),
-                "target_label": torch.tensor([1], dtype=torch.long),
-                "target_label_ids": torch.tensor([[1, -1, -1, -1, -1]], dtype=torch.long),
-                "gt_points": [torch.tensor([[0.1, 0.2]], dtype=torch.float32)],
-                "target_label_text": ["chair"],
-                "image_rel": ["test/image_0001.jpg"],
-            }
-        ]
-        samples = collect_generation_samples(
-            model=_PreviewModel(),
-            loader=loader,
-            device=torch.device("cpu"),
-            amp_dtype=torch.float32,
-            processor=_PreviewProcessor(),
-            label_embedding_bank=torch.tensor(
-                [
-                    [1.0, 0.0],
-                    [0.0, 1.0],
-                ],
-                dtype=torch.float32,
-            ),
-            retrieval_label_texts=["book", "chair"],
-            retrieval_top_k=2,
-            clip_encoder=_PreviewClipEncoder(),
-            object_temperature=0.07,
-            show_tqdm=False,
-            max_new_tokens=8,
-            num_beams=1,
-            max_samples=1,
-        )
-        self.assertEqual(len(samples), 1)
-        sample = samples[0]
-        self.assertEqual(sample["generated_text"], "Point:0.1000,0.2000\nObject:chair")
-        self.assertEqual(sample["parsed_object_text"], "chair")
-        self.assertEqual(sample["retrieved_topk_ids"][0], 1)
-        self.assertEqual(sample["retrieved_topk_labels"][0], "chair")
-        self.assertEqual(sample["parsed_point"], [0.1, 0.2])
-        self.assertAlmostEqual(float(sample["min_l2"]), 0.0, places=6)
-        self.assertTrue(bool(sample["exact_match"]))
-
-
-class TestObjectRetrievalE2E(unittest.TestCase):
-
-    def test_acc1_uses_bank_canonical_ids(self) -> None:
-        loader = [
-            {
-                "joint_inputs": {
-                    "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
-                    "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
-                },
-                "target_text": ["Point:0.1000,0.2000\nObject:laptop"],
-                "target_text_valid": torch.tensor([1.0], dtype=torch.float32),
-                "target_label": torch.tensor([42], dtype=torch.long),  # canonical label id
-                "target_label_ids": torch.tensor([[42, -1, -1, -1, -1]], dtype=torch.long),
-                "gt_points": [torch.tensor([[0.1, 0.2]], dtype=torch.float32)],
-            }
-        ]
-
-        metrics = run_test_metrics(
-            model=_RetrievalE2EModel(),
-            loader=loader,
-            device=torch.device("cpu"),
-            amp_dtype=torch.float32,
-            processor=_RetrievalE2EProcessor(),
-            label_embedding_bank=torch.tensor(
-                [
-                    [1.0, 0.0],  # bank row 0 -> canonical id 7
-                    [0.0, 1.0],  # bank row 1 -> canonical id 42
-                ],
-                dtype=torch.float32,
-            ),
-            retrieval_label_texts=["mug", "laptop"],
-            retrieval_top_k=2,
-            clip_encoder=_RetrievalE2EClipEncoder(),
-            object_temperature=0.07,
-            show_tqdm=False,
-            max_new_tokens=8,
-            num_beams=1,
-            bank_canonical_ids=[7, 42],
-        )
-
-        self.assertAlmostEqual(float(metrics["acc@1"]), 1.0, places=6)
-        self.assertAlmostEqual(float(metrics["acc@3"]), 1.0, places=6)
-        self.assertAlmostEqual(float(metrics["multiacc@1"]), 1.0, places=6)
-        self.assertAlmostEqual(float(metrics["ObjectParseFail"]), 0.0, places=6)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Legacy shim — superseded by gaze_tokens.py in the structured-token pipeline.
+# <obj_emb> is the old free-text slot; new code uses <obj_XXX> tokens.
+
 import re
 from typing import Any
 

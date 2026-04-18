@@ -11,9 +11,11 @@ from .utils.data_utils import (
     Record,
     TestGroup,
     apply_train_augmentation,
+    alias_label_text,
     build_prompt,
     sanitize_bbox_pixels,
 )
+from .utils.gaze_tokens import GAZE_OBJ_UNKNOWN, build_structured_target_text, quantize_coord
 
 
 class _ImageLRUCache:
@@ -37,65 +39,77 @@ class _ImageLRUCache:
                 self._cache.popitem(last=False)
             self._cache[path] = img.copy()
 
-def format_target_text(
+
+def _resolve_obj_id(
+    label_text: str,
+    label_id: int,
+    id2label: dict[int, str],
+    vocab2id: dict[str, int],
+    vocab2id_lower: dict[str, int],
+    num_classes: int,
+) -> int:
+    """Return a valid object id in [0, num_classes), or -1 if not resolvable."""
+    obj_id = int(label_id)
+    if obj_id < 0:
+        raw = alias_label_text(label_text)
+        if raw in vocab2id:
+            obj_id = int(vocab2id[raw])
+        else:
+            obj_id = int(vocab2id_lower.get(raw.lower(), -1))
+
+    if int(num_classes) > 0:
+        return obj_id if 0 <= obj_id < int(num_classes) else -1
+    return obj_id if obj_id >= 0 else -1
+
+
+def format_structured_target_text(
     label_text: str,
     label_id: int,
     id2label: dict[int, str] | None,
     vocab2id: dict[str, int] | None,
     vocab2id_lower: dict[str, int] | None,
     num_classes: int,
-    answer_template: str,
-    fallback_target_text: str,
     point_x: float,
     point_y: float,
-    point_decimals: int,
-) -> tuple[str, float]:
-    def clamp01(x: float) -> float:
-        return max(0.0, min(1.0, float(x)))
+) -> tuple[str, int, float, float]:
+    """Build structured 7-token target text.
 
-    raw = str(label_text or "").strip()
-    if not raw and (id2label is not None) and int(label_id) >= 0:
-        raw = str(id2label.get(int(label_id), "")).strip()
-    if not raw:
-        raw = str(fallback_target_text)
+    Returns (target_text, resolved_obj_id, target_text_valid, target_object_valid).
+    """
+    raw = alias_label_text(label_text)
+    if not raw and id2label is not None and int(label_id) >= 0:
+        raw = alias_label_text(str(id2label.get(int(label_id), "")).strip())
 
-    # Vocab-ID lookup uses the raw label so it matches vocab2id keys exactly.
-    obj_id = int(label_id)
-    if obj_id < 0:
-        v = vocab2id or {}
-        vl = vocab2id_lower or {}
-        if raw in v:
-            obj_id = int(v[raw])
-        else:
-            obj_id = int(vl.get(raw.lower(), -1))
+    obj_id = _resolve_obj_id(
+        label_text=raw,
+        label_id=int(label_id),
+        id2label=id2label or {},
+        vocab2id=vocab2id or {},
+        vocab2id_lower=vocab2id_lower or {},
+        num_classes=int(num_classes),
+    )
 
-    if int(num_classes) > 0:
-        is_valid_obj = 0 <= int(obj_id) < int(num_classes)
-    else:
-        is_valid_obj = int(obj_id) >= 0
-    is_valid = 1.0 if is_valid_obj else 0.0
-
-    # Keep the raw dataset label text so train-time text generation matches the
-    # semgaze-style direct vocab lookup path instead of an extra canonicalizer.
-    template_label = raw
-
-    dec = max(0, int(point_decimals))
-    px = f"{clamp01(point_x):.{dec}f}"
-    py = f"{clamp01(point_y):.{dec}f}"
-    tpl = str(answer_template or "Point:{point_x},{point_y}\nObject:{label_text}")
-    required_fields = ("{point_x}", "{point_y}", "{label_text}")
-    if any(field not in tpl for field in required_fields):
-        tpl = "Point:{point_x},{point_y}\nObject:{label_text}"
-    try:
-        text = tpl.format(
-            label_text=template_label,
-            point_x=px,
-            point_y=py,
-            point_decimals=dec,
+    if obj_id >= 0:
+        text = build_structured_target_text(
+            point_x=float(point_x),
+            point_y=float(point_y),
+            obj_id=obj_id,
+            num_classes=int(num_classes),
         )
-    except Exception:
-        text = f"Point:{px},{py}\nObject:{template_label}"
-    return str(text), float(is_valid)
+        text_valid = 1.0
+        object_valid = 1.0
+    else:
+        text = build_structured_target_text(
+            point_x=float(point_x),
+            point_y=float(point_y),
+            obj_id=None,
+            num_classes=int(num_classes),
+            obj_token=GAZE_OBJ_UNKNOWN,
+        )
+        text_valid = 1.0
+        object_valid = 0.0
+
+    return text, obj_id, float(text_valid), float(object_valid)
 
 
 def draw_head_bbox_prompt(
@@ -106,7 +120,6 @@ def draw_head_bbox_prompt(
     y2: int,
 ) -> Image.Image:
     w, h = scene.size
-    # Draw inclusive rectangle coordinates, clamped to valid image extent.
     rx1 = max(0, min(int(x1), max(w - 1, 0)))
     ry1 = max(0, min(int(y1), max(h - 1, 0)))
     rx2 = max(0, min(int(x2) - 1, max(w - 1, 0)))
@@ -133,13 +146,14 @@ class GazeDataset(Dataset):
         vocab2id: dict[str, int] | None = None,
         vocab2id_lower: dict[str, int] | None = None,
         num_classes: int = 0,
-        answer_template: str = "Point: {point_x} {point_y}\nObject: {label_text}",
-        fallback_target_text: str = "unknown",
-        point_decimals: int = 4,
         visual_prompting: bool = False,
         image_cache_size: int = 0,
+        filter_invalid_object_samples: bool = True,
+        # deprecated args kept for backward compat (ignored)
+        answer_template: str = "",
+        fallback_target_text: str = "",
+        point_decimals: int = 4,
     ) -> None:
-        self.records = records
         self.prompt_template = str(prompt_template or "")
         self.prompt_text = str(prompt_text or "")
         self.apply_augmentation = bool(apply_augmentation)
@@ -147,13 +161,32 @@ class GazeDataset(Dataset):
         self.vocab2id = vocab2id or {}
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
-        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
-        self.fallback_target_text = str(fallback_target_text)
-        self.point_decimals = int(point_decimals)
         self.visual_prompting = bool(visual_prompting)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
+
+        if bool(filter_invalid_object_samples):
+            before = len(records)
+            self.records = [
+                r for r in records
+                if _resolve_obj_id(
+                    label_text=str(r.label_text or "").strip(),
+                    label_id=int(r.label_id),
+                    id2label=self.id2label,
+                    vocab2id=self.vocab2id,
+                    vocab2id_lower=self.vocab2id_lower,
+                    num_classes=self.num_classes,
+                ) >= 0
+            ]
+            dropped = before - len(self.records)
+            if dropped > 0:
+                print(
+                    f"[INFO] GazeDataset: filtered {dropped}/{before} records "
+                    f"with invalid object labels (filter_invalid_object_samples=True)"
+                )
+        else:
+            self.records = records
 
     def __len__(self) -> int:
         return len(self.records)
@@ -190,40 +223,42 @@ class GazeDataset(Dataset):
             bbox_norm,
             self.prompt_template,
             self.prompt_text,
-            point_decimals=self.point_decimals,
+            num_classes=self.num_classes,
+            point_decimals=4,
         )
+
         resolved_label_text = str(rec.label_text or "").strip()
         if (not resolved_label_text) and int(rec.label_id) >= 0:
             resolved_label_text = str(self.id2label.get(int(rec.label_id), "")).strip()
-        target_text, target_valid = format_target_text(
+
+        target_text, obj_id, target_text_valid, target_object_valid = format_structured_target_text(
             label_text=resolved_label_text,
             label_id=int(rec.label_id),
             id2label=self.id2label,
             vocab2id=self.vocab2id,
             vocab2id_lower=self.vocab2id_lower,
             num_classes=self.num_classes,
-            answer_template=self.answer_template,
-            fallback_target_text=self.fallback_target_text,
             point_x=float(gaze_x),
             point_y=float(gaze_y),
-            point_decimals=self.point_decimals,
         )
+
+        bx = quantize_coord(float(gaze_x))
+        by = quantize_coord(float(gaze_y))
 
         return {
             "scene_image": scene,
             "text_input": prompt,
             "target_text": target_text,
-            # target_text_valid controls whether point/format masks are built.
-            # Always 1.0: even when the object label is invalid we still want
-            # to supervise the gaze coordinate (localization is the primary goal).
-            "target_text_valid": torch.tensor(1.0, dtype=torch.float32),
+            "target_text_valid": torch.tensor(target_text_valid, dtype=torch.float32),
             "target_point_valid": torch.tensor(1.0, dtype=torch.float32),
-            # target_object_valid is decoupled from point validity so that
-            # object retrieval loss is suppressed only when the label is bad.
-            "target_object_valid": torch.tensor(target_valid, dtype=torch.float32),
+            "target_object_valid": torch.tensor(target_object_valid, dtype=torch.float32),
             "target_label": int(rec.label_id),
-            "target_label_ids": [int(rec.label_id)] if int(rec.label_id) >= 0 else [],
+            "target_label_ids": [int(obj_id)] if int(obj_id) >= 0 else [],
             "target_point": torch.tensor([float(gaze_x), float(gaze_y)], dtype=torch.float32),
+            "target_point_bin": torch.tensor([bx, by], dtype=torch.long),
+            "target_object_id": torch.tensor(max(0, obj_id), dtype=torch.long),
+            "target_structured_valid": torch.tensor(target_text_valid, dtype=torch.float32),
+            "target_format_valid": torch.tensor(1.0, dtype=torch.float32),
             "gt_points": torch.tensor([[float(gaze_x), float(gaze_y)]], dtype=torch.float32),
             "target_label_text": resolved_label_text,
             "image_rel": str(rec.image_rel),
@@ -240,11 +275,12 @@ class GazeTestDataset(Dataset):
         vocab2id: dict[str, int] | None = None,
         vocab2id_lower: dict[str, int] | None = None,
         num_classes: int = 0,
-        answer_template: str = "Point: {point_x} {point_y}\nObject: {label_text}",
-        fallback_target_text: str = "unknown",
-        point_decimals: int = 4,
         visual_prompting: bool = False,
         image_cache_size: int = 0,
+        # deprecated args kept for backward compat (ignored)
+        answer_template: str = "",
+        fallback_target_text: str = "",
+        point_decimals: int = 4,
     ) -> None:
         self.groups = groups
         self.prompt_template = str(prompt_template or "")
@@ -253,9 +289,6 @@ class GazeTestDataset(Dataset):
         self.vocab2id = vocab2id or {}
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
-        self.answer_template = str(answer_template or "Point: {point_x} {point_y}\nObject: {label_text}")
-        self.fallback_target_text = str(fallback_target_text)
-        self.point_decimals = int(point_decimals)
         self.visual_prompting = bool(visual_prompting)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
@@ -285,37 +318,43 @@ class GazeTestDataset(Dataset):
             bbox_norm,
             self.prompt_template,
             self.prompt_text,
-            point_decimals=self.point_decimals,
+            num_classes=self.num_classes,
+            point_decimals=4,
         )
         if g.gt_points:
             px = sum(float(x) for x, _ in g.gt_points) / float(len(g.gt_points))
             py = sum(float(y) for _, y in g.gt_points) / float(len(g.gt_points))
         else:
             px, py = 0.5, 0.5
-        target_text, target_valid = format_target_text(
+
+        target_text, obj_id, target_text_valid, target_object_valid = format_structured_target_text(
             label_text=g.label_text,
             label_id=int(g.label_id),
             id2label=self.id2label,
             vocab2id=self.vocab2id,
             vocab2id_lower=self.vocab2id_lower,
             num_classes=self.num_classes,
-            answer_template=self.answer_template,
-            fallback_target_text=self.fallback_target_text,
             point_x=px,
             point_y=py,
-            point_decimals=self.point_decimals,
         )
+
+        bx = quantize_coord(float(px))
+        by = quantize_coord(float(py))
 
         return {
             "scene_image": scene,
             "text_input": prompt,
             "target_text": target_text,
-            "target_text_valid": torch.tensor(target_valid, dtype=torch.float32),
+            "target_text_valid": torch.tensor(target_text_valid, dtype=torch.float32),
             "target_point_valid": torch.tensor(1.0, dtype=torch.float32),
-            "target_object_valid": torch.tensor(target_valid, dtype=torch.float32),
+            "target_object_valid": torch.tensor(target_object_valid, dtype=torch.float32),
             "target_label": int(g.label_id),
             "target_label_ids": [int(x) for x in (g.label_ids or []) if int(x) >= 0],
             "target_point": torch.tensor([float(px), float(py)], dtype=torch.float32),
+            "target_point_bin": torch.tensor([bx, by], dtype=torch.long),
+            "target_object_id": torch.tensor(max(0, obj_id), dtype=torch.long),
+            "target_structured_valid": torch.tensor(target_text_valid, dtype=torch.float32),
+            "target_format_valid": torch.tensor(1.0, dtype=torch.float32),
             "gt_points": torch.tensor(g.gt_points, dtype=torch.float32),
             "target_label_text": str(g.label_text),
             "image_rel": str(g.image_rel),

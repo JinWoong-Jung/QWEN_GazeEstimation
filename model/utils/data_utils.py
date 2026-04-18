@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageEnhance, ImageOps
 
+from .gaze_tokens import COORD_BINS, format_loc_token, quantize_coord
+
 
 def is_normalized_point(x: float, y: float) -> bool:
     return 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
@@ -49,14 +51,27 @@ def build_prompt(
     prompt_template: str,
     prompt_text: str = "",
     *,
+    num_classes: int | None = None,
     point_decimals: int | None = None,
 ) -> str:
     xmin, ymin, xmax, ymax = bbox_norm
+    coord_min = 0
+    coord_max = int(COORD_BINS) - 1
+    obj_min = 0
+    obj_max = max(0, int(num_classes) - 1) if num_classes is not None else 0
     format_vars: dict[str, Any] = {
         "xmin": float(xmin),
         "ymin": float(ymin),
         "xmax": float(xmax),
         "ymax": float(ymax),
+        "loc_x1": format_loc_token(quantize_coord(float(xmin))),
+        "loc_y1": format_loc_token(quantize_coord(float(ymin))),
+        "loc_x2": format_loc_token(quantize_coord(float(xmax))),
+        "loc_y2": format_loc_token(quantize_coord(float(ymax))),
+        "coord_min": int(coord_min),
+        "coord_max": int(coord_max),
+        "obj_min": int(obj_min),
+        "obj_max": int(obj_max),
     }
     if point_decimals is not None:
         format_vars["point_decimals"] = int(point_decimals)
@@ -238,6 +253,39 @@ def load_vocab2id(vocab2id_path: Path | None) -> tuple[dict[str, int], dict[str,
     return v, vl
 
 
+SAFE_LABEL_ALIASES: dict[str, str] = {
+    "man": "person",
+    "woman": "person",
+    "child": "person",
+    "girl": "person",
+    "boy": "person",
+    "baby": "person",
+    "boxer": "person",
+    "student": "person",
+    "football player": "person",
+    "baseball player": "person",
+    "wrestler": "person",
+    "chef": "person",
+    "construction worker": "person",
+    "dancer": "person",
+    "teacher": "person",
+    "referee": "person",
+    "spectator": "person",
+    "smartphone": "phone",
+    "computer laptop": "laptop",
+    "computer screen": "screen",
+    "computer monitor screen": "screen",
+    "wine glass": "glass",
+}
+
+
+def alias_label_text(label_text: str) -> str:
+    txt = " ".join(str(label_text or "").strip().split())
+    if not txt:
+        return ""
+    return SAFE_LABEL_ALIASES.get(txt.lower(), txt)
+
+
 def vocab_id(
     label_text: str,
     vocab2id: dict[str, int] | None = None,
@@ -245,7 +293,7 @@ def vocab_id(
 ) -> int:
     if not label_text:
         return -1
-    txt = str(label_text).strip()
+    txt = alias_label_text(label_text)
     if not txt:
         return -1
     v = vocab2id or {}
@@ -264,7 +312,7 @@ def direct_vocab_id(
 ) -> int:
     if not label_text:
         return -1
-    txt = str(label_text).strip()
+    txt = alias_label_text(label_text)
     if not txt:
         return -1
     v = vocab2id or {}
