@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -115,6 +116,53 @@ def group_normalize_advantages(
 
 
 # ---------------------------------------------------------------------------
+# Adaptive KL Controller (Rex-Omni / TRL 방식)
+# ---------------------------------------------------------------------------
+
+class AdaptiveKLController:
+    """KL coefficient that adapts to keep KL near a target value.
+
+    Based on: https://arxiv.org/pdf/1909.08593.pdf
+    Adapted from Rex-Omni verl/trainer/core_algos.py
+    """
+
+    def __init__(self, init_kl_coef: float, target_kl: float, horizon: float) -> None:
+        self.kl_coef = float(init_kl_coef)
+        self.target = float(target_kl)
+        self.horizon = float(horizon)
+
+    def update(self, current_kl: float, n_steps: int) -> None:
+        proportional_error = float(np.clip(current_kl / self.target - 1, -0.2, 0.2))
+        mult = 1.0 + proportional_error * float(n_steps) / self.horizon
+        self.kl_coef *= mult
+
+
+class FixedKLController:
+    """Fixed KL coefficient (no adaptation)."""
+
+    def __init__(self, init_kl_coef: float) -> None:
+        self.kl_coef = float(init_kl_coef)
+
+    def update(self, current_kl: float, n_steps: int) -> None:
+        pass
+
+
+def build_kl_controller(
+    kl_type: str,
+    init_kl_coef: float,
+    target_kl: float = 0.1,
+    horizon: float = 10000.0,
+) -> AdaptiveKLController | FixedKLController:
+    if kl_type == "adaptive":
+        return AdaptiveKLController(
+            init_kl_coef=init_kl_coef,
+            target_kl=target_kl,
+            horizon=horizon,
+        )
+    return FixedKLController(init_kl_coef=init_kl_coef)
+
+
+# ---------------------------------------------------------------------------
 # Log-prob utilities
 # ---------------------------------------------------------------------------
 
@@ -144,24 +192,175 @@ def compute_token_logprobs_sum(
     """Sum of per-token log-probs at answer positions (causal-LM shift).
 
     Returns (sum_logprobs [B], n_tokens [B]).
-    Both tensors are on the same device as logits.
     """
-    # Causal LM: logits[:, t] predicts input_ids[:, t+1]
-    shift_logits = logits[:, :-1, :]                       # [B, L-1, V]
-    shift_ids = input_ids[:, 1:].clamp(min=0)              # [B, L-1]
-    shift_mask = answer_mask[:, 1:].to(device=logits.device)  # [B, L-1]
+    shift_logits = logits[:, :-1, :]
+    shift_ids = input_ids[:, 1:].clamp(min=0)
+    shift_mask = answer_mask[:, 1:].to(device=logits.device)
 
     log_probs = F.log_softmax(shift_logits.float(), dim=-1)
-    token_lp = log_probs.gather(2, shift_ids.unsqueeze(-1)).squeeze(-1)  # [B, L-1]
+    token_lp = log_probs.gather(2, shift_ids.unsqueeze(-1)).squeeze(-1)
     token_lp = token_lp * shift_mask.float()
 
-    sum_lp = token_lp.sum(dim=1)               # [B]
-    n_tokens = shift_mask.float().sum(dim=1)   # [B]
+    sum_lp = token_lp.sum(dim=1)
+    n_tokens = shift_mask.float().sum(dim=1)
     return sum_lp, n_tokens
 
 
+def compute_token_logprobs(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Per-token log-probs for all positions (causal-LM shift).
+
+    Returns token_logprobs [B, L-1] — position i gives log P(token i+1 | context).
+    Masking (response_mask) is applied externally by the loss function.
+    """
+    shift_logits = logits[:, :-1, :]                   # [B, L-1, V]
+    shift_ids = input_ids[:, 1:].clamp(min=0)          # [B, L-1]
+    log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+    return log_probs.gather(2, shift_ids.unsqueeze(-1)).squeeze(-1)  # [B, L-1]
+
+
 # ---------------------------------------------------------------------------
-# GRPO objective
+# KL divergence (Rex-Omni / verl style — per-token)
+# ---------------------------------------------------------------------------
+
+def compute_kl_per_token(
+    log_probs: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    kl_penalty: str = "low_var_kl",
+) -> torch.Tensor:
+    """Per-token KL divergence estimate.
+
+    Args:
+        log_probs:     [B, L] current policy per-token log-probs
+        ref_log_probs: [B, L] reference policy per-token log-probs
+        kl_penalty:    one of "kl" | "abs" | "mse" | "low_var_kl"
+
+    Returns:
+        kl: [B, L] per-token KL estimates
+
+    Adapted from Rex-Omni verl/trainer/core_algos.py::compute_kl()
+    """
+    log_probs = log_probs.float()
+    ref_log_probs = ref_log_probs.float()
+
+    if kl_penalty == "kl":
+        return log_probs - ref_log_probs
+
+    if kl_penalty == "abs":
+        return (log_probs - ref_log_probs).abs()
+
+    if kl_penalty == "mse":
+        return 0.5 * (log_probs - ref_log_probs).square()
+
+    if kl_penalty == "low_var_kl":
+        # Joschu approximation: low-variance, numerically stable
+        # http://joschu.net/blog/kl-approx.html
+        kl = ref_log_probs - log_probs
+        kld = (kl.exp() - kl - 1.0).contiguous()
+        return torch.clamp(kld, min=-10.0, max=10.0)
+
+    raise NotImplementedError(f"Unknown kl_penalty: {kl_penalty}")
+
+
+# ---------------------------------------------------------------------------
+# Policy loss (Rex-Omni verl style — per-token, dual-clip)
+# ---------------------------------------------------------------------------
+
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean over masked positions; returns 0 if mask is all-False."""
+    mask = mask.to(dtype=torch.bool, device=x.device)
+    n = mask.float().sum()
+    if n < 1.0:
+        return x.new_zeros(())
+    return (x * mask.float()).sum() / n
+
+
+def compute_policy_loss_per_token(
+    old_log_probs: torch.Tensor,
+    new_log_probs: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.2,
+    clip_ratio_dual: float = 3.0,
+    kl_beta: float = 0.01,
+    kl_penalty: str = "low_var_kl",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Per-token GRPO policy loss with dual-clip and KL penalty.
+
+    Implements Rex-Omni verl/trainer/core_algos.py::compute_policy_loss() adapted
+    for single-GPU training with built-in KL regularisation.
+
+    Args:
+        old_log_probs:  [B, L] log-probs cached at rollout time
+        new_log_probs:  [B, L] log-probs of current policy (with grad)
+        ref_log_probs:  [B, L] log-probs of frozen reference model
+        advantages:     [B] scalar advantage per sample (broadcast to token level)
+        response_mask:  [B, L] True at response token positions
+        clip_ratio_low: lower PPO clip bound (1 - eps)
+        clip_ratio_high: upper PPO clip bound (1 + eps); can be > low for DAPO
+        clip_ratio_dual: dual-clip threshold (prevents large negative loss when adv<0)
+        kl_beta:        KL penalty coefficient
+        kl_penalty:     KL approximation mode
+
+    Returns:
+        (total_loss, stats_dict)
+    """
+    # Broadcast scalar advantage → token level [B, L]
+    adv_token = advantages.float().to(device=new_log_probs.device).unsqueeze(-1).expand_as(new_log_probs)
+
+    # Importance sampling ratio per token
+    neg_approx_kl = new_log_probs - old_log_probs          # [B, L]
+    ratio = torch.exp(neg_approx_kl)                        # [B, L]
+    clipped_ratio = torch.exp(
+        torch.clamp(
+            neg_approx_kl,
+            math.log(1.0 - clip_ratio_low),
+            math.log(1.0 + clip_ratio_high),
+        )
+    )
+
+    # PPO surrogate losses
+    pg_loss_unclipped = -adv_token * ratio                  # [B, L]
+    pg_loss_clipped   = -adv_token * clipped_ratio          # [B, L]
+    pg_loss_dual      = -adv_token * clip_ratio_dual        # [B, L] — dual-clip floor
+
+    # Higher clip: max(unclipped, clipped) — penalises ratio > 1+eps when adv>0
+    pg_loss_higher = torch.max(pg_loss_unclipped, pg_loss_clipped)
+    # Dual clip: only active when adv < 0 — prevents over-suppression of unlikely actions
+    pg_loss_final = torch.where(adv_token < 0, torch.min(pg_loss_higher, pg_loss_dual), pg_loss_higher)
+
+    pg_loss = _masked_mean(pg_loss_final, response_mask)
+
+    # Clip fraction statistics
+    clip_frac_high = _masked_mean((pg_loss_unclipped < pg_loss_clipped).float(), response_mask)
+    clip_frac_low  = _masked_mean(
+        (pg_loss_higher > pg_loss_dual).float() * (adv_token < 0).float(),
+        response_mask,
+    )
+    approx_kl_mean = _masked_mean(-neg_approx_kl, response_mask)
+
+    # KL penalty from reference model
+    kl_tokens = compute_kl_per_token(new_log_probs, ref_log_probs, kl_penalty=kl_penalty)
+    kl_loss = _masked_mean(kl_tokens, response_mask)
+
+    total_loss = pg_loss + float(kl_beta) * kl_loss
+
+    return total_loss, {
+        "pg_loss":         float(pg_loss.detach().item()),
+        "kl_mean":         float(kl_loss.detach().item()),
+        "approx_kl":       float(approx_kl_mean.detach().item()),
+        "clip_frac_high":  float(clip_frac_high.detach().item()),
+        "clip_frac_low":   float(clip_frac_low.detach().item()),
+        "ratio_mean":      float(_masked_mean(ratio, response_mask).detach().item()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Legacy GRPO objective (sequence-level) — kept for backward compatibility
 # ---------------------------------------------------------------------------
 
 def compute_grpo_loss(
@@ -173,37 +372,28 @@ def compute_grpo_loss(
     clip_eps: float = 0.2,
     kl_beta: float = 0.02,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """GRPO clipped policy-gradient loss + KL-from-ref penalty.
-
-    All logprob arguments are per-sequence sums; normalised by n_tokens internally.
-
-    L = -mean[ min(r*A, clip(r,1-eps,1+eps)*A) ] + kl_beta * mean[log(pi/pi_ref)]
-
-    Returns (loss, stats_dict).
-    """
+    """Sequence-level GRPO loss (legacy). Prefer compute_policy_loss_per_token."""
     n = n_tokens.clamp(min=1.0).to(device=new_lp_sum.device, dtype=torch.float32)
     adv = advantages.to(device=new_lp_sum.device, dtype=torch.float32)
     new_lp = new_lp_sum.to(dtype=torch.float32)
     old_lp = old_lp_sum.to(device=new_lp_sum.device, dtype=torch.float32)
     ref_lp = ref_lp_sum.to(device=new_lp_sum.device, dtype=torch.float32)
 
-    # Per-token average log-ratio (current vs old-at-rollout)
     log_ratio = (new_lp - old_lp) / n
-    ratio = log_ratio.exp().clamp(0.0, 10.0)  # safety clamp against exp overflow
+    ratio = log_ratio.exp().clamp(0.0, 10.0)
 
     pg_unclipped = ratio * adv
     pg_clipped = ratio.clamp(1.0 - float(clip_eps), 1.0 + float(clip_eps)) * adv
     pg_loss = -torch.min(pg_unclipped, pg_clipped).mean()
 
-    # KL: E[log(pi_theta / pi_ref)] evaluated on rollout samples
     kl_per_sample = (new_lp - ref_lp) / n
     kl_loss = kl_per_sample.mean()
 
     total_loss = pg_loss + float(kl_beta) * kl_loss
 
     return total_loss, {
-        "pg_loss": float(pg_loss.detach().item()),
-        "kl_mean": float(kl_loss.detach().item()),
+        "pg_loss":    float(pg_loss.detach().item()),
+        "kl_mean":    float(kl_loss.detach().item()),
         "ratio_mean": float(ratio.detach().mean().item()),
-        "ratio_std": float(ratio.detach().std().item()) if ratio.numel() > 1 else 0.0,
+        "ratio_std":  float(ratio.detach().std().item()) if ratio.numel() > 1 else 0.0,
     }

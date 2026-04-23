@@ -66,7 +66,11 @@ from .utils.processor_collate import (
     build_train_inputs,
 )
 from .utils.rl_utils import (
-    compute_grpo_loss,
+    AdaptiveKLController,
+    FixedKLController,
+    build_kl_controller,
+    compute_policy_loss_per_token,
+    compute_token_logprobs,
     compute_token_logprobs_sum,
     compute_total_reward,
     group_normalize_advantages,
@@ -390,6 +394,84 @@ def checkpoint_monitor_value(
     return float(val_gen_metrics.get(metric_key, 0.0))
 
 
+def _infer_logprobs_chunked(
+    model: torch.nn.Module,
+    lp_joint: dict[str, Any],
+    input_ids: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    micro_bsz: int,
+) -> torch.Tensor:
+    """Inference-mode per-token log-probs, processed in micro-batches.
+
+    Splits the B*G batch into chunks of `micro_bsz` so that only one chunk's
+    activations + logits live on GPU at a time.  Returns [B*G, L-1] on CPU.
+
+    pixel_values in Qwen-VL is a flat [total_patches, C, h, w] tensor — not
+    [B, ...].  We use image_grid_thw (num_images, 3) to slice it per sample.
+    When image_grid_thw is unavailable we fall back to equal-size splitting.
+    """
+    total = int(input_ids.shape[0])
+    if micro_bsz <= 0 or micro_bsz >= total:
+        # No chunking: process full batch at once
+        joint_dev = to_device(lp_joint, device=device)
+        ids_dev = input_ids.to(device=device)
+        with torch.inference_mode():
+            with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                enabled=(device.type == "cuda")):
+                out = model(joint_inputs=joint_dev, use_cache=False)
+        lp = compute_token_logprobs(out["logits"].detach(), ids_dev).cpu()
+        del out
+        return lp
+
+    # --- Build per-sample patch counts from image_grid_thw ---
+    grid_thw = lp_joint.get("image_grid_thw", None)
+    if torch.is_tensor(grid_thw) and int(grid_thw.shape[0]) == total:
+        # Each row is (T, H, W); patches_i = T * H * W
+        patches_per_sample = [
+            int(grid_thw[i, 0]) * int(grid_thw[i, 1]) * int(grid_thw[i, 2])
+            for i in range(total)
+        ]
+    else:
+        # Fallback: assume equal patch counts
+        pv = lp_joint.get("pixel_values", None)
+        total_patches = int(pv.shape[0]) if torch.is_tensor(pv) else 0
+        base = total_patches // total if total > 0 else 0
+        patches_per_sample = [base] * total
+
+    # --- Slice helper: extract keys for sample indices [start, end) ---
+    def _slice_joint(start: int, end: int) -> dict[str, Any]:
+        sliced: dict[str, Any] = {}
+        patch_start = sum(patches_per_sample[:start])
+        patch_end   = sum(patches_per_sample[:end])
+        for k, v in lp_joint.items():
+            if not torch.is_tensor(v):
+                sliced[k] = v
+            elif k == "pixel_values":
+                sliced[k] = v[patch_start:patch_end]
+            elif k == "image_grid_thw":
+                sliced[k] = v[start:end]
+            elif v.shape[0] == total:
+                sliced[k] = v[start:end]
+            else:
+                sliced[k] = v
+        return sliced
+
+    # --- Chunked forward ---
+    chunks: list[torch.Tensor] = []
+    for start in range(0, total, micro_bsz):
+        end = min(start + micro_bsz, total)
+        chunk_joint = to_device(_slice_joint(start, end), device=device)
+        chunk_ids   = input_ids[start:end].to(device=device)
+        with torch.inference_mode():
+            with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                enabled=(device.type == "cuda")):
+                out = model(joint_inputs=chunk_joint, use_cache=False)
+        chunks.append(compute_token_logprobs(out["logits"].detach(), chunk_ids).cpu())
+        del out, chunk_joint
+    return torch.cat(chunks, dim=0)   # [B*G, L-1]
+
+
 def _run_rl_training(
     *,
     args: argparse.Namespace,
@@ -420,11 +502,9 @@ def _run_rl_training(
     Returns (global_step, best_val_loss).
     """
     # ------------------------------------------------------------------
-    # RL hyperparameters
+    # RL hyperparameters (Rex-Omni / verl style)
     # ------------------------------------------------------------------
     rl_group_size = max(1, int(getattr(args, "rl_group_size", 4)))
-    rl_clip_eps = float(getattr(args, "rl_clip_eps", 0.2))
-    rl_kl_beta = float(getattr(args, "rl_kl_beta", 0.02))
     rl_lr = float(getattr(args, "rl_lr", getattr(args, "lr", 1e-5)))
     rl_weight_decay = float(getattr(args, "weight_decay", 0.01))
     rl_max_grad_norm = float(getattr(args, "max_grad_norm", 1.0))
@@ -437,6 +517,28 @@ def _run_rl_training(
     rl_top_p = float(getattr(args, "rl_top_p", 0.9))
     rl_epochs = max(1, int(getattr(args, "epochs", 5)))
     rl_max_new_tokens = max(16, int(getattr(args, "generation_max_new_tokens", 16)))
+
+    # PPO clipping — asymmetric + dual-clip (Rex-Omni)
+    rl_clip_ratio_low  = float(getattr(args, "rl_clip_ratio_low",  getattr(args, "rl_clip_eps", 0.2)))
+    rl_clip_ratio_high = float(getattr(args, "rl_clip_ratio_high", getattr(args, "rl_clip_eps", 0.2)))
+    rl_clip_ratio_dual = float(getattr(args, "rl_clip_ratio_dual", 3.0))
+
+    # KL controller — adaptive or fixed (Rex-Omni AdaptiveKLController)
+    kl_ctrl = build_kl_controller(
+        kl_type   = str(getattr(args, "rl_kl_type",    "fixed")),
+        init_kl_coef = float(getattr(args, "rl_kl_beta",   0.01)),
+        target_kl = float(getattr(args, "rl_kl_target", 0.1)),
+        horizon   = float(getattr(args, "rl_kl_horizon", 10000.0)),
+    )
+    rl_kl_penalty = str(getattr(args, "rl_kl_penalty", "low_var_kl"))
+
+    # Multi-epoch rollout reuse
+    n_ppo_epochs = max(1, int(getattr(args, "rl_n_ppo_epochs", 1)))
+
+    # Logprob micro-batch size: limits peak VRAM during ref/old forward passes.
+    # -1 = full B*G batch at once. Set to rl_group_size (e.g. 4) to process one
+    # prompt group at a time — safest option for large batch_size.
+    lp_micro_bsz = int(getattr(args, "rl_logprob_micro_batch_size", -1))
     accum_steps = max(1, int(getattr(args, "grad_accum_steps", 4)))
     run_val_metrics_every_n = max(1, int(getattr(args, "run_val_metrics_every_n_epochs", 1)))
     checkpoint_monitor = str(getattr(args, "checkpoint_monitor", "val_dist")).strip() or "val_dist"
@@ -450,7 +552,7 @@ def _run_rl_training(
     pad_token_id: int | None = getattr(tokenizer, "pad_token_id", None)
 
     # ------------------------------------------------------------------
-    # Ref model: frozen copy of the SFT checkpoint
+    # Ref model: frozen copy of the SFT checkpoint — kept on GPU for speed.
     # ------------------------------------------------------------------
     print("[RL] loading frozen reference model …")
     _ref_base = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
@@ -462,7 +564,7 @@ def _run_rl_training(
                 _ref_base, model_id=str(_adapter_dir), is_trainable=False,
             )
             _ref_tmp = QwenTextGenerationModel(qwen_model=_ref_qwen)
-            load_added_token_rows(ckpt_dir=checkpoint_dir, model=_ref_tmp, device=device)
+            load_added_token_rows(ckpt_dir=checkpoint_dir, model=_ref_tmp, device=torch.device("cpu"))
         else:
             _ref_qwen = _ref_base
             print("[RL][WARN] no lora_adapter found in checkpoint_dir; using base model as ref.")
@@ -473,7 +575,7 @@ def _run_rl_training(
     ref_model.eval()
     for _p in ref_model.parameters():
         _p.requires_grad_(False)
-    print("[RL] reference model loaded and frozen.")
+    print("[RL] reference model loaded and frozen on GPU.")
 
     # ------------------------------------------------------------------
     # RL dataloader (inference-mode prompts + GT labels + raw images)
@@ -514,9 +616,10 @@ def _run_rl_training(
 
     print(
         f"[RL] starting GRPO training: epochs={rl_epochs} group_size={rl_group_size} "
-        f"clip_eps={rl_clip_eps} kl_beta={rl_kl_beta} lr={rl_lr} "
-        f"reward=(pt={reward_point_weight} obj={reward_object_weight} "
-        f"joint={reward_joint_bonus} extra_pen={reward_extra_penalty} beta={reward_point_beta})"
+        f"clip_low={rl_clip_ratio_low} clip_high={rl_clip_ratio_high} clip_dual={rl_clip_ratio_dual} "
+        f"kl_beta={kl_ctrl.kl_coef} kl_type={getattr(args, 'rl_kl_type', 'fixed')} lr={rl_lr} "
+        f"n_ppo_epochs={n_ppo_epochs} "
+        f"reward=(pt={reward_point_weight} obj={reward_object_weight} beta={reward_point_beta})"
     )
 
     global_step = 0
@@ -644,10 +747,7 @@ def _run_rl_training(
 
             # -------------------------------------------------------
             # 5. Build logprob joint_inputs: B*G (prompt + sampled answer)
-            #    Re-uses resized scene images so the vision encoder runs on
-            #    the same pixel content as the rollout.
             # -------------------------------------------------------
-            # Expand scene_images and text_inputs B → B*G
             exp_scenes: list[Any] = [scene_images_b[k // G] for k in range(B * G)]
             exp_texts: list[str] = [text_inputs_b[k // G] for k in range(B * G)]
             tv_ones = torch.ones(B * G, dtype=torch.float32)
@@ -663,12 +763,12 @@ def _run_rl_training(
                 target_format_valid=tv_ones,
                 max_text_length=int(getattr(args, "max_text_length", 256)),
             )
-            # Answer mask: union of point / object / format masks
-            # Falls back to build_answer_mask for outputs where format was invalid
-            _struct_mask = (_mpt | _mobj | _mfmt)  # [B*G, L]
-            _has_struct = _struct_mask.any(dim=1)   # [B*G]
+
+            # response_mask: all generated token positions (Rex-Omni style)
+            # Falls back to structured mask for structured tokens where available.
+            _struct_mask = (_mpt | _mobj | _mfmt)          # [B*G, L]
+            _has_struct = _struct_mask.any(dim=1)
             if not _has_struct.all():
-                # For samples with zero structured tokens, use full answer span mask
                 _fallback = build_answer_mask(
                     processor=processor,
                     joint_inputs=lp_joint,
@@ -676,46 +776,42 @@ def _run_rl_training(
                     target_valid=tv_ones,
                 )
                 _struct_mask[~_has_struct] = _fallback[~_has_struct]
-            answer_mask = _struct_mask  # [B*G, L]
+            response_mask = _struct_mask                    # [B*G, L]
 
-            lp_input_ids = lp_joint["input_ids"]   # [B*G, L]
-
-            # -------------------------------------------------------
-            # 6. Old logprobs (current policy, no grad, eval)
-            # Must match rollout's dropout state (eval) so ratio ≈ 1 at step 0.
-            # -------------------------------------------------------
-            lp_joint_dev = to_device(lp_joint, device=device)
-            answer_mask_dev = answer_mask.to(device=device)
+            lp_input_ids  = lp_joint["input_ids"]            # [B*G, L]
+            lp_joint_dev  = to_device(lp_joint, device=device)
             input_ids_dev = lp_input_ids.to(device=device)
-
-            # policy_model is already in eval() from the rollout step above
-            with torch.no_grad():
-                with torch.autocast(
-                    device_type=device.type, dtype=amp_dtype,
-                    enabled=(device.type == "cuda"),
-                ):
-                    _out_old = policy_model(joint_inputs=lp_joint_dev, use_cache=False)
-            old_lp_sum, n_tok = compute_token_logprobs_sum(
-                _out_old["logits"].detach(), input_ids_dev, answer_mask_dev,
-            )
+            resp_mask_dev = response_mask[:, 1:].to(device=device)   # causal shift
 
             # -------------------------------------------------------
-            # 7. Ref logprobs (frozen ref model, no grad)
+            # 6. Ref log-probs — per-token [B*G, L-1] (Rex-Omni style)
             # -------------------------------------------------------
-            with torch.no_grad():
-                with torch.autocast(
-                    device_type=device.type, dtype=amp_dtype,
-                    enabled=(device.type == "cuda"),
-                ):
-                    _out_ref = ref_model(joint_inputs=lp_joint_dev, use_cache=False)
-            ref_lp_sum, _ = compute_token_logprobs_sum(
-                _out_ref["logits"].detach(), input_ids_dev, answer_mask_dev,
-            )
+            ref_log_probs = _infer_logprobs_chunked(
+                model=ref_model,
+                lp_joint=lp_joint,
+                input_ids=lp_input_ids,
+                device=device,
+                amp_dtype=amp_dtype,
+                micro_bsz=lp_micro_bsz,
+            )   # [B*G, L-1] on CPU
 
             # -------------------------------------------------------
-            # 8. New logprobs (policy with grad, still eval mode) + GRPO loss
-            # Keep eval() so dropout state matches old_lp exactly.
-            # eval() does not disable gradient computation; backward works normally.
+            # 7. Old log-probs — per-token [B*G, L-1] cached at rollout time
+            #    (Rex-Omni: old_lp is computed once, then reused across n_ppo_epochs)
+            # -------------------------------------------------------
+            policy_model.eval()
+            old_log_probs = _infer_logprobs_chunked(
+                model=policy_model,
+                lp_joint=lp_joint,
+                input_ids=lp_input_ids,
+                device=device,
+                amp_dtype=amp_dtype,
+                micro_bsz=lp_micro_bsz,
+            )   # [B*G, L-1] on CPU
+
+            # -------------------------------------------------------
+            # 8. n_ppo_epochs gradient updates on cached rollout buffer
+            #    (Rex-Omni core: 1 rollout → multiple policy updates)
             # -------------------------------------------------------
             is_last_batch = (step == num_rl_batches)
             remainder = num_rl_batches % accum_steps
@@ -725,35 +821,43 @@ def _run_rl_training(
                 else int(accum_steps)
             )
 
-            with torch.autocast(
-                device_type=device.type, dtype=amp_dtype,
-                enabled=(device.type == "cuda"),
-            ):
-                _out_new = policy_model(joint_inputs=lp_joint_dev, use_cache=False)
-            new_lp_sum, _ = compute_token_logprobs_sum(
-                _out_new["logits"], input_ids_dev, answer_mask_dev,
-            )
+            for _ppo_ep in range(n_ppo_epochs):
+                with torch.autocast(
+                    device_type=device.type, dtype=amp_dtype,
+                    enabled=(device.type == "cuda"),
+                ):
+                    _out_new = policy_model(joint_inputs=lp_joint_dev, use_cache=False)
+                new_log_probs = compute_token_logprobs(
+                    _out_new["logits"], input_ids_dev,
+                )   # [B*G, L-1] — on GPU, with grad
 
-            rl_loss, grpo_stats = compute_grpo_loss(
-                new_lp_sum=new_lp_sum,
-                old_lp_sum=old_lp_sum.detach(),
-                ref_lp_sum=ref_lp_sum.detach(),
-                n_tokens=n_tok.detach(),
-                advantages=adv_tensor,
-                clip_eps=rl_clip_eps,
-                kl_beta=rl_kl_beta,
-            )
-            scaled_loss = rl_loss / float(max(current_accum, 1))
-            scaled_loss.backward()
+                rl_loss, grpo_stats = compute_policy_loss_per_token(
+                    old_log_probs=old_log_probs.to(device=device),
+                    new_log_probs=new_log_probs,
+                    ref_log_probs=ref_log_probs.to(device=device),
+                    advantages=adv_tensor,
+                    response_mask=resp_mask_dev,
+                    clip_ratio_low=rl_clip_ratio_low,
+                    clip_ratio_high=rl_clip_ratio_high,
+                    clip_ratio_dual=rl_clip_ratio_dual,
+                    kl_beta=kl_ctrl.kl_coef,
+                    kl_penalty=rl_kl_penalty,
+                )
+                scaled_loss = rl_loss / float(max(current_accum * n_ppo_epochs, 1))
+                scaled_loss.backward()
 
-            sum_pg_loss += float(grpo_stats["pg_loss"])
-            sum_kl += float(grpo_stats["kl_mean"])
+                sum_pg_loss += float(grpo_stats["pg_loss"])
+                sum_kl      += float(grpo_stats["kl_mean"])
+
+            # Adaptive KL update after last ppo epoch
+            kl_ctrl.update(
+                current_kl=float(grpo_stats["kl_mean"]),
+                n_steps=accum_steps,
+            )
 
             should_step = ((step % accum_steps) == 0) or is_last_batch
             if should_step:
-                _grad_norm = torch.nn.utils.clip_grad_norm_(
-                    trainable_params, max_norm=rl_max_grad_norm,
-                )
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=rl_max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -765,16 +869,20 @@ def _run_rl_training(
                         n_roll = max(rollout_count, 1)
                         wandb_run.log(
                             {
-                                "rl/reward_mean": sum_reward / n_roll,
-                                "rl/reward_point_mean": sum_reward_pt / n_roll,
+                                "rl/reward_mean":        sum_reward / n_roll,
+                                "rl/reward_point_mean":  sum_reward_pt / n_roll,
                                 "rl/reward_object_mean": sum_reward_obj / n_roll,
-                                "rl/reward_joint_mean": sum_reward_joint / n_roll,
+                                "rl/reward_joint_mean":  sum_reward_joint / n_roll,
                                 "rl/invalid_format_rate": sum_invalid_fmt / n_roll,
-                                "rl/extra_text_rate": sum_extra_txt / n_roll,
-                                "rl/kl_mean": sum_kl / max(update_count, 1),
-                                "rl/policy_loss": sum_pg_loss / max(update_count, 1),
-                                "rl/adv_std": float(adv_tensor.std().item()),
-                                "rl/learning_rate": float(optimizer.param_groups[0]["lr"]),
+                                "rl/extra_text_rate":    sum_extra_txt / n_roll,
+                                "rl/kl_mean":            sum_kl / max(update_count, 1),
+                                "rl/kl_coef":            kl_ctrl.kl_coef,
+                                "rl/policy_loss":        sum_pg_loss / max(update_count, 1),
+                                "rl/clip_frac_high":     float(grpo_stats.get("clip_frac_high", 0.0)),
+                                "rl/clip_frac_low":      float(grpo_stats.get("clip_frac_low", 0.0)),
+                                "rl/ratio_mean":         float(grpo_stats.get("ratio_mean", 1.0)),
+                                "rl/adv_std":            float(adv_tensor.std().item()),
+                                "rl/learning_rate":      float(optimizer.param_groups[0]["lr"]),
                                 "rl/epoch": (float(epoch) - 1.0) + float(update_count) / max(float(updates_per_epoch), 1.0),
                             },
                             step=global_step,
@@ -785,6 +893,7 @@ def _run_rl_training(
                 it.set_postfix(
                     rwd=f"{(sum_reward / n_r):.3f}",
                     kl=f"{(sum_kl / max(update_count, 1)):.4f}",
+                    kl_c=f"{kl_ctrl.kl_coef:.4f}",
                 )
 
         # -------------------------------------------------------
