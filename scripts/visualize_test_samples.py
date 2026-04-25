@@ -264,6 +264,7 @@ def main() -> None:
     vocab2id, vocab2id_lower = load_vocab2id(vocab2id_path)
     num_classes = infer_num_classes(vocab2id, vocab2id_path)
     id2label = build_id2label(vocab2id)
+    coord_bins = int(getattr(args, "coord_bins", 1000))
 
     _resize_mode = str(getattr(args, "image_resize_mode", "native")).strip().lower()
     _fixed_resize = (_resize_mode == "fixed")
@@ -276,7 +277,11 @@ def main() -> None:
         min_pixels=None if _fixed_resize else int(getattr(args, "min_pixels", 12544)),
         max_pixels=None if _fixed_resize else int(getattr(args, "max_pixels", 2007040)),
     )
-    register_gaze_special_tokens(processor.tokenizer, num_classes=num_classes)
+    register_gaze_special_tokens(
+        processor.tokenizer,
+        num_classes=num_classes,
+        coord_bins=coord_bins,
+    )
 
     test_label_map, test_label_text_map, test_label_ids_map, _ = load_test_label_map(
         test_labels,
@@ -309,6 +314,7 @@ def main() -> None:
         num_classes=int(num_classes),
         visual_prompting=bool(args.visual_prompting),
         image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
+        coord_bins=coord_bins,
     )
     collator = QwenTestCollator(
         processor=processor,
@@ -358,6 +364,7 @@ def main() -> None:
         amp_dtype=amp_dtype,
         processor=collator.processor,
         num_classes=int(num_classes),
+        coord_bins=coord_bins,
         show_tqdm=bool(args.show_tqdm),
         desc="Visualize",
         max_new_tokens=int(args.generation_max_new_tokens),

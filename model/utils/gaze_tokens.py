@@ -11,14 +11,14 @@ OBJECT_PREFIX: str = "Object:"
 GAZE_OBJ_UNKNOWN: str = "<obj_unknown>"
 FORMAT_TOKENS: list[str] = []
 
-_LOC_RE = re.compile(r"^<loc_(\d{3})>$")
+_LOC_RE = re.compile(r"^<loc_(\d+)>$")
 _OBJ_RE = re.compile(r"^<obj_(\d+)>$")
 _STRICT_RE = re.compile(
     r"^"
     r"<\|im_start\|>"
     r"\s*Point:\s*"
-    r"(<loc_\d{3}>)"
-    r"(<loc_\d{3}>)"
+    r"(<loc_\d+>)"
+    r"(<loc_\d+>)"
     r"\s*"
     r"Object:\s*"
     r"(<obj_\d+>|<obj_unknown>)"
@@ -32,27 +32,37 @@ def _obj_token_width(num_classes: int) -> int:
     return max(3, len(str(max(0, int(num_classes) - 1))))
 
 
-def quantize_coord(coord: float, bins: int = 1000) -> int:
+def _loc_token_width(coord_bins: int = COORD_BINS) -> int:
+    return max(3, len(str(max(0, int(coord_bins) - 1))))
+
+
+def quantize_coord(coord: float, bins: int = COORD_BINS) -> int:
     b = int(bins)
+    if b <= 0:
+        raise ValueError(f"bins must be positive, got: {bins!r}")
     return int(max(0, min(b - 1, round(float(coord) * (b - 1)))))
 
 
-def dequantize_coord(bin_idx: int, bins: int = 1000) -> float:
+def dequantize_coord(bin_idx: int, bins: int = COORD_BINS) -> float:
     return float(int(bin_idx)) / float(max(1, int(bins) - 1))
 
 
-def format_loc_token(bin_idx: int) -> str:
-    return f"<loc_{int(bin_idx):03d}>"
+def format_loc_token(bin_idx: int, width: int = 3) -> str:
+    return f"<loc_{int(bin_idx):0{int(width)}d}>"
 
 
 def format_obj_token(obj_id: int, width: int) -> str:
     return f"<obj_{int(obj_id):0{int(width)}d}>"
 
 
-def build_gaze_special_tokens(num_classes: int) -> list[str]:
+def build_gaze_special_tokens(num_classes: int, coord_bins: int = COORD_BINS) -> list[str]:
     tokens: list[str] = []
-    for i in range(COORD_BINS):
-        tokens.append(format_loc_token(i))
+    coord_n = int(coord_bins)
+    if coord_n <= 0:
+        raise ValueError(f"coord_bins must be positive, got: {coord_bins!r}")
+    loc_w = _loc_token_width(coord_n)
+    for i in range(coord_n):
+        tokens.append(format_loc_token(i, loc_w))
     w = _obj_token_width(num_classes)
     for i in range(int(num_classes)):
         tokens.append(format_obj_token(i, w))
@@ -60,8 +70,12 @@ def build_gaze_special_tokens(num_classes: int) -> list[str]:
     return tokens
 
 
-def register_gaze_special_tokens(tokenizer: Any, num_classes: int) -> dict[str, int]:
-    tokens = build_gaze_special_tokens(num_classes)
+def register_gaze_special_tokens(
+    tokenizer: Any,
+    num_classes: int,
+    coord_bins: int = COORD_BINS,
+) -> dict[str, int]:
+    tokens = build_gaze_special_tokens(num_classes, coord_bins=coord_bins)
     existing = set(tokenizer.get_vocab().keys())
     new_tokens = [t for t in tokens if t not in existing]
     if new_tokens:
@@ -84,9 +98,12 @@ def build_structured_target_text(
     num_classes: int,
     *,
     obj_token: str | None = None,
+    coord_bins: int = COORD_BINS,
 ) -> str:
-    bx = quantize_coord(float(point_x))
-    by = quantize_coord(float(point_y))
+    coord_n = int(coord_bins)
+    bx = quantize_coord(float(point_x), bins=coord_n)
+    by = quantize_coord(float(point_y), bins=coord_n)
+    loc_w = _loc_token_width(coord_n)
     if str(obj_token or "").strip():
         resolved_obj_tok = str(obj_token).strip()
     else:
@@ -95,8 +112,8 @@ def build_structured_target_text(
     return (
         f"{ANSWER_START}"
         f"{POINT_PREFIX} "
-        f"{format_loc_token(bx)}"
-        f"{format_loc_token(by)}"
+        f"{format_loc_token(bx, loc_w)}"
+        f"{format_loc_token(by, loc_w)}"
         f"\n"
         f"{OBJECT_PREFIX} "
         f"{resolved_obj_tok}"
@@ -104,7 +121,11 @@ def build_structured_target_text(
     )
 
 
-def parse_structured_output_text(text: str, num_classes: int) -> dict:
+def parse_structured_output_text(
+    text: str,
+    num_classes: int,
+    coord_bins: int = COORD_BINS,
+) -> dict:
     s = str(text or "").strip()
     m = _STRICT_RE.match(s)
     if m is None:
@@ -132,7 +153,11 @@ def parse_structured_output_text(text: str, num_classes: int) -> dict:
         }
 
     nc = int(num_classes)
-    if bx >= COORD_BINS or by >= COORD_BINS:
+    coord_n = int(coord_bins)
+    if coord_n <= 0:
+        raise ValueError(f"coord_bins must be positive, got: {coord_bins!r}")
+
+    if bx >= coord_n or by >= coord_n:
         return {
             "valid_format": False,
             "has_extra_text": False,
@@ -147,7 +172,7 @@ def parse_structured_output_text(text: str, num_classes: int) -> dict:
             "valid_format": True,
             "has_extra_text": False,
             "point_bins": (bx, by),
-            "point_xy": (dequantize_coord(bx), dequantize_coord(by)),
+            "point_xy": (dequantize_coord(bx, bins=coord_n), dequantize_coord(by, bins=coord_n)),
             "object_id": None,
             "object_unknown": True,
         }
@@ -169,19 +194,10 @@ def parse_structured_output_text(text: str, num_classes: int) -> dict:
         "valid_format": not out_of_range,
         "has_extra_text": False,
         "point_bins": (bx, by),
-        "point_xy": (dequantize_coord(bx), dequantize_coord(by)),
+        "point_xy": (dequantize_coord(bx, bins=coord_n), dequantize_coord(by, bins=coord_n)),
         "object_id": oid,
         "object_unknown": False,
     }
-
-
-def parse_structured_output_ids(
-    token_ids: list[int],
-    tokenizer: Any,
-    num_classes: int,
-) -> dict:
-    text = tokenizer.decode(token_ids, skip_special_tokens=False)
-    return parse_structured_output_text(str(text).strip(), num_classes)
 
 
 def is_valid_structured_output(parsed: dict) -> bool:

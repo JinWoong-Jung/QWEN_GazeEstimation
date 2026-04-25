@@ -134,6 +134,16 @@ def build_structured_masks(
     if tokenizer is None:
         return mask_pt, mask_obj, mask_fmt
 
+    # Batch tokenize all target texts once (1 call instead of bsz calls).
+    raw_out = tokenizer(
+        [str(target_texts[i]) if i < len(target_texts) else "" for i in range(bsz)],
+        add_special_tokens=False,
+        return_attention_mask=False,
+    )
+    batch_ans_ids: list[list[int]] = raw_out.get("input_ids", [])
+    if batch_ans_ids and not isinstance(batch_ans_ids[0], list):
+        batch_ans_ids = [batch_ans_ids]
+
     for i in range(bsz):
         if i >= len(target_texts):
             continue
@@ -149,12 +159,7 @@ def build_structured_masks(
             continue
 
         seq_ids = [int(x) for x in input_ids[i, :valid_len].tolist()]
-        ans_txt = str(target_texts[i])
-        out = tokenizer(ans_txt, add_special_tokens=False, return_attention_mask=False)
-        ans_ids = out.get("input_ids", [])
-        if isinstance(ans_ids, list) and ans_ids and isinstance(ans_ids[0], list):
-            ans_ids = ans_ids[0]
-        ans_ids = [int(x) for x in ans_ids]
+        ans_ids = [int(x) for x in (batch_ans_ids[i] if i < len(batch_ans_ids) else [])]
 
         ans_start = find_subseq(seq_ids, ans_ids, from_right=True)
         if ans_start < 0:
@@ -162,7 +167,8 @@ def build_structured_masks(
 
         tok_strs: list[str] = []
         if hasattr(tokenizer, "convert_ids_to_tokens"):
-            tok_strs = [str(tokenizer.convert_ids_to_tokens(int(tid))) for tid in ans_ids]
+            raw_toks = tokenizer.convert_ids_to_tokens(ans_ids)
+            tok_strs = [str(t) for t in raw_toks]
         else:
             tok_strs = [str(tid) for tid in ans_ids]
 

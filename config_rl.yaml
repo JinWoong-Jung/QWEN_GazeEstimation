@@ -75,6 +75,7 @@ prompt:
     Object: <obj_KKK><|im_end|>
 
 model:
+  coord_bins: 128
   attn_implementation: "sdpa"
   max_text_length: 256
   lora_r: 16

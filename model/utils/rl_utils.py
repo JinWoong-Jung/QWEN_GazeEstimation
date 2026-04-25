@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 from .eval_utils import l2_stats
-from .gaze_tokens import parse_structured_output_text
 
 
 # ---------------------------------------------------------------------------

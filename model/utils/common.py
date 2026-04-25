@@ -10,10 +10,6 @@ def to_device(batch: dict[str, Any], device: Any) -> dict[str, Any]:
     return out
 
 
-def normalize_text(text: str) -> str:
-    return " ".join(str(text or "").strip().lower().split())
-
-
 def chat_text(
     processor: Any,
     user_text: str,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -129,16 +130,20 @@ def resolve_model_source(path: str, *, default_namespace: str = "Qwen") -> str:
 
 def set_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(int(seed))
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    if hasattr(torch, "use_deterministic_algorithms"):
-        torch.use_deterministic_algorithms(True, warn_only=True)
+    if os.environ.get("QWEN_DETERMINISTIC", "").lower() in {"1", "true"}:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        if hasattr(torch, "use_deterministic_algorithms"):
+            torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = True
 
 
 def parse_dtype(dtype: str) -> torch.dtype | str:
@@ -313,6 +318,7 @@ def maybe_save_generation_preview(
     amp_dtype: torch.dtype,
     processor: Any,
     num_classes: int,
+    coord_bins: int,
 ) -> None:
     preview_n = max(0, int(getattr(args, "preview_test_samples", 0)))
     if preview_n <= 0:
@@ -325,6 +331,7 @@ def maybe_save_generation_preview(
         amp_dtype=amp_dtype,
         processor=processor,
         num_classes=int(num_classes),
+        coord_bins=int(coord_bins),
         show_tqdm=bool(args.show_tqdm),
         desc="Test preview",
         max_new_tokens=int(args.generation_max_new_tokens),
@@ -439,11 +446,14 @@ def _infer_logprobs_chunked(
         base = total_patches // total if total > 0 else 0
         patches_per_sample = [base] * total
 
+    # Precompute cumulative patch offsets once to avoid O(N) re-summation per chunk.
+    _cum_patches = list(itertools.accumulate(patches_per_sample, initial=0))
+
     # --- Slice helper: extract keys for sample indices [start, end) ---
     def _slice_joint(start: int, end: int) -> dict[str, Any]:
         sliced: dict[str, Any] = {}
-        patch_start = sum(patches_per_sample[:start])
-        patch_end   = sum(patches_per_sample[:end])
+        patch_start = _cum_patches[start]
+        patch_end   = _cum_patches[end]
         for k, v in lp_joint.items():
             if not torch.is_tensor(v):
                 sliced[k] = v
@@ -704,7 +714,11 @@ def _run_rl_training(
             rewards_list: list[dict[str, float]] = []
             for k in range(B * G):
                 b = k // G
-                parsed = parse_structured_output_text(preds[k], int(num_classes))
+                parsed = parse_structured_output_text(
+                    preds[k],
+                    int(num_classes),
+                    coord_bins=int(getattr(args, "coord_bins", 1000)),
+                )
                 gt_pts = gt_points_b[b] if b < len(gt_points_b) else None
                 # GT object ids: use target_label_ids (multi-label aware)
                 raw_ids = target_label_ids_b[b].tolist() if b < int(target_label_ids_b.shape[0]) else []
@@ -934,6 +948,7 @@ def _run_rl_training(
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
+                coord_bins=int(getattr(args, "coord_bins", 1000)),
                 show_tqdm=bool(getattr(args, "show_tqdm", True)),
                 desc=f"RL ValMetric {epoch}",
                 max_new_tokens=rl_max_new_tokens,
@@ -1054,6 +1069,9 @@ def main() -> None:
         "object": float(getattr(args, "loss_object_weight", 1.0)),
         "format": float(getattr(args, "loss_format_weight", 0.25)),
     }
+    coord_bins = int(getattr(args, "coord_bins", 1000))
+    if coord_bins <= 0:
+        raise ValueError(f"coord_bins must be positive, got: {coord_bins}")
 
     load_dtype = parse_dtype(args.dtype)
     if device.type != "cuda" and load_dtype in {torch.bfloat16, torch.float16}:
@@ -1086,11 +1104,12 @@ def main() -> None:
     token_id_map = register_gaze_special_tokens(
         tokenizer=processor.tokenizer,
         num_classes=num_classes,
+        coord_bins=coord_bins,
     )
     new_vocab_size = len(processor.tokenizer)
     print(
         f"[INFO] tokenizer extended: vocab_size={new_vocab_size} "
-        f"(added loc tokens: 1000, obj tokens: {num_classes}, fmt tokens: 0)"
+        f"(added loc tokens: {coord_bins}, obj tokens: {num_classes}, fmt tokens: 0)"
     )
 
     if bool(getattr(args, "test_only", False)):
@@ -1164,6 +1183,7 @@ def main() -> None:
                 num_classes=int(num_classes),
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
+                coord_bins=coord_bins,
             )
             log_target_example("test_only", test_ds)
             _tnw = int(args.num_workers)
@@ -1184,6 +1204,7 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
+                coord_bins=coord_bins,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
@@ -1208,6 +1229,7 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
+                coord_bins=coord_bins,
             )
 
         elapsed = time.time() - start_time
@@ -1298,6 +1320,7 @@ def main() -> None:
         visual_prompting=bool(args.visual_prompting),
         image_cache_size=image_cache_size,
         filter_invalid_object_samples=filter_invalid,
+        coord_bins=coord_bins,
     )
     val_ds = GazeDataset(
         records=val_records,
@@ -1311,6 +1334,7 @@ def main() -> None:
         visual_prompting=bool(args.visual_prompting),
         image_cache_size=image_cache_size,
         filter_invalid_object_samples=filter_invalid,
+        coord_bins=coord_bins,
     )
 
     # Count filtered samples
@@ -1366,15 +1390,16 @@ def main() -> None:
     )
     val_metric_loader = None
     if bool(getattr(args, "run_val_metrics", True)):
+        _val_metric_nw = min(_nw, 2)
         val_metric_loader = DataLoader(
             val_ds,
             batch_size=max(1, int(args.test_batch_size)),
             shuffle=False,
-            num_workers=_nw,
+            num_workers=_val_metric_nw,
             pin_memory=(device.type == "cuda"),
             collate_fn=test_collator,
-            persistent_workers=_persistent,
-            prefetch_factor=_prefetch,
+            persistent_workers=False,
+            prefetch_factor=2 if _val_metric_nw > 0 else None,
         )
 
     # --- init order: base model → resize embeddings → LoRA ---
@@ -1502,6 +1527,7 @@ def main() -> None:
                     num_classes=int(num_classes),
                     visual_prompting=bool(args.visual_prompting),
                     image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
+                    coord_bins=coord_bins,
                 )
                 test_loader = DataLoader(
                     test_ds,
@@ -1520,6 +1546,7 @@ def main() -> None:
                     amp_dtype=amp_dtype,
                     processor=processor,
                     num_classes=int(num_classes),
+                    coord_bins=coord_bins,
                     show_tqdm=bool(args.show_tqdm),
                     desc="Test",
                     max_new_tokens=int(args.generation_max_new_tokens),
@@ -1544,6 +1571,7 @@ def main() -> None:
                     amp_dtype=amp_dtype,
                     processor=processor,
                     num_classes=int(num_classes),
+                    coord_bins=coord_bins,
                 )
 
         finish_wandb(wandb_run)
@@ -1603,6 +1631,8 @@ def main() -> None:
         updates_done_in_epoch = 0
         last_logged_train_bucket = 0
         skipped_all_ignore = 0
+        _t_fwd_sum = 0.0
+        _t_bwd_sum = 0.0
 
         optimizer.zero_grad(set_to_none=True)
         train_iter = tqdm(
@@ -1634,7 +1664,10 @@ def main() -> None:
                 if (int(remainder_steps) > 0 and step >= int(last_window_start))
                 else int(accum_steps)
             )
+            _is_accum_step = ((step % accum_steps) == 0) or is_last_batch
+            _compute_fmt_rate = _is_accum_step and (wandb_run is not None)
 
+            _t_fwd0 = time.perf_counter()
             with torch.autocast(
                 device_type=device.type,
                 dtype=amp_dtype,
@@ -1650,11 +1683,15 @@ def main() -> None:
                     weight_point=loss_weights["point"],
                     weight_object=loss_weights["object"],
                     weight_format=loss_weights["format"],
+                    compute_format_rate=_compute_fmt_rate,
                 )
                 raw_loss = losses["loss"]
                 loss = raw_loss / float(max(current_accum_steps, 1))
+            _t_fwd_sum += time.perf_counter() - _t_fwd0
 
+            _t_bwd0 = time.perf_counter()
             loss.backward()
+            _t_bwd_sum += time.perf_counter() - _t_bwd0
 
             should_step = ((step % accum_steps) == 0) or is_last_batch
             if should_step:
@@ -1711,6 +1748,7 @@ def main() -> None:
         if skipped_all_ignore > 0:
             print(f"[INFO] skipped all-ignore batches in train epoch: {skipped_all_ignore}")
 
+        _t_val0 = time.perf_counter()
         val_metrics = (
             run_eval(
                 model,
@@ -1724,6 +1762,7 @@ def main() -> None:
             if len(val_ds) > 0
             else {"loss": train_loss}
         )
+        _t_val_loss = time.perf_counter() - _t_val0
         val_loss = float(val_metrics.get("loss", train_loss))
 
         val_gen_metrics = None
@@ -1732,7 +1771,9 @@ def main() -> None:
             and len(val_ds) > 0
             and (epoch % run_val_metrics_every_n == 0 or epoch == effective_epochs)
         )
+        _t_val_gen = 0.0
         if _run_val_gen:
+            _t_vg0 = time.perf_counter()
             val_gen_metrics = run_test_metrics(
                 model=model,
                 loader=val_metric_loader,
@@ -1740,6 +1781,7 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
+                coord_bins=coord_bins,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"ValMetric {epoch}/{args.epochs}",
                 max_new_tokens=int(args.generation_max_new_tokens),
@@ -1748,6 +1790,7 @@ def main() -> None:
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
             )
+            _t_val_gen = time.perf_counter() - _t_vg0
 
         epoch_msg = (
             f"[EPOCH {epoch}] train_loss={train_loss:.6f} val_loss={val_loss:.6f}"
@@ -1762,11 +1805,16 @@ def main() -> None:
         print(epoch_msg)
 
         if wandb_run is not None:
+            n_steps = max(step_count, 1)
             payload: dict[str, float] = {
                 "val/loss": float(val_loss),
                 "val/loss_point": float(val_metrics.get("loss_point", 0.0)),
                 "val/loss_object": float(val_metrics.get("loss_object", 0.0)),
                 "val/loss_format": float(val_metrics.get("loss_format", 0.0)),
+                "time/fwd_per_step_s": _t_fwd_sum / n_steps,
+                "time/bwd_per_step_s": _t_bwd_sum / n_steps,
+                "time/val_loss_s": _t_val_loss,
+                "time/val_gen_s": _t_val_gen,
             }
             if isinstance(val_gen_metrics, dict):
                 payload.update(val_metric_log_payload(val_gen_metrics))
@@ -1784,6 +1832,7 @@ def main() -> None:
                 or (checkpoint_monitor_mode == "max" and monitor_value > best_monitor_value)
             )
         )
+        _t_ckpt0 = time.perf_counter()
         if monitor_value is None:
             print(f"[WARN] checkpoint monitor {checkpoint_monitor!r} is unavailable this epoch; skipping save.")
         elif monitor_improved:
@@ -1805,16 +1854,21 @@ def main() -> None:
                 base_vocab_size=base_vocab_size,
             )
 
-        save_checkpoint(
-            out_dir / "last",
-            epoch,
-            model,
-            processor,
-            optimizer,
-            scheduler,
-            clear_dir=True,
-            base_vocab_size=base_vocab_size,
-        )
+        save_last_every = max(1, int(getattr(args, "save_last_every_n_epochs", 5)))
+        if (epoch % save_last_every == 0) or (epoch == effective_epochs):
+            save_checkpoint(
+                out_dir / "last",
+                epoch,
+                model,
+                processor,
+                optimizer,
+                scheduler,
+                clear_dir=True,
+                base_vocab_size=base_vocab_size,
+            )
+        _t_ckpt = time.perf_counter() - _t_ckpt0
+        if wandb_run is not None:
+            wandb_run.log({"time/checkpoint_s": _t_ckpt}, step=global_step)
 
     if bool(args.eval_only) and len(val_ds) > 0:
         val_metrics = run_eval(
@@ -1836,6 +1890,7 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
+                coord_bins=coord_bins,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Eval metrics (checkpoint)",
                 max_new_tokens=int(args.generation_max_new_tokens),
@@ -1892,6 +1947,7 @@ def main() -> None:
                 num_classes=int(num_classes),
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
+                coord_bins=coord_bins,
             )
             log_target_example("test", test_ds)
             test_loader = DataLoader(
@@ -1911,6 +1967,7 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
+                coord_bins=coord_bins,
                 show_tqdm=bool(args.show_tqdm),
                 desc="Test",
                 max_new_tokens=int(args.generation_max_new_tokens),
@@ -1935,6 +1992,7 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
+                coord_bins=coord_bins,
             )
 
     finish_wandb(wandb_run)

@@ -177,10 +177,6 @@ def load_checkpoint_for_eval(
     elif (ckpt_dir / "added_token_rows.pt").exists() is False:
         print(f"[WARN] added_token_rows.pt not found in {ckpt_dir}; token embeddings may be random")
 
-    trainer_state_path = ckpt_dir / "trainer_state.pt"
-    if trainer_state_path.exists():
-        _ = torch.load(trainer_state_path, map_location=device)
-
     if not adapter_loaded:
         print(f"[WARN] checkpoint at {ckpt_dir} did not fully load (adapter missing or failed)")
 

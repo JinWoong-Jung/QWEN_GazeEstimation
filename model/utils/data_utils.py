@@ -5,7 +5,7 @@ import random
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -53,10 +53,15 @@ def build_prompt(
     *,
     num_classes: int | None = None,
     point_decimals: int | None = None,
+    coord_bins: int = COORD_BINS,
 ) -> str:
     xmin, ymin, xmax, ymax = bbox_norm
+    coord_n = int(coord_bins)
+    if coord_n <= 0:
+        raise ValueError(f"coord_bins must be positive, got: {coord_bins!r}")
+    loc_w = max(3, len(str(coord_n - 1)))
     coord_min = 0
-    coord_max = int(COORD_BINS) - 1
+    coord_max = coord_n - 1
     obj_min = 0
     obj_max = max(0, int(num_classes) - 1) if num_classes is not None else 0
     format_vars: dict[str, Any] = {
@@ -64,10 +69,10 @@ def build_prompt(
         "ymin": float(ymin),
         "xmax": float(xmax),
         "ymax": float(ymax),
-        "loc_x1": format_loc_token(quantize_coord(float(xmin))),
-        "loc_y1": format_loc_token(quantize_coord(float(ymin))),
-        "loc_x2": format_loc_token(quantize_coord(float(xmax))),
-        "loc_y2": format_loc_token(quantize_coord(float(ymax))),
+        "loc_x1": format_loc_token(quantize_coord(float(xmin), bins=coord_n), loc_w),
+        "loc_y1": format_loc_token(quantize_coord(float(ymin), bins=coord_n), loc_w),
+        "loc_x2": format_loc_token(quantize_coord(float(xmax), bins=coord_n), loc_w),
+        "loc_y2": format_loc_token(quantize_coord(float(ymax), bins=coord_n), loc_w),
         "coord_min": int(coord_min),
         "coord_max": int(coord_max),
         "obj_min": int(obj_min),
@@ -455,103 +460,6 @@ def split_aliases(split_name: str | None) -> set[str]:
     if s in {"val", "validation"}:
         return {"val", "validation"}
     return {s}
-
-
-def build_fallback_map(
-    fallback_csvs: list[Path | None] | None,
-    fallback_text_key: str = "annotation",
-    split_name: str | None = None,
-) -> dict[tuple[str, int], list[str]]:
-    out: dict[tuple[str, int], list[str]] = {}
-    if not fallback_csvs:
-        return out
-
-    split_filter = split_aliases(split_name)
-    for csv_path in fallback_csvs:
-        if csv_path is None or (not csv_path.exists()):
-            continue
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    path = str(row["path"]).strip()
-                    sample_id = int(float(row["id"]))
-                except Exception:
-                    continue
-                if not path:
-                    continue
-                if split_filter:
-                    row_split = str(row.get("split", "")).strip().lower()
-                    if row_split not in split_filter:
-                        continue
-                text_raw = str(row.get(fallback_text_key, "")).strip()
-                cands = annotation_candidates(text_raw)
-                if not cands:
-                    continue
-                key = (path, sample_id)
-                if key not in out:
-                    out[key] = []
-                for cand in cands:
-                    if cand not in out[key]:
-                        out[key].append(cand)
-    return out
-
-
-def build_embed_id_mapper(
-    vocab2id: dict[str, int],
-    label_embed_dir: Path | None,
-    label_emb_dim: int = 512,
-) -> Callable[[str], int] | None:
-    bank = build_vocab_embedding_matrix(
-        vocab2id=vocab2id,
-        label_embed_dir=label_embed_dir,
-        label_emb_dim=int(label_emb_dim),
-        normalize=True,
-    )
-    if (not torch.is_tensor(bank)) or bank.dim() != 2 or int(bank.shape[0]) <= 0:
-        return None
-    bank = bank.to(dtype=torch.float32)
-    valid = bank.norm(dim=1).gt(0)
-    if int(valid.sum().item()) <= 0:
-        return None
-    valid_ids = [int(x) for x in torch.nonzero(valid, as_tuple=False).flatten().tolist()]
-    valid_bank = bank[valid].contiguous()
-    embed_dir = label_embed_dir if (label_embed_dir is not None and label_embed_dir.exists()) else None
-    if embed_dir is None:
-        return None
-
-    cache: dict[str, int] = {}
-
-    def _map(label_text: str) -> int:
-        txt = clean_label(label_text)
-        if not txt:
-            return -1
-        if txt in cache:
-            return int(cache[txt])
-        emb_path = embed_dir / f"{txt}-emb.pt"
-        if not emb_path.exists():
-            cache[txt] = -1
-            return -1
-        try:
-            vec = torch.load(emb_path, map_location="cpu")
-            if not torch.is_tensor(vec):
-                cache[txt] = -1
-                return -1
-            q = vec.to(dtype=torch.float32).flatten()
-            if int(q.numel()) != int(valid_bank.shape[1]):
-                cache[txt] = -1
-                return -1
-            q = F.normalize(q.unsqueeze(0), p=2, dim=-1)
-            sim = q @ valid_bank.t()
-            j = int(torch.argmax(sim, dim=1).item())
-            mapped = int(valid_ids[j]) if 0 <= j < len(valid_ids) else -1
-            cache[txt] = int(mapped)
-            return int(mapped)
-        except Exception:
-            cache[txt] = -1
-            return -1
-
-    return _map
 
 
 def load_label_map(

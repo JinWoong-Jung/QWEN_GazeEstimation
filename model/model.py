@@ -50,6 +50,3 @@ class QwenTextGenerationModel(nn.Module):
             **generate_kwargs,
         )
 
-
-# Backward-compatible alias.
-QwenGazeIntegratedModel = QwenTextGenerationModel

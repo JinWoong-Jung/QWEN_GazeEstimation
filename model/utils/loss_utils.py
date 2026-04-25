@@ -92,8 +92,13 @@ def compute_structured_loss(
     weight_point: float = 1.0,
     weight_object: float = 1.0,
     weight_format: float = 0.25,
+    compute_format_rate: bool = False,
 ) -> dict[str, Any]:
     """Compute L_SFT = w_p * L_point + w_o * L_object + w_f * L_format.
+
+    CE is computed once on the union of valid mask positions, then split by
+    category. compute_format_rate gates the expensive argmax-based format
+    exact-match rate — pass True only at wandb logging steps.
 
     Returns dict with keys:
         loss, loss_point, loss_object, loss_format,
@@ -120,10 +125,54 @@ def compute_structured_loss(
             "n_format_samples": 0,
         }
 
-    l_pt, n_pt = masked_token_ce(logits, labels, loss_mask_point)
-    l_obj, n_obj = masked_token_ce(logits, labels, loss_mask_object)
-    l_fmt, n_fmt = masked_token_ce(logits, labels, loss_mask_format)
-    fmt_valid_rate, n_fmt_samples = masked_sample_exact_rate(logits, labels, loss_mask_format)
+    # Causal LM shift — done once for all categories.
+    shift_logits = logits[:, :-1, :]   # [B, L-1, V]
+    shift_labels = labels[:, 1:]        # [B, L-1]
+    not_padding = shift_labels.ne(-100)
+
+    def _shift_mask(m: torch.Tensor | None) -> torch.Tensor:
+        if m is None or not torch.is_tensor(m) or m.dim() != 2:
+            return torch.zeros(shift_labels.shape, dtype=torch.bool, device=device)
+        return m.to(device=device, dtype=torch.bool)[:, 1:]
+
+    sm_pt  = _shift_mask(loss_mask_point)
+    sm_obj = _shift_mask(loss_mask_object)
+    sm_fmt = _shift_mask(loss_mask_format)
+
+    pt_valid  = sm_pt  & not_padding
+    obj_valid = sm_obj & not_padding
+    fmt_valid = sm_fmt & not_padding
+
+    n_pt  = int(pt_valid.sum().item())
+    n_obj = int(obj_valid.sum().item())
+    n_fmt = int(fmt_valid.sum().item())
+
+    # Build union mask and compute CE exactly once on valid token positions.
+    valid_union = (sm_pt | sm_obj | sm_fmt) & not_padding   # [B, L-1]
+
+    if valid_union.any():
+        ce_valid = F.cross_entropy(
+            shift_logits[valid_union],   # [N_valid, V]
+            shift_labels[valid_union],   # [N_valid]
+            reduction="none",
+        )  # [N_valid]
+
+        def _cat_mean(cat_valid: torch.Tensor, n_cat: int) -> torch.Tensor:
+            if n_cat <= 0:
+                return z
+            return ce_valid[cat_valid[valid_union]].mean()
+
+        l_pt  = _cat_mean(pt_valid,  n_pt)
+        l_obj = _cat_mean(obj_valid, n_obj)
+        l_fmt = _cat_mean(fmt_valid, n_fmt)
+    else:
+        l_pt = l_obj = l_fmt = z
+
+    fmt_valid_rate, n_fmt_samples = (
+        masked_sample_exact_rate(logits, labels, loss_mask_format)
+        if compute_format_rate
+        else (z, 0)
+    )
 
     wp, wo, wf = float(weight_point), float(weight_object), float(weight_format)
     total = z
@@ -159,6 +208,7 @@ def compute_answer_loss(
     weight_point: float = 1.0,
     weight_object: float = 1.0,
     weight_format: float = 0.25,
+    compute_format_rate: bool = False,
 ) -> dict[str, Any]:
     """Compute structured SFT loss when structured masks are present,
     else fall back to full-answer CE (legacy).
@@ -188,6 +238,7 @@ def compute_answer_loss(
             weight_point=float(weight_point),
             weight_object=float(weight_object),
             weight_format=float(weight_format),
+            compute_format_rate=compute_format_rate,
         )
         d["loss_answer"] = d["loss"]
         d["n_answer_tokens"] = d["n_point_tokens"] + d["n_object_tokens"] + d["n_format_tokens"]

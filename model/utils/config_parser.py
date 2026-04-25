@@ -139,6 +139,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--max_pixels", type=int, default=int(default_value(d, "max_pixels", 2007040)))
 
     # --- model/generation ---
+    p.add_argument("--coord_bins", type=int, default=int(default_value(d, "coord_bins", 1000)))
     p.add_argument("--max_text_length", type=int, default=int(default_value(d, "max_text_length", 256)))
     p.add_argument("--generation_max_new_tokens", type=int, default=int(default_value(d, "generation_max_new_tokens", 8)))
     p.add_argument("--generation_num_beams", type=int, default=int(default_value(d, "generation_num_beams", 1)))

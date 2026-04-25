@@ -132,6 +132,16 @@ class TestRegisterGazeSpecialTokens(unittest.TestCase):
         expected_new = COORD_BINS + num_classes + 1
         self.assertEqual(after - before, expected_new)
 
+    def test_custom_coord_bins_vocab_size(self) -> None:
+        tok = DummyTokenizer()
+        num_classes = 5
+        before = len(tok.get_vocab())
+        register_gaze_special_tokens(tok, num_classes=num_classes, coord_bins=128)
+        after = len(tok.get_vocab())
+        self.assertEqual(after - before, 128 + num_classes + 1)
+        self.assertIn("<loc_127>", tok.get_vocab())
+        self.assertNotIn("<loc_999>", tok.get_vocab())
+
     def test_double_registration_is_idempotent(self) -> None:
         tok = DummyTokenizer()
         num_classes = 5

@@ -44,6 +44,11 @@ class TestQuantize(unittest.TestCase):
     def test_clamp_above_one(self):
         self.assertEqual(quantize_coord(1.5), 999)
 
+    def test_custom_bin_count(self):
+        self.assertEqual(quantize_coord(1.0, bins=128), 127)
+        self.assertEqual(quantize_coord(1.5, bins=128), 127)
+        self.assertEqual(dequantize_coord(127, bins=128), 1.0)
+
 
 class TestFormatTokens(unittest.TestCase):
     def test_loc_token_format(self):
@@ -77,6 +82,14 @@ class TestBuildSpecialTokens(unittest.TestCase):
         tokens = build_gaze_special_tokens(10)
         self.assertIn("<loc_000>", tokens)
         self.assertIn("<loc_999>", tokens)
+
+    def test_custom_loc_tokens_range(self):
+        tokens = build_gaze_special_tokens(10, coord_bins=128)
+        self.assertEqual(len([tok for tok in tokens if tok.startswith("<loc_")]), 128)
+        self.assertIn("<loc_000>", tokens)
+        self.assertIn("<loc_127>", tokens)
+        self.assertNotIn("<loc_128>", tokens)
+        self.assertNotIn("<loc_999>", tokens)
 
     def test_obj_tokens_range(self):
         tokens = build_gaze_special_tokens(5)
@@ -114,6 +127,10 @@ class TestBuildStructuredTargetText(unittest.TestCase):
         t = build_structured_target_text(0.5, 0.5, None, 100, obj_token=GAZE_OBJ_UNKNOWN)
         self.assertIn(GAZE_OBJ_UNKNOWN, t)
 
+    def test_custom_coord_bins(self):
+        t = build_structured_target_text(1.0, 0.0, 7, 100, coord_bins=128)
+        self.assertIn("<loc_127><loc_000>", t)
+
 
 class TestParseStructuredOutputText(unittest.TestCase):
     def _make(self, x: float, y: float, obj: int, nc: int = 100) -> str:
@@ -139,6 +156,27 @@ class TestParseStructuredOutputText(unittest.TestCase):
         p = parse_structured_output_text(t, 100)
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["point_bins"], (999, 999))
+
+    def test_custom_coord_bins_roundtrip(self):
+        t = build_structured_target_text(1.0, 0.0, 7, 100, coord_bins=128)
+        p = parse_structured_output_text(t, 100, coord_bins=128)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["point_bins"], (127, 0))
+        self.assertEqual(p["point_xy"], (1.0, 0.0))
+
+    def test_custom_coord_bins_out_of_range(self):
+        t = (
+            f"{ANSWER_START}"
+            f"{POINT_PREFIX} "
+            f"{format_loc_token(128)}"
+            f"{format_loc_token(0)}"
+            f"\n"
+            f"{OBJECT_PREFIX} "
+            f"{format_obj_token(7, 3)}"
+            f"{ANSWER_END}"
+        )
+        p = parse_structured_output_text(t, 100, coord_bins=128)
+        self.assertFalse(p["valid_format"])
 
     def test_empty_string_invalid(self):
         p = parse_structured_output_text("", 100)

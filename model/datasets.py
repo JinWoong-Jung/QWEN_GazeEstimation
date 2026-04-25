@@ -71,6 +71,7 @@ def format_structured_target_text(
     num_classes: int,
     point_x: float,
     point_y: float,
+    coord_bins: int = 1000,
 ) -> tuple[str, int, float, float]:
     """Build structured 7-token target text.
 
@@ -95,6 +96,7 @@ def format_structured_target_text(
             point_y=float(point_y),
             obj_id=obj_id,
             num_classes=int(num_classes),
+            coord_bins=int(coord_bins),
         )
         text_valid = 1.0
         object_valid = 1.0
@@ -105,6 +107,7 @@ def format_structured_target_text(
             obj_id=None,
             num_classes=int(num_classes),
             obj_token=GAZE_OBJ_UNKNOWN,
+            coord_bins=int(coord_bins),
         )
         text_valid = 1.0
         object_valid = 0.0
@@ -149,6 +152,7 @@ class GazeDataset(Dataset):
         visual_prompting: bool = False,
         image_cache_size: int = 0,
         filter_invalid_object_samples: bool = True,
+        coord_bins: int = 1000,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -161,6 +165,7 @@ class GazeDataset(Dataset):
         self.vocab2id = vocab2id or {}
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
+        self.coord_bins = int(coord_bins)
         self.visual_prompting = bool(visual_prompting)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
@@ -225,6 +230,7 @@ class GazeDataset(Dataset):
             self.prompt_text,
             num_classes=self.num_classes,
             point_decimals=4,
+            coord_bins=self.coord_bins,
         )
 
         resolved_label_text = str(rec.label_text or "").strip()
@@ -240,10 +246,11 @@ class GazeDataset(Dataset):
             num_classes=self.num_classes,
             point_x=float(gaze_x),
             point_y=float(gaze_y),
+            coord_bins=self.coord_bins,
         )
 
-        bx = quantize_coord(float(gaze_x))
-        by = quantize_coord(float(gaze_y))
+        bx = quantize_coord(float(gaze_x), bins=self.coord_bins)
+        by = quantize_coord(float(gaze_y), bins=self.coord_bins)
 
         return {
             "scene_image": scene,
@@ -277,6 +284,7 @@ class GazeTestDataset(Dataset):
         num_classes: int = 0,
         visual_prompting: bool = False,
         image_cache_size: int = 0,
+        coord_bins: int = 1000,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -289,6 +297,7 @@ class GazeTestDataset(Dataset):
         self.vocab2id = vocab2id or {}
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
+        self.coord_bins = int(coord_bins)
         self.visual_prompting = bool(visual_prompting)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
@@ -320,6 +329,7 @@ class GazeTestDataset(Dataset):
             self.prompt_text,
             num_classes=self.num_classes,
             point_decimals=4,
+            coord_bins=self.coord_bins,
         )
         if g.gt_points:
             px = sum(float(x) for x, _ in g.gt_points) / float(len(g.gt_points))
@@ -336,10 +346,11 @@ class GazeTestDataset(Dataset):
             num_classes=self.num_classes,
             point_x=px,
             point_y=py,
+            coord_bins=self.coord_bins,
         )
 
-        bx = quantize_coord(float(px))
-        by = quantize_coord(float(py))
+        bx = quantize_coord(float(px), bins=self.coord_bins)
+        by = quantize_coord(float(py), bins=self.coord_bins)
 
         return {
             "scene_image": scene,

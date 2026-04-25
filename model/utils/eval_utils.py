@@ -5,7 +5,6 @@ import re
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
@@ -35,11 +34,8 @@ class _GazeObjEndStoppingCriteria(StoppingCriteria):
         scores: torch.FloatTensor,
         **kwargs: Any,
     ) -> bool:
-        for row in input_ids:
-            generated = row[self.prompt_len :].tolist()
-            if self.obj_end_id not in generated:
-                return False
-        return True
+        generated = input_ids[:, self.prompt_len :]
+        return bool((generated == self.obj_end_id).any(dim=1).all().item())
 
 
 def make_gaze_obj_end_stopping_criteria(
@@ -208,6 +204,7 @@ def run_test_metrics(
     amp_dtype: torch.dtype,
     processor: Any,
     num_classes: int,
+    coord_bins: int = 1000,
     show_tqdm: bool = True,
     desc: str = "Test",
     max_new_tokens: int = 8,
@@ -299,7 +296,7 @@ def run_test_metrics(
             for i in range(bsz):
                 total += 1
                 pred = preds[i] if i < len(preds) else ""
-                parsed = parse_structured_output_text(pred, int(num_classes))
+                parsed = parse_structured_output_text(pred, int(num_classes), coord_bins=int(coord_bins))
                 is_text_valid = i < int(target_valid.numel()) and float(target_valid[i].item()) > 0.0
                 is_point_valid = i < int(target_point_valid.numel()) and float(target_point_valid[i].item()) > 0.0
                 is_object_valid = i < int(target_object_valid.numel()) and float(target_object_valid[i].item()) > 0.0
@@ -417,6 +414,7 @@ def collect_generation_samples(
     amp_dtype: torch.dtype,
     processor: Any,
     num_classes: int,
+    coord_bins: int = 1000,
     show_tqdm: bool = True,
     desc: str = "GenerationPreview",
     max_new_tokens: int = 8,
@@ -487,7 +485,7 @@ def collect_generation_samples(
 
             for i in range(bsz):
                 pred = preds[i] if i < len(preds) else ""
-                parsed = parse_structured_output_text(pred, int(num_classes))
+                parsed = parse_structured_output_text(pred, int(num_classes), coord_bins=int(coord_bins))
 
                 serialized_gt_points: list[list[float]] = []
                 stats = None
