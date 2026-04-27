@@ -4,7 +4,6 @@ import unittest
 
 from model.utils.gaze_tokens import (
     ANSWER_END,
-    ANSWER_START,
     COORD_BINS,
     GAZE_OBJ_UNKNOWN,
     OBJECT_PREFIX,
@@ -105,10 +104,12 @@ class TestBuildStructuredTargetText(unittest.TestCase):
 
     def test_starts_ends_with_format_tokens(self):
         t = build_structured_target_text(0.3, 0.7, 5, 100)
-        self.assertTrue(t.startswith(ANSWER_START))
-        self.assertTrue(t.endswith(ANSWER_END))
         self.assertIn(POINT_PREFIX, t)
         self.assertIn(OBJECT_PREFIX, t)
+        # ANSWER_START is now empty; ANSWER_END (<|im_end|>) is the chat-template
+        # EOS added by the template, not part of the target text itself.
+        self.assertFalse(t.startswith("<|im_start|>"))
+        self.assertFalse(t.endswith("<|im_end|>"))
 
     def test_contains_obj_token(self):
         t = build_structured_target_text(0.0, 0.0, 42, 100)
@@ -118,8 +119,6 @@ class TestBuildStructuredTargetText(unittest.TestCase):
         t = build_structured_target_text(0.5, 0.5, 0, 100)
         import re
         tokens = re.findall(r"<[^>]+>", t)
-        self.assertEqual(tokens.count(ANSWER_START), 1)
-        self.assertEqual(tokens.count(ANSWER_END), 1)
         self.assertEqual(sum(1 for tok in tokens if tok.startswith("<loc_")), 2)
         self.assertEqual(sum(1 for tok in tokens if tok.startswith("<obj_")), 1)
 
@@ -206,17 +205,15 @@ class TestParseStructuredOutputText(unittest.TestCase):
         self.assertTrue(p["has_extra_text"])
 
     def test_object_id_out_of_range(self):
-        # manually construct text with obj_id = num_classes
+        # manually construct text with obj_id = num_classes (out of range)
         from model.utils.gaze_tokens import format_loc_token, format_obj_token
         t = (
-            f"{ANSWER_START}"
             f"{POINT_PREFIX} "
             f"{format_loc_token(0)}"
             f"{format_loc_token(0)}"
             f"\n"
             f"{OBJECT_PREFIX} "
             f"{format_obj_token(100, 3)}"
-            f"{ANSWER_END}"
         )
         p = parse_structured_output_text(t, 100)
         self.assertFalse(p["valid_format"])

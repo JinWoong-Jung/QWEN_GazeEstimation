@@ -34,7 +34,7 @@ train:
   epochs: 20
   batch_size: 16
   grad_accum_steps: 8
-  num_workers: 4
+  num_workers: 8
   lr: 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
@@ -50,7 +50,7 @@ eval:
   test_only: false
   run_test: false
   run_val_metrics: true
-  run_val_metrics_every_n_epochs: 5
+  run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_loss"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
   checkpoint_monitor_mode: "auto"     # auto | min | max
   generation_max_new_tokens: 16       # <|im_start|> Point: <loc><loc>\nObject: <obj><|im_end|> ≈ 12 tokens + buffer
@@ -67,11 +67,10 @@ prompt:
     Predict the gaze point that this person is looking at, and the object located at that gaze point.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Wrap the answer with the existing special tokens <|im_start|> and <|im_end|>.
     Return exactly the two-line format below, with no extra text before or after it.
     Return exactly:
-    <|im_start|>Point: <loc_NNN><loc_MMM>
-    Object: <obj_KKK><|im_end|>
+    Point: <loc_NNN><loc_MMM>
+    Object: <obj_KKK>
 
 model:
   coord_bins: 128
@@ -106,7 +105,7 @@ wandb:
   enabled: true
   project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "baseline(2B)"
+  run_name: "baseline_2B"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

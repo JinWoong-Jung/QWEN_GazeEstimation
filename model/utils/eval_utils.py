@@ -78,23 +78,15 @@ def decode_generated(
     for i in range(generated_ids.shape[0]):
         src_i = (i // nrs) if bsz > 0 else i
         src_i = min(max(0, int(src_i)), bsz - 1) if bsz > 0 else src_i
-        if (
-            attention_mask is not None
-            and torch.is_tensor(attention_mask)
-            and attention_mask.dim() >= 2
-            and bsz > 0
-        ):
-            start = int(attention_mask[src_i].sum().item())
-        else:
-            start = int(input_ids.shape[1])
+        start = int(input_ids.shape[1])
         new_tokens = generated_ids[i, start:]
         txt = (
             tok.decode(new_tokens, skip_special_tokens=False)
             if tok is not None
             else str(new_tokens.tolist())
         )
-        # Keep <|im_start|> / <|im_end|> intact — the structured parser requires them.
-        # Only strip other Qwen chat markers that are not part of the answer content.
+        # Keep <|im_end|> intact — the parser accepts it as an optional trailing EOS.
+        # Strip other Qwen chat markers (e.g. <|endoftext|>) but not im_start/im_end.
         txt = re.sub(r"<\|(?!im_start\||im_end\|)[^>]+?\|>", "", str(txt)).strip()
         out.append(str(txt))
     return out

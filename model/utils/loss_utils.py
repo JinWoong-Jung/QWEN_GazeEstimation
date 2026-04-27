@@ -125,7 +125,7 @@ def compute_structured_loss(
             "n_format_samples": 0,
         }
 
-    # Causal LM shift — done once for all categories.
+    # Causal LM shift - done once for all categories.
     shift_logits = logits[:, :-1, :]   # [B, L-1, V]
     shift_labels = labels[:, 1:]        # [B, L-1]
     not_padding = shift_labels.ne(-100)

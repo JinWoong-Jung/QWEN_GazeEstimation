@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 COORD_BINS: int = 1000
-ANSWER_START: str = "<|im_start|>"
+ANSWER_START: str = ""
 ANSWER_END: str = "<|im_end|>"
 POINT_PREFIX: str = "Point:"
 OBJECT_PREFIX: str = "Object:"
@@ -13,18 +13,17 @@ FORMAT_TOKENS: list[str] = []
 
 _LOC_RE = re.compile(r"^<loc_(\d+)>$")
 _OBJ_RE = re.compile(r"^<obj_(\d+)>$")
+# ANSWER_END (<|im_end|>) is the chat-template EOS; it appears at the tail of
+# generated output and is made optional so the regex matches with or without it.
 _STRICT_RE = re.compile(
-    r"^"
-    r"<\|im_start\|>"
-    r"\s*Point:\s*"
+    r"^\s*Point:\s*"
     r"(<loc_\d+>)"
     r"(<loc_\d+>)"
     r"\s*"
     r"Object:\s*"
     r"(<obj_\d+>|<obj_unknown>)"
     r"\s*"
-    r"<\|im_end\|>"
-    r"$"
+    r"(?:<\|im_end\|>)?\s*$"
 )
 
 
@@ -110,14 +109,12 @@ def build_structured_target_text(
         w = _obj_token_width(num_classes)
         resolved_obj_tok = format_obj_token(int(obj_id), w)
     return (
-        f"{ANSWER_START}"
         f"{POINT_PREFIX} "
         f"{format_loc_token(bx, loc_w)}"
         f"{format_loc_token(by, loc_w)}"
         f"\n"
         f"{OBJECT_PREFIX} "
         f"{resolved_obj_tok}"
-        f"{ANSWER_END}"
     )
 
 
@@ -198,6 +195,16 @@ def parse_structured_output_text(
         "object_id": oid,
         "object_unknown": False,
     }
+
+
+def parse_structured_output_ids(
+    token_ids: list[int],
+    tokenizer: Any,
+    num_classes: int,
+    coord_bins: int = COORD_BINS,
+) -> dict:
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    return parse_structured_output_text(str(text).strip(), num_classes, coord_bins=coord_bins)
 
 
 def is_valid_structured_output(parsed: dict) -> bool:

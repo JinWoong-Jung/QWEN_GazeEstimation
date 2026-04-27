@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -62,7 +63,6 @@ def build_answer_mask(
 ) -> torch.Tensor:
     """Build a bool mask [B, L] that is True for all answer-token positions."""
     input_ids = joint_inputs["input_ids"]
-    attention_mask = joint_inputs.get("attention_mask", None)
     if not torch.is_tensor(input_ids):
         raise ValueError("joint_inputs['input_ids'] must be a tensor.")
     bsz, seqlen = int(input_ids.shape[0]), int(input_ids.shape[1])
@@ -78,15 +78,7 @@ def build_answer_mask(
         if i < int(target_valid.numel()) and float(target_valid[i].item()) <= 0.0:
             continue
 
-        valid_len = (
-            int(attention_mask[i].sum().item())
-            if torch.is_tensor(attention_mask)
-            else seqlen
-        )
-        if valid_len <= 0:
-            continue
-
-        seq_ids = [int(x) for x in input_ids[i, :valid_len].tolist()]
+        seq_ids = [int(x) for x in input_ids[i, :seqlen].tolist()]
         ans_txt = str(target_texts[i])
         out = tokenizer(ans_txt, add_special_tokens=False, return_attention_mask=False)
         ans_ids = out.get("input_ids", [])
@@ -99,7 +91,7 @@ def build_answer_mask(
         ans_start = find_subseq(seq_ids, ans_ids, from_right=True)
         if ans_start < 0:
             continue
-        ans_end = min(valid_len, ans_start + len(ans_ids))
+        ans_end = min(seqlen, ans_start + len(ans_ids))
         answer_mask[i, ans_start:ans_end] = True
 
     return answer_mask
@@ -119,7 +111,6 @@ def build_structured_masks(
     format = all other tokens inside the answer span
     """
     input_ids = joint_inputs["input_ids"]
-    attention_mask = joint_inputs.get("attention_mask", None)
     if not torch.is_tensor(input_ids):
         bsz = len(target_texts)
         z = torch.zeros((bsz, 1), dtype=torch.bool)
@@ -133,6 +124,8 @@ def build_structured_masks(
     tokenizer = getattr(processor, "tokenizer", None)
     if tokenizer is None:
         return mask_pt, mask_obj, mask_fmt
+
+    attention_mask = joint_inputs.get("attention_mask", None)
 
     # Batch tokenize all target texts once (1 call instead of bsz calls).
     raw_out = tokenizer(
@@ -262,6 +255,19 @@ def build_train_inputs(
     supervised = mask_pt.any(dim=1) | mask_obj.any(dim=1) | mask_fmt.any(dim=1)
     if torch.any(~supervised):
         labels[~supervised] = -100
+
+    if os.environ.get("QWEN_DEBUG_MASKS", "").lower() in {"1", "true"}:
+        tokenizer = getattr(processor, "tokenizer", None)
+        print(
+            "[DEBUG masks]",
+            "padding_side=", getattr(tokenizer, "padding_side", None),
+            "seq_len=", int(joint_inputs["input_ids"].shape[1]),
+            "point_tokens=", int(mask_pt.sum().item()),
+            "object_tokens=", int(mask_obj.sum().item()),
+            "format_tokens=", int(mask_fmt.sum().item()),
+            "supervised_samples=", int(supervised.sum().item()),
+            "batch=", bsz,
+        )
 
     return dict(joint_inputs), labels, mask_pt, mask_obj, mask_fmt
 

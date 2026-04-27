@@ -159,6 +159,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
 
     # --- structured token pipeline ---
     p.add_argument("--train_stage", type=str, default=str(default_value(d, "train_stage", "sft")))
+    p.add_argument("--save_last_every_n_epochs", type=int, default=int(default_value(d, "save_last_every_n_epochs", 5)))
     p.add_argument("--filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_true")
     p.add_argument("--no_filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_false")
     p.set_defaults(filter_invalid_object_samples=bool(default_value(d, "filter_invalid_object_samples", True)))

@@ -318,7 +318,6 @@ def maybe_save_generation_preview(
     amp_dtype: torch.dtype,
     processor: Any,
     num_classes: int,
-    coord_bins: int,
 ) -> None:
     preview_n = max(0, int(getattr(args, "preview_test_samples", 0)))
     if preview_n <= 0:
@@ -502,6 +501,7 @@ def _run_rl_training(
     loss_weights: dict[str, float],
     wandb_run: Any,
     scene_size: tuple[int, int] | None,
+    coord_bins: int = 1000,
 ) -> tuple[int, float]:
     """GRPO-based RL post-training (Stage 2).
 
@@ -714,11 +714,7 @@ def _run_rl_training(
             rewards_list: list[dict[str, float]] = []
             for k in range(B * G):
                 b = k // G
-                parsed = parse_structured_output_text(
-                    preds[k],
-                    int(num_classes),
-                    coord_bins=int(getattr(args, "coord_bins", 1000)),
-                )
+                parsed = parse_structured_output_text(preds[k], int(num_classes))
                 gt_pts = gt_points_b[b] if b < len(gt_points_b) else None
                 # GT object ids: use target_label_ids (multi-label aware)
                 raw_ids = target_label_ids_b[b].tolist() if b < int(target_label_ids_b.shape[0]) else []
@@ -948,7 +944,6 @@ def _run_rl_training(
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
-                coord_bins=int(getattr(args, "coord_bins", 1000)),
                 show_tqdm=bool(getattr(args, "show_tqdm", True)),
                 desc=f"RL ValMetric {epoch}",
                 max_new_tokens=rl_max_new_tokens,
@@ -1488,6 +1483,7 @@ def main() -> None:
             loss_weights=loss_weights,
             wandb_run=wandb_run,
             scene_size=_scene_size,
+            coord_bins=coord_bins,
         )
 
         if args.run_test:
@@ -1667,7 +1663,6 @@ def main() -> None:
             _is_accum_step = ((step % accum_steps) == 0) or is_last_batch
             _compute_fmt_rate = _is_accum_step and (wandb_run is not None)
 
-            _t_fwd0 = time.perf_counter()
             with torch.autocast(
                 device_type=device.type,
                 dtype=amp_dtype,
@@ -1854,21 +1849,16 @@ def main() -> None:
                 base_vocab_size=base_vocab_size,
             )
 
-        save_last_every = max(1, int(getattr(args, "save_last_every_n_epochs", 5)))
-        if (epoch % save_last_every == 0) or (epoch == effective_epochs):
-            save_checkpoint(
-                out_dir / "last",
-                epoch,
-                model,
-                processor,
-                optimizer,
-                scheduler,
-                clear_dir=True,
-                base_vocab_size=base_vocab_size,
-            )
-        _t_ckpt = time.perf_counter() - _t_ckpt0
-        if wandb_run is not None:
-            wandb_run.log({"time/checkpoint_s": _t_ckpt}, step=global_step)
+        save_checkpoint(
+            out_dir / "last",
+            epoch,
+            model,
+            processor,
+            optimizer,
+            scheduler,
+            clear_dir=True,
+            base_vocab_size=base_vocab_size,
+        )
 
     if bool(args.eval_only) and len(val_ds) > 0:
         val_metrics = run_eval(
