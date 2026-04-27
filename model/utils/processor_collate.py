@@ -8,6 +8,7 @@ import torch
 from ..modules.preprocess import resize_scene
 from .common import chat_text
 from .gaze_tokens import (
+    ANSWER_END,
     GAZE_OBJ_UNKNOWN,
 )
 from .gaze_tokens import _LOC_RE, _OBJ_RE
@@ -166,6 +167,14 @@ def build_structured_masks(
                 mask_obj[i, pos] = True
             else:
                 mask_fmt[i, pos] = True
+
+        # Include the ANSWER_END (<|im_end|>) token immediately after the answer
+        # span so the model learns to stop generating after the last object token.
+        ans_end_pos = ans_start + len(ans_ids)
+        if ans_end_pos < seqlen and hasattr(tokenizer, "convert_tokens_to_ids"):
+            im_end_id = tokenizer.convert_tokens_to_ids(ANSWER_END)
+            if isinstance(im_end_id, int) and im_end_id >= 0 and seq_ids[ans_end_pos] == im_end_id:
+                mask_fmt[i, ans_end_pos] = True
 
     return mask_pt, mask_obj, mask_fmt
 

@@ -51,8 +51,8 @@ eval:
   run_test: false
   run_val_metrics: true
   run_val_metrics_every_n_epochs: 1
-  checkpoint_monitor: "val_loss"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
-  checkpoint_monitor_mode: "auto"     # auto | min | max
+  checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
+  checkpoint_monitor_mode: "min"     # auto | min | max
   generation_max_new_tokens: 16       # <|im_start|> Point: <loc><loc>\nObject: <obj><|im_end|> ≈ 12 tokens + buffer
   generation_num_beams: 1
   repetition_penalty: 1.0
@@ -85,7 +85,7 @@ model:
 loss:
   loss_point_weight: 1.0
   loss_object_weight: 1.0
-  loss_format_weight: 0.25
+  loss_format_weight: 1.0
 
 rl:
   rl_enabled: false
