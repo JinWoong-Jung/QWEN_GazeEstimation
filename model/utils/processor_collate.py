@@ -125,8 +125,6 @@ def build_structured_masks(
     if tokenizer is None:
         return mask_pt, mask_obj, mask_fmt
 
-    attention_mask = joint_inputs.get("attention_mask", None)
-
     # Batch tokenize all target texts once (1 call instead of bsz calls).
     raw_out = tokenizer(
         [str(target_texts[i]) if i < len(target_texts) else "" for i in range(bsz)],
@@ -143,15 +141,8 @@ def build_structured_masks(
         if i < int(target_valid.numel()) and float(target_valid[i].item()) <= 0.0:
             continue
 
-        valid_len = (
-            int(attention_mask[i].sum().item())
-            if torch.is_tensor(attention_mask)
-            else seqlen
-        )
-        if valid_len <= 0:
-            continue
-
-        seq_ids = [int(x) for x in input_ids[i, :valid_len].tolist()]
+        # Search the full padded row — padding-side agnostic and batch-size invariant.
+        seq_ids = [int(x) for x in input_ids[i, :seqlen].tolist()]
         ans_ids = [int(x) for x in (batch_ans_ids[i] if i < len(batch_ans_ids) else [])]
 
         ans_start = find_subseq(seq_ids, ans_ids, from_right=True)

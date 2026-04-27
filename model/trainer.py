@@ -318,6 +318,7 @@ def maybe_save_generation_preview(
     amp_dtype: torch.dtype,
     processor: Any,
     num_classes: int,
+    coord_bins: int,
 ) -> None:
     preview_n = max(0, int(getattr(args, "preview_test_samples", 0)))
     if preview_n <= 0:
@@ -714,7 +715,7 @@ def _run_rl_training(
             rewards_list: list[dict[str, float]] = []
             for k in range(B * G):
                 b = k // G
-                parsed = parse_structured_output_text(preds[k], int(num_classes))
+                parsed = parse_structured_output_text(preds[k], int(num_classes), coord_bins=int(coord_bins))
                 gt_pts = gt_points_b[b] if b < len(gt_points_b) else None
                 # GT object ids: use target_label_ids (multi-label aware)
                 raw_ids = target_label_ids_b[b].tolist() if b < int(target_label_ids_b.shape[0]) else []
