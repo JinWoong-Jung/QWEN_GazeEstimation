@@ -33,7 +33,7 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from .datasets import GazeDataset, GazeTestDataset
 from .model import QwenTextGenerationModel
-from .utils.checkpoint import load_added_token_rows, load_checkpoint_for_eval, save_checkpoint
+from .utils.checkpoint import load_added_token_rows, load_token_rows, load_checkpoint_for_eval, save_checkpoint
 from .utils.common import to_device
 from .utils.config_parser import (
     build_parser,
@@ -259,27 +259,58 @@ def init_base_model(
     return AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
 
 
-def enable_new_token_gradients(peft_model: Any, base_vocab_size: int) -> None:
-    """Unfreeze only the newly added embedding rows for gradient updates.
+def enable_token_id_gradients(peft_model: Any, token_ids: list[int]) -> None:
+    """Unfreeze exactly the embedding rows used by gaze special tokens.
 
-    get_peft_model freezes all base-model parameters including embed_tokens.
-    New token rows (indices base_vocab_size..) must be trainable so their
-    embeddings are learned rather than staying at random initialization.
+    Safer than unfreezing [base_vocab_size:new_vocab_size]: in Qwen, the
+    tokenizer length can be smaller than the model embedding matrix size, so
+    newly registered special tokens may land in existing reserved rows below
+    base_vocab_size. A range-based hook would silently leave those frozen.
 
-    A backward hook zeroes gradients for the original rows so only the new
-    rows receive optimizer updates. Because embed_tokens and lm_head share the
-    same weight tensor (tied embeddings), one hook covers both.
+    Uses index_select + index_copy instead of a range zero-out so only the
+    exact gaze token rows receive gradient updates.
     """
-    emb = peft_model.get_input_embeddings()
-    n_base = int(base_vocab_size)
-    emb.weight.requires_grad_(True)
+    ids = sorted({int(x) for x in token_ids if int(x) >= 0})
+    if not ids:
+        raise ValueError("No gaze token ids provided to enable_token_id_gradients.")
 
-    def _zero_base_rows(grad: torch.Tensor) -> torch.Tensor:
-        grad = grad.clone()
-        grad[:n_base].zero_()
-        return grad
+    def _install_row_mask_hook(weight: torch.nn.Parameter, ids_: list[int]) -> int:
+        n_rows = int(weight.shape[0])
+        valid_ids = sorted({i for i in ids_ if 0 <= i < n_rows})
+        if not valid_ids:
+            return 0
+        weight.requires_grad_(True)
+        ids_cpu = torch.tensor(valid_ids, dtype=torch.long)
 
-    emb.weight.register_hook(_zero_base_rows)
+        def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
+            ids_dev = ids_cpu.to(device=grad.device)
+            out = torch.zeros_like(grad)
+            out.index_copy_(0, ids_dev, grad.index_select(0, ids_dev))
+            return out
+
+        weight.register_hook(_mask_grad)
+        return len(valid_ids)
+
+    input_emb = peft_model.get_input_embeddings()
+    n_input = _install_row_mask_hook(input_emb.weight, ids)
+
+    output_emb = (
+        peft_model.get_output_embeddings()
+        if hasattr(peft_model, "get_output_embeddings")
+        else None
+    )
+    n_output = 0
+    if output_emb is not None and hasattr(output_emb, "weight"):
+        tied = (
+            output_emb.weight is input_emb.weight
+            or output_emb.weight.data_ptr() == input_emb.weight.data_ptr()
+        )
+        if not tied:
+            n_output = _install_row_mask_hook(output_emb.weight, ids)
+
+    print(
+        f"[INFO] trainable gaze token rows installed: input={n_input}, output={n_output}"
+    )
 
 
 
@@ -503,6 +534,7 @@ def _run_rl_training(
     wandb_run: Any,
     scene_size: tuple[int, int] | None,
     coord_bins: int = 1000,
+    token_ids_to_save: list[int] | None = None,
 ) -> tuple[int, float]:
     """GRPO-based RL post-training (Stage 2).
 
@@ -575,7 +607,8 @@ def _run_rl_training(
                 _ref_base, model_id=str(_adapter_dir), is_trainable=False,
             )
             _ref_tmp = QwenTextGenerationModel(qwen_model=_ref_qwen)
-            load_added_token_rows(ckpt_dir=checkpoint_dir, model=_ref_tmp, device=torch.device("cpu"))
+            if not load_token_rows(ckpt_dir=checkpoint_dir, model=_ref_tmp, device=torch.device("cpu")):
+                load_added_token_rows(ckpt_dir=checkpoint_dir, model=_ref_tmp, device=torch.device("cpu"))
         else:
             _ref_qwen = _ref_base
             print("[RL][WARN] no lora_adapter found in checkpoint_dir; using base model as ref.")
@@ -989,6 +1022,7 @@ def _run_rl_training(
                 out_dir / "best", epoch, policy_model, processor,
                 optimizer, scheduler, clear_dir=True,
                 base_vocab_size=base_vocab_size,
+                token_ids_to_save=token_ids_to_save,
             )
             print(f"[RL] new best checkpoint: {checkpoint_monitor}={best_monitor_value:.6f}")
 
@@ -996,6 +1030,7 @@ def _run_rl_training(
             out_dir / "last", epoch, policy_model, processor,
             optimizer, scheduler, clear_dir=True,
             base_vocab_size=base_vocab_size,
+            token_ids_to_save=token_ids_to_save,
         )
 
     elapsed = time.time() - start_time
@@ -1103,6 +1138,7 @@ def main() -> None:
         coord_bins=coord_bins,
     )
     new_vocab_size = len(processor.tokenizer)
+    gaze_token_ids = sorted({int(v) for v in token_id_map.values() if int(v) >= 0})
     print(
         f"[INFO] tokenizer extended: vocab_size={new_vocab_size} "
         f"(added loc tokens: {coord_bins}, obj tokens: {num_classes}, fmt tokens: 0)"
@@ -1439,15 +1475,20 @@ def main() -> None:
         qwen_lora = get_peft_model(base_qwen, lora_cfg)
         qwen_lora.print_trainable_parameters()
 
-    # Unfreeze only the new token embedding rows added by resize_token_embeddings.
+    # Unfreeze exactly the gaze special token embedding rows.
     # get_peft_model freezes all base-model params; without this the gaze special
     # token embeddings (<loc_XXX>, <obj_XXX>, etc.) would remain at their
     # random-initialisation values throughout training and never be updated.
+    # Uses token-ID-based hook rather than [base_vocab_size:] range, because
+    # Qwen reserved rows below base_vocab_size may host some of our new tokens.
     if not bool(getattr(args, "eval_only", False)):
-        enable_new_token_gradients(qwen_lora, base_vocab_size)
+        enable_token_id_gradients(qwen_lora, gaze_token_ids)
+        below_base = sum(1 for i in gaze_token_ids if i < base_vocab_size)
+        above_base = sum(1 for i in gaze_token_ids if i >= base_vocab_size)
         print(
-            f"[INFO] enabled gradient for new token embedding rows "
-            f"[{base_vocab_size}:{new_vocab_size}] ({new_vocab_size - base_vocab_size} rows)"
+            f"[INFO] enabled gradient for gaze token rows: "
+            f"total={len(gaze_token_ids)} below_base={below_base} above_base={above_base} "
+            f"base_vocab_size={base_vocab_size} new_vocab_size={new_vocab_size}"
         )
 
     model = QwenTextGenerationModel(qwen_model=qwen_lora).to(device)
@@ -1485,6 +1526,7 @@ def main() -> None:
             wandb_run=wandb_run,
             scene_size=_scene_size,
             coord_bins=coord_bins,
+            token_ids_to_save=gaze_token_ids,
         )
 
         if args.run_test:
@@ -1664,6 +1706,7 @@ def main() -> None:
             _is_accum_step = ((step % accum_steps) == 0) or is_last_batch
             _compute_fmt_rate = _is_accum_step and (wandb_run is not None)
 
+            _t_fwd0 = time.perf_counter()
             with torch.autocast(
                 device_type=device.type,
                 dtype=amp_dtype,
@@ -1848,6 +1891,7 @@ def main() -> None:
                 scheduler,
                 clear_dir=True,
                 base_vocab_size=base_vocab_size,
+                token_ids_to_save=gaze_token_ids,
             )
 
         save_checkpoint(
@@ -1859,6 +1903,7 @@ def main() -> None:
             scheduler,
             clear_dir=True,
             base_vocab_size=base_vocab_size,
+            token_ids_to_save=gaze_token_ids,
         )
 
     if bool(args.eval_only) and len(val_ds) > 0:
