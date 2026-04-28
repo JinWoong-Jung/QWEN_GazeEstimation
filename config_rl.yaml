@@ -31,15 +31,15 @@ train:
   device: "cuda"
   dtype: "bfloat16"
   gradient_checkpointing: false
-  epochs: 20
-  batch_size: 16
+  epochs: 5
+  batch_size: 8
   grad_accum_steps: 8
   num_workers: 8
   lr: 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
   max_grad_norm: 1.0
-  train_stage: "sft"  # sft | rl
+  train_stage: "rl"  # sft | rl
   filter_invalid_object_samples: false
   save_last_every_n_epochs: 5
 
@@ -48,9 +48,10 @@ eval:
   show_tqdm: true
   eval_only: false
   test_only: false
-  run_test: false
+  run_test: true
   run_val_metrics: true
   run_val_metrics_every_n_epochs: 1
+  preview_val_samples: 20
   checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
   generation_max_new_tokens: 16       # <|im_start|> Point: <loc><loc>\nObject: <obj><|im_end|> ≈ 12 tokens + buffer
@@ -93,19 +94,19 @@ rl:
   rl_lr: 1e-6
 
   # PPO clipping (Rex-Omni style: asymmetric + dual-clip)
-  rl_clip_ratio_low: 0.2       # lower PPO clip bound  (1 - eps)
+  rl_clip_ratio_low: 0.15       # lower PPO clip bound  (1 - eps)
   rl_clip_ratio_high: 0.2      # upper PPO clip bound  (1 + eps)
   rl_clip_ratio_dual: 3.0      # dual-clip: prevents catastrophic loss when adv < 0
 
   # KL regularisation (Rex-Omni / verl style)
-  rl_kl_beta: 0.01             # initial KL coefficient
+  rl_kl_beta: 0.05             # initial KL coefficient
   rl_kl_type: "adaptive"       # "fixed" | "adaptive"
-  rl_kl_target: 0.1            # adaptive KL target value
+  rl_kl_target: 0.02            # adaptive KL target value
   rl_kl_horizon: 10000         # adaptive KL horizon (steps over which to adapt)
   rl_kl_penalty: "low_var_kl" # "kl" | "abs" | "mse" | "low_var_kl"
 
   # Multi-epoch rollout reuse (Rex-Omni core idea)
-  rl_n_ppo_epochs: 2           # gradient updates per rollout; 1 = original behaviour
+  rl_n_ppo_epochs: 1           # gradient updates per rollout; 1 = original behaviour
 
   # Logprob micro-batch size for ref/old forward passes (VRAM 절감)
   # -1 = full B*G 한 번에 처리. OOM 시 rl_group_size(4) 로 줄이면 안전.
@@ -114,19 +115,19 @@ rl:
   # Reward weights
   reward_point_weight: 1.0
   reward_object_weight: 0.75
-  reward_joint_bonus: 0.0 # 0.25     # bonus when both point and object are correct
+  reward_joint_bonus: 0.15 # 0.25     # bonus when both point and object are correct
   reward_extra_penalty: 0.0 # 0.5    # penalty for extra text in output
-  reward_point_beta: 10.0      # beta in exp(-beta * min_l2)
+  reward_point_beta: 7.0      # beta in exp(-beta * min_l2)
 
   # Rollout sampling
-  rl_temperature: 1.0          # sampling temperature during rollout (Rex-Omni: 1.0)
-  rl_top_p: 0.99               # top-p for rollout sampling (Rex-Omni: 0.99)
+  rl_temperature: 0.7           # sampling temperature during rollout (Rex-Omni: 1.0)
+  rl_top_p: 0.90                # top-p for rollout sampling (Rex-Omni: 0.99)
 
 wandb:
   enabled: true
   project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "baseline_rl"
-  wandb_log_every_steps: 20
+  run_name: "baseline_2B_rl"
+  wandb_log_every_steps: 1
   tags: ["rl"]
   notes: "Stage 2 RL config with safer memory defaults"

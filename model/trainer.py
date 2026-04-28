@@ -350,8 +350,12 @@ def maybe_save_generation_preview(
     processor: Any,
     num_classes: int,
     coord_bins: int,
+    preview_attr: str = "preview_test_samples",
+    filename: str = "test_generation_preview.json",
+    desc: str = "Test preview",
+    log_prefix: str = "TEST",
 ) -> None:
-    preview_n = max(0, int(getattr(args, "preview_test_samples", 0)))
+    preview_n = max(0, int(getattr(args, preview_attr, 0)))
     if preview_n <= 0:
         return
 
@@ -364,7 +368,7 @@ def maybe_save_generation_preview(
         num_classes=int(num_classes),
         coord_bins=int(coord_bins),
         show_tqdm=bool(args.show_tqdm),
-        desc="Test preview",
+        desc=desc,
         max_new_tokens=int(args.generation_max_new_tokens),
         num_beams=int(getattr(args, "generation_num_beams", 1)),
         repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
@@ -372,12 +376,12 @@ def maybe_save_generation_preview(
         max_samples=preview_n,
         stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
     )
-    preview_path = out_dir / "test_generation_preview.json"
+    preview_path = out_dir / filename
     preview_path.write_text(
         json.dumps(preview_samples, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"[TEST] saved generation preview: {preview_path} (samples={len(preview_samples)})")
+    print(f"[{log_prefix}] saved generation preview: {preview_path} (samples={len(preview_samples)})")
     print_generation_samples(preview_samples)
 
 
@@ -978,12 +982,29 @@ def _run_rl_training(
                 amp_dtype=amp_dtype,
                 processor=processor,
                 num_classes=int(num_classes),
+                coord_bins=coord_bins,
                 show_tqdm=bool(getattr(args, "show_tqdm", True)),
                 desc=f"RL ValMetric {epoch}",
                 max_new_tokens=rl_max_new_tokens,
-                num_beams=1,
-                repetition_penalty=1.0,
+                num_beams=int(getattr(args, "generation_num_beams", 1)),
+                repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
+                no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+            )
+            maybe_save_generation_preview(
+                args=args,
+                out_dir=out_dir,
+                model=policy_model,
+                loader=val_metric_loader,
+                device=device,
+                amp_dtype=amp_dtype,
+                processor=processor,
+                num_classes=int(num_classes),
+                coord_bins=coord_bins,
+                preview_attr="preview_val_samples",
+                filename=f"val_generation_preview_epoch_{epoch:03d}.json",
+                desc=f"RL Val preview {epoch}",
+                log_prefix="VAL",
             )
             epoch_msg += (
                 f" val_dist={float(val_gen_metrics.get('Avg L2', 0.0)):.6f}"
@@ -1845,6 +1866,21 @@ def main() -> None:
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+            )
+            maybe_save_generation_preview(
+                args=args,
+                out_dir=out_dir,
+                model=model,
+                loader=val_metric_loader,
+                device=device,
+                amp_dtype=amp_dtype,
+                processor=processor,
+                num_classes=int(num_classes),
+                coord_bins=coord_bins,
+                preview_attr="preview_val_samples",
+                filename=f"val_generation_preview_epoch_{epoch:03d}.json",
+                desc=f"Val preview {epoch}/{args.epochs}",
+                log_prefix="VAL",
             )
             _t_val_gen = time.perf_counter() - _t_vg0
 
