@@ -1,5 +1,5 @@
 paths:
-  model_path: "model/Qwen3-VL-4B-Instruct" # model/Qwen3-VL-4B-Instruct or model/Qwen3-VL-2B-Instruct
+  model_path: "model/Qwen3-VL-2B-Instruct" # model/Qwen3-VL-4B-Instruct or model/Qwen3-VL-2B-Instruct
   output_dir: "checkpoints"
   image_root: "data/gazefollow_extended/train"
   train_ann: "data/gazefollow/train_annotations_new.txt"
@@ -12,8 +12,6 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
-  # Pass the Stage-1 checkpoint at runtime, e.g.
-  # --checkpoint_dir checkpoints/baseline/best
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
@@ -32,28 +30,29 @@ train:
   seed: 42
   device: "cuda"
   dtype: "bfloat16"
-  gradient_checkpointing: true
-  epochs: 5
-  batch_size: 4
+  gradient_checkpointing: false
+  epochs: 20
+  batch_size: 16
   grad_accum_steps: 8
-  num_workers: 2
-  lr: 1e-6
+  num_workers: 8
+  lr: 1e-4
   weight_decay: 0.01
-  warmup_ratio: 0.0
+  warmup_ratio: 0.05
   max_grad_norm: 1.0
-  train_stage: "rl"  # sft | rl
+  train_stage: "sft"  # sft | rl
   filter_invalid_object_samples: false
+  save_last_every_n_epochs: 5
 
 eval:
-  test_batch_size: 4
+  test_batch_size: 16
   show_tqdm: true
   eval_only: false
   test_only: false
   run_test: false
   run_val_metrics: true
-  run_val_metrics_every_n_epochs: 5
+  run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
-  checkpoint_monitor_mode: "auto"     # auto | min | max
+  checkpoint_monitor_mode: "min"     # auto | min | max
   generation_max_new_tokens: 16       # <|im_start|> Point: <loc><loc>\nObject: <obj><|im_end|> ≈ 12 tokens + buffer
   generation_num_beams: 1
   repetition_penalty: 1.0
@@ -68,11 +67,10 @@ prompt:
     Predict the gaze point that this person is looking at, and the object located at that gaze point.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Wrap the answer with the existing special tokens <|im_start|> and <|im_end|>.
     Return exactly the two-line format below, with no extra text before or after it.
     Return exactly:
-    <|im_start|>Point: <loc_NNN><loc_MMM>
-    Object: <obj_KKK><|im_end|>
+    Point: <loc_NNN><loc_MMM>
+    Object: <obj_KKK>
 
 model:
   coord_bins: 128
@@ -87,7 +85,7 @@ model:
 loss:
   loss_point_weight: 1.0
   loss_object_weight: 1.0
-  loss_format_weight: 0.25
+  loss_format_weight: 1.0
 
 rl:
   rl_enabled: true
