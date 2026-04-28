@@ -1177,13 +1177,22 @@ def main() -> None:
             )
             print(f"[INFO] loaded LoRA adapter from: {adapter_dir}")
             if checkpoint_dir is not None:
-                rows_loaded = load_added_token_rows(
+                _tmp_model = QwenTextGenerationModel(qwen_model=qwen_model)
+                rows_loaded = load_token_rows(
                     ckpt_dir=checkpoint_dir,
-                    model=QwenTextGenerationModel(qwen_model=qwen_model),
+                    model=_tmp_model,
                     device=device,
                 )
                 if rows_loaded:
-                    print(f"[INFO] restored added token rows from: {checkpoint_dir / 'added_token_rows.pt'}")
+                    print(f"[INFO] restored gaze token rows from: {checkpoint_dir / 'gaze_token_rows.pt'}")
+                else:
+                    rows_loaded = load_added_token_rows(
+                        ckpt_dir=checkpoint_dir,
+                        model=_tmp_model,
+                        device=device,
+                    )
+                    if rows_loaded:
+                        print(f"[INFO] restored added token rows from: {checkpoint_dir / 'added_token_rows.pt'}")
         else:
             qwen_model = base_qwen
             print("[INFO] adapter checkpoint not found; running zero-shot base model.")
@@ -1455,13 +1464,21 @@ def main() -> None:
         print(f"[INFO] loaded LoRA adapter from: {adapter_dir}")
         if checkpoint_dir is not None:
             _tmp_model = QwenTextGenerationModel(qwen_model=qwen_lora)
-            rows_loaded = load_added_token_rows(
+            rows_loaded = load_token_rows(
                 ckpt_dir=checkpoint_dir,
                 model=_tmp_model,
                 device=device,
             )
             if rows_loaded:
-                print(f"[INFO] restored added token rows from: {checkpoint_dir / 'added_token_rows.pt'}")
+                print(f"[INFO] restored gaze token rows from: {checkpoint_dir / 'gaze_token_rows.pt'}")
+            else:
+                rows_loaded = load_added_token_rows(
+                    ckpt_dir=checkpoint_dir,
+                    model=_tmp_model,
+                    device=device,
+                )
+                if rows_loaded:
+                    print(f"[INFO] restored added token rows from: {checkpoint_dir / 'added_token_rows.pt'}")
     else:
         target_modules = [x.strip() for x in str(args.lora_target_modules).split(",") if x.strip()]
         lora_cfg = LoraConfig(

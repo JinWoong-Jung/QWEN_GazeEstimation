@@ -83,11 +83,11 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--checkpoint_dir", type=str, default=str(default_value(d, "checkpoint_dir", "")))
 
     # --- eval mode flags ---
-    p.add_argument("--eval_only", dest="eval_only", action="store_true")
-    p.add_argument("--no_eval_only", dest="eval_only", action="store_false")
+    p.add_argument("--eval_only", "--eval-only", dest="eval_only", action="store_true")
+    p.add_argument("--no_eval_only", "--no-eval-only", dest="eval_only", action="store_false")
     p.set_defaults(eval_only=bool(default_value(d, "eval_only", False)))
-    p.add_argument("--test_only", dest="test_only", action="store_true")
-    p.add_argument("--no_test_only", dest="test_only", action="store_false")
+    p.add_argument("--test_only", "--test-only", dest="test_only", action="store_true")
+    p.add_argument("--no_test_only", "--no-test-only", dest="test_only", action="store_false")
     p.set_defaults(test_only=bool(default_value(d, "test_only", False)))
 
     # --- data ---

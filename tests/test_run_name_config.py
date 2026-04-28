@@ -21,6 +21,14 @@ class TestRunNameConfig(unittest.TestCase):
         self.assertEqual(args.run_name, "exp_alpha")
         self.assertEqual(args.wandb_run_name, "exp_alpha")
 
+    def test_parser_accepts_hyphenated_eval_flags(self) -> None:
+        args = build_parser().parse_args(["--test-only", "--eval-only"])
+        self.assertTrue(args.test_only)
+        self.assertTrue(args.eval_only)
+
+        args = build_parser().parse_args(["--test-only", "--no-test-only"])
+        self.assertFalse(args.test_only)
+
     def test_output_dir_replaces_existing_leaf_with_run_name(self) -> None:
         self.assertEqual(
             output_dir_from_run_name("checkpoints/qwen_ge", "exp_beta"),
