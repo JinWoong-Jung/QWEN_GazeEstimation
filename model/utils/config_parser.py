@@ -182,6 +182,15 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--no_force_reasoning_format_eval", dest="force_reasoning_format_eval", action="store_false")
     p.set_defaults(force_reasoning_format_eval=bool(default_value(d, "force_reasoning_format_eval", False)))
 
+    # --- multi-view SFT ---
+    p.add_argument("--use_multiview_sft", dest="use_multiview_sft", action="store_true")
+    p.add_argument("--no_use_multiview_sft", dest="use_multiview_sft", action="store_false")
+    p.set_defaults(use_multiview_sft=bool(default_value(d, "use_multiview_sft", False)))
+    p.add_argument("--direct_view_ratio", type=float, default=float(default_value(d, "direct_view_ratio", 0.8)))
+    p.add_argument("--reasoning_view_ratio", type=float, default=float(default_value(d, "reasoning_view_ratio", 0.2)))
+    p.add_argument("--max_reasoning_words", type=int, default=int(default_value(d, "max_reasoning_words", 30)))
+    p.add_argument("--max_reasoning_chars", type=int, default=int(default_value(d, "max_reasoning_chars", 220)))
+
     # --- structured loss weights ---
     p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 1.0)))
     p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 1.0)))

@@ -264,16 +264,18 @@ class TestTargetOrders(unittest.TestCase):
 
     # --- reasoning_object_point ---
     def test_reasoning_object_point_order(self):
-        from model.utils.gaze_tokens import REASONING_START, REASONING_END
+        from model.utils.gaze_tokens import REASONING_PREFIX
         t = build_structured_target_text(
             0.5, 0.5, 10, 100,
             target_order="reasoning_object_point",
             reasoning_text="The person looks at the screen.",
         )
-        think_pos = t.index(REASONING_START)
+        # New flat format: "Reasoning: <text>\nObject: ...\nPoint: ..."
+        self.assertNotIn("<think>", t)
+        rsn_pos = t.index(REASONING_PREFIX)
         obj_pos = t.index(OBJECT_PREFIX)
         pt_pos = t.index(POINT_PREFIX)
-        self.assertLess(think_pos, obj_pos)
+        self.assertLess(rsn_pos, obj_pos)
         self.assertLess(obj_pos, pt_pos)
         p = self._parse(t)
         self.assertTrue(p["valid_format"])
@@ -288,15 +290,16 @@ class TestTargetOrders(unittest.TestCase):
         self.assertTrue(p["valid_format"])
 
     def test_reasoning_object_point_forced_empty(self):
-        from model.utils.gaze_tokens import REASONING_START, REASONING_END
+        from model.utils.gaze_tokens import REASONING_PREFIX
         t = build_structured_target_text(
             0.5, 0.5, 3, 100,
             target_order="reasoning_object_point",
             force_reasoning_format=True,
         )
-        self.assertIn(REASONING_START, t)
-        self.assertIn("Reasoning:", t)
-        self.assertIn(REASONING_END, t)
+        # New flat format: no <think> wrapper, just "Reasoning:\nObject: ...\nPoint: ..."
+        self.assertNotIn("<think>", t)
+        self.assertNotIn("</think>", t)
+        self.assertIn(REASONING_PREFIX, t)
         p = self._parse(t)
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["object_id"], 3)

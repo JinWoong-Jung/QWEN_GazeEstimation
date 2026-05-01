@@ -13,6 +13,7 @@ FORMAT_TOKENS: list[str] = []
 
 REASONING_START: str = "<think>"
 REASONING_END: str = "</think>"
+REASONING_PREFIX: str = "Reasoning:"
 
 _LOC_RE = re.compile(r"^<loc_(\d+)>$")
 _OBJ_RE = re.compile(r"^<obj_(\d+)>$")
@@ -40,15 +41,42 @@ _STRICT_RE_OBJ_FIRST = re.compile(
     re.DOTALL,
 )
 
-# Reasoning-first: "<think>...</think>\nObject: <obj_K>\nPoint: <loc_X><loc_Y>"
+# Flat reasoning-first: "Reasoning: ...\nObject: <obj_K>\nPoint: <loc_X><loc_Y>"
 # Groups: 1=obj, 2=loc_x, 3=loc_y
 _STRICT_RE_REASONING_FIRST = re.compile(
+    r"^\s*Reasoning:.*?"
+    r"\s*Object:\s*(<obj_\d+>|<obj_unknown>)"
+    r"\s*Point:\s*(<loc_\d+>)(<loc_\d+>)"
+    r"\s*(?:<\|im_end\|>)?\s*$",
+    re.DOTALL,
+)
+
+# Legacy think-first: "<think>...</think>\nObject: <obj_K>\nPoint: <loc_X><loc_Y>"
+# Groups: 1=obj, 2=loc_x, 3=loc_y
+_STRICT_RE_THINK_FIRST = re.compile(
     r"^\s*<think>.*?</think>"
     r"\s*Object:\s*(<obj_\d+>|<obj_unknown>)"
     r"\s*Point:\s*(<loc_\d+>)(<loc_\d+>)"
     r"\s*(?:<\|im_end\|>)?\s*$",
     re.DOTALL,
 )
+
+
+def normalize_reasoning_text(text: str, max_words: int = 30, max_chars: int = 220) -> str:
+    """Collapse whitespace, truncate, and ensure trailing period."""
+    text = " ".join(str(text or "").split())
+    if not text:
+        return text
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words])
+    if len(text) > max_chars:
+        truncated = text[:max_chars]
+        last_space = truncated.rfind(" ")
+        text = truncated[:last_space] if last_space > 0 else truncated
+    if text and not text.endswith("."):
+        text = text + "."
+    return text
 
 
 def _obj_token_width(num_classes: int) -> int:
@@ -150,11 +178,10 @@ def build_structured_target_text(
     order = str(target_order or "object_point").strip()
 
     if order == "reasoning_object_point":
-        reasoning_body = str(reasoning_text or "").strip()
+        reasoning_body = normalize_reasoning_text(str(reasoning_text or "").strip())
         if reasoning_body or bool(force_reasoning_format):
-            content_line = f"Reasoning: {reasoning_body}" if reasoning_body else "Reasoning:"
-            reasoning_block = f"{REASONING_START}\n{content_line}\n{REASONING_END}"
-            return f"{reasoning_block}\n{object_str}\n{point_str}"
+            content_line = f"{REASONING_PREFIX} {reasoning_body}" if reasoning_body else REASONING_PREFIX
+            return f"{content_line}\n{object_str}\n{point_str}"
         return f"{object_str}\n{point_str}"
 
     if order == "point_object_reasoning":
@@ -314,8 +341,14 @@ def parse_structured_output_text(
         return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
                                    num_classes=num_classes, coord_bins=coord_n)
 
-    # reasoning_object_point: groups obj=1, x=2, y=3
+    # flat reasoning_object_point: "Reasoning: ...\nObject: ...\nPoint: ..."
     m = _STRICT_RE_REASONING_FIRST.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    # legacy think-first: "<think>...</think>\nObject: ...\nPoint: ..."
+    m = _STRICT_RE_THINK_FIRST.match(s)
     if m is not None:
         return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
                                    num_classes=num_classes, coord_bins=coord_n)

@@ -21,7 +21,7 @@ warnings.filterwarnings(
 
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 from transformers import (
     AutoModelForImageTextToText,
@@ -31,7 +31,7 @@ from transformers import (
 
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
-from .datasets import GazeDataset, GazeTestDataset
+from .datasets import GazeDataset, GazeTestDataset, MultiViewGazeDataset
 from .model import QwenTextGenerationModel
 from .utils.checkpoint import load_added_token_rows, load_token_rows, load_checkpoint_for_eval, save_checkpoint
 from .utils.common import to_device
@@ -1150,6 +1150,9 @@ def main() -> None:
         prompt_text_for_run = _prompt_text_direct
     else:
         prompt_text_for_run = _prompt_text_reasoning
+    # Val/test always use direct-only target → must use the direct prompt.
+    # Fall back to reasoning prompt only when no direct prompt is configured.
+    _prompt_text_eval = _prompt_text_direct if _prompt_text_direct else prompt_text_for_run
     filter_invalid = bool(getattr(args, "filter_invalid_object_samples", True))
     loss_weights = {
         "point": float(getattr(args, "loss_point_weight", 1.0)),
@@ -1274,7 +1277,7 @@ def main() -> None:
             test_ds = GazeTestDataset(
                 groups=test_groups,
                 prompt_template=args.prompt_template,
-                prompt_text=prompt_text_for_run,
+                prompt_text=_prompt_text_eval,
                 id2label=id2label,
                 vocab2id=vocab2id,
                 vocab2id_lower=vocab2id_lower,
@@ -1439,28 +1442,59 @@ def main() -> None:
         _force_train = False
         _force_eval = False
 
-    train_ds = GazeDataset(
-        records=train_records,
-        prompt_template=args.prompt_template,
-        prompt_text=prompt_text_for_run,
-        apply_augmentation=True,
-        id2label=id2label,
-        vocab2id=vocab2id,
-        vocab2id_lower=vocab2id_lower,
-        num_classes=int(num_classes),
-        visual_prompting=bool(args.visual_prompting),
-        image_cache_size=image_cache_size,
-        filter_invalid_object_samples=filter_invalid,
-        coord_bins=coord_bins,
-        reasoning_index=reasoning_index,
-        force_reasoning_format=_force_train,
-        target_order=_target_order,
-        disable_spatial_aug_for_reasoning=_disable_spatial_aug,
-    )
+    _use_multiview = bool(getattr(args, "use_multiview_sft", False)) and bool(getattr(args, "use_reasoning", False))
+    _direct_view_ratio = float(getattr(args, "direct_view_ratio", 0.8))
+    _reasoning_view_ratio = float(getattr(args, "reasoning_view_ratio", 0.2))
+    _max_reasoning_words = int(getattr(args, "max_reasoning_words", 30))
+    _max_reasoning_chars = int(getattr(args, "max_reasoning_chars", 220))
+
+    if _use_multiview and reasoning_index is not None:
+        train_ds: GazeDataset | MultiViewGazeDataset = MultiViewGazeDataset(
+            records=train_records,
+            prompt_template=args.prompt_template,
+            prompt_text_direct=_prompt_text_direct or prompt_text_for_run,
+            prompt_text_reasoning=_prompt_text_reasoning,
+            id2label=id2label,
+            vocab2id=vocab2id,
+            vocab2id_lower=vocab2id_lower,
+            num_classes=int(num_classes),
+            visual_prompting=bool(args.visual_prompting),
+            image_cache_size=image_cache_size,
+            filter_invalid_object_samples=filter_invalid,
+            coord_bins=coord_bins,
+            reasoning_index=reasoning_index,
+            max_reasoning_words=_max_reasoning_words,
+            max_reasoning_chars=_max_reasoning_chars,
+        )
+        n_direct, n_reasoning = train_ds.get_view_counts()
+        print(
+            f"[INFO] MultiViewGazeDataset: n_direct={n_direct} n_reasoning={n_reasoning} "
+            f"total_views={len(train_ds)} direct_ratio={_direct_view_ratio:.2f} "
+            f"reasoning_ratio={_reasoning_view_ratio:.2f}"
+        )
+    else:
+        train_ds = GazeDataset(
+            records=train_records,
+            prompt_template=args.prompt_template,
+            prompt_text=prompt_text_for_run,
+            apply_augmentation=True,
+            id2label=id2label,
+            vocab2id=vocab2id,
+            vocab2id_lower=vocab2id_lower,
+            num_classes=int(num_classes),
+            visual_prompting=bool(args.visual_prompting),
+            image_cache_size=image_cache_size,
+            filter_invalid_object_samples=filter_invalid,
+            coord_bins=coord_bins,
+            reasoning_index=reasoning_index,
+            force_reasoning_format=_force_train,
+            target_order=_target_order,
+            disable_spatial_aug_for_reasoning=_disable_spatial_aug,
+        )
     val_ds = GazeDataset(
         records=val_records,
         prompt_template=args.prompt_template,
-        prompt_text=prompt_text_for_run,
+        prompt_text=_prompt_text_eval,
         apply_augmentation=False,
         id2label=id2label,
         vocab2id=vocab2id,
@@ -1505,10 +1539,25 @@ def main() -> None:
     _persistent = _nw > 0
     _prefetch = 2 if _nw > 0 else None
 
+    _train_sampler = None
+    if _use_multiview and isinstance(train_ds, MultiViewGazeDataset):
+        n_direct, n_reasoning = train_ds.get_view_counts()
+        if n_direct > 0 and n_reasoning > 0:
+            weights: list[float] = (
+                [_direct_view_ratio / float(n_direct)] * n_direct
+                + [_reasoning_view_ratio / float(n_reasoning)] * n_reasoning
+            )
+            _train_sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(train_records),
+                replacement=True,
+            )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(_train_sampler is None),
+        sampler=_train_sampler,
         num_workers=_nw,
         pin_memory=(device.type == "cuda"),
         collate_fn=train_collator,
@@ -1672,7 +1721,7 @@ def main() -> None:
                 test_ds = GazeTestDataset(
                     groups=test_groups,
                     prompt_template=args.prompt_template,
-                    prompt_text=prompt_text_for_run,
+                    prompt_text=_prompt_text_eval,
                     id2label=id2label,
                     vocab2id=vocab2id,
                     vocab2id_lower=vocab2id_lower,
@@ -1875,6 +1924,10 @@ def main() -> None:
                         epoch_progress = (float(epoch) - 1.0) + (
                             float(updates_done_in_epoch) / max(float(updates_per_epoch), 1.0)
                         )
+                        _view_types = batch.get("view_type", [])
+                        _n_batch = max(len(_view_types), 1)
+                        _n_direct_batch = sum(1 for v in _view_types if v == "direct")
+                        _n_rsn_batch = sum(1 for v in _view_types if v == "reasoning")
                         wandb_run.log(
                             {
                                 "train/loss": float(raw_loss.detach().item()),
@@ -1887,6 +1940,8 @@ def main() -> None:
                                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "train/grad_norm": grad_norm_value,
                                 "train/epoch": epoch_progress,
+                                "train/view_direct_frac": float(_n_direct_batch) / float(_n_batch),
+                                "train/view_reasoning_frac": float(_n_rsn_batch) / float(_n_batch),
                             },
                             step=global_step,
                         )
@@ -2107,7 +2162,7 @@ def main() -> None:
             test_ds = GazeTestDataset(
                 groups=test_groups,
                 prompt_template=args.prompt_template,
-                prompt_text=prompt_text_for_run,
+                prompt_text=_prompt_text_eval,
                 id2label=id2label,
                 vocab2id=vocab2id,
                 vocab2id_lower=vocab2id_lower,

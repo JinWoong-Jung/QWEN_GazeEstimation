@@ -72,7 +72,7 @@ class TestReasoningMasks(unittest.TestCase):
         mpt, mobj, mfmt, mrsn = build_structured_masks(
             self.proc, self._joint(text), [text], torch.ones(1)
         )
-        self.assertFalse(mrsn.any().item(), "reasoning mask must be all False when no <think> block")
+        self.assertFalse(mrsn.any().item(), "reasoning mask must be all False when no reasoning block")
 
     def test_with_reasoning_has_content(self):
         text = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "person looks left")

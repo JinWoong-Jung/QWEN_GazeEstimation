@@ -43,12 +43,17 @@ train:
   filter_invalid_object_samples: false
   save_last_every_n_epochs: 5
   use_reasoning: true
+  use_multiview_sft: true
 
 reasoning:
   target_order: "reasoning_object_point"   # object_point | point_object | point_object_reasoning | reasoning_object_point
-  force_reasoning_format_train: true        # force <think> scaffold even when no reasoning file
+  force_reasoning_format_train: false       # do not create empty reasoning scaffolds
   force_reasoning_format_eval: false        # do NOT force empty scaffold on val/test
   disable_spatial_aug_for_reasoning: true   # skip hflip/crop for samples with reasoning files
+  direct_view_ratio: 0.8
+  reasoning_view_ratio: 0.2
+  max_reasoning_words: 30
+  max_reasoning_chars: 220
 
 eval:
   test_batch_size: 16
@@ -60,7 +65,7 @@ eval:
   run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 128      # reasoning_object_point: ~15-50 reasoning + ~10 answer tokens
+  generation_max_new_tokens: 24       # direct Object->Point eval should stay short
   generation_num_beams: 1
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
@@ -76,9 +81,7 @@ prompt:
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
     Return exactly:
-    <think>
     Reasoning: <your reasoning here>
-    </think>
     Object: <obj_KKK>
     Point: <loc_NNN><loc_MMM>
   # Used when use_reasoning=false (object_point target order, no <think> block)
@@ -102,10 +105,10 @@ model:
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 loss:
-  loss_point_weight: 2.0
+  loss_point_weight: 3.0
   loss_object_weight: 1.0
-  loss_format_weight: 0.5
-  loss_reasoning_weight: 0.5
+  loss_format_weight: 0.2
+  loss_reasoning_weight: 0.05
 
 wandb:
   enabled: true

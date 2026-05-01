@@ -186,44 +186,53 @@ def build_structured_masks(
 
         # Detect reasoning block span within ans_ids (offset indices).
         rsn_content_offsets: set[int] = set()
-        if think_start_ids and think_end_ids:
-            ts = find_subseq(ans_ids, think_start_ids, from_right=False)
-            te = find_subseq(ans_ids, think_end_ids, from_right=False)
-            if ts >= 0 and te > ts:
-                # Indices of tokens that are reasoning CONTENT (not structure).
-                # Structure tokens: <think>(ts..ts+len-1), \n after <think>,
-                #                   "Reasoning:" label tokens, \n before </think>,
-                #                   </think>(te..te+len-1).
-                think_start_end = ts + len(think_start_ids)      # first token after <think>
-                think_end_start = te                              # first token of </think>
 
-                # Tokens right after <think> that belong to "Reasoning:" label
+        ts_pos = find_subseq(ans_ids, think_start_ids, from_right=False) if think_start_ids else -1
+        rl_pos = find_subseq(ans_ids, reasoning_label_ids, from_right=False) if reasoning_label_ids else -1
+
+        if ts_pos >= 0 and think_end_ids and (rl_pos < 0 or ts_pos < rl_pos):
+            # Legacy <think>...</think> format.
+            te_pos = find_subseq(ans_ids, think_end_ids, from_right=False)
+            if te_pos > ts_pos:
+                think_start_end = ts_pos + len(think_start_ids)
+                think_end_start = te_pos
                 rl_len = len(reasoning_label_ids)
                 rsn_label_start = think_start_end
-                # skip a leading newline token after <think> (structure)
-                # use tok_strs — avoids fragile convert_tokens_to_ids("\n") lookup
                 if rsn_label_start < len(tok_strs) and tok_strs[rsn_label_start] in {"<0x0A>", "\n", "Ċ", "▁\n"}:
                     rsn_label_start += 1
-                rsn_label_end = rsn_label_start + rl_len  # exclusive
-
-                # Content: from after "Reasoning: " (including space token) up to
-                # the \n token that immediately precedes </think>.
+                rsn_label_end = rsn_label_start + rl_len
                 content_start = rsn_label_end
-                # skip a space token after "Reasoning:"
                 if content_start < len(ans_ids):
                     space_str = tok_strs[content_start] if content_start < len(tok_strs) else ""
                     if space_str in {"▁", " ", "Ġ"} or (len(space_str) == 1 and space_str.isspace()):
                         content_start += 1
-
-                # The \n immediately before </think> is structure (format).
                 content_end = think_end_start
                 if content_end > content_start and content_end - 1 >= 0:
                     last_tok = tok_strs[content_end - 1] if content_end - 1 < len(tok_strs) else ""
                     if last_tok in {"<0x0A>", "\n", "Ċ", "ĠĊ", "▁\n"}:
                         content_end -= 1
-
                 for off in range(content_start, content_end):
                     rsn_content_offsets.add(off)
+
+        elif rl_pos >= 0:
+            # New flat format: "Reasoning: <content>\nObject:..."
+            content_start = rl_pos + len(reasoning_label_ids)
+            # Skip a space token (but not a newline) immediately after "Reasoning:"
+            if content_start < len(ans_ids):
+                space_str = tok_strs[content_start] if content_start < len(tok_strs) else ""
+                if space_str in {"▁", " ", "Ġ"}:
+                    content_start += 1
+            # Collect tokens up to the first newline.
+            # Also catches BPE fusions like ".Ċ" (period+newline) by checking
+            # if the token string contains the Qwen newline character Ċ (U+010A).
+            content_end = content_start
+            while content_end < len(ans_ids):
+                t_str = tok_strs[content_end] if content_end < len(tok_strs) else ""
+                if t_str in {"<0x0A>", "\n", "Ċ", "ĠĊ", "▁\n"} or "Ċ" in t_str or "\n" in t_str:
+                    break
+                content_end += 1
+            for off in range(content_start, content_end):
+                rsn_content_offsets.add(off)
 
         for off, tok_str in enumerate(tok_strs):
             pos = ans_start + off
@@ -443,6 +452,7 @@ class QwenTrainCollator:
             "target_point_bin": target_point_bin,
             "target_object_id": target_object_id,
             "image_rel": [str(x.get("image_rel", "")) for x in batch],
+            "view_type": [str(x.get("view_type", "direct")) for x in batch],
         }
 
 

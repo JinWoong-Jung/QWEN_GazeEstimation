@@ -39,16 +39,19 @@ class TestBuildWithReasoning(unittest.TestCase):
             "",
             force_reasoning_format=True,
         )
-        self.assertIn(REASONING_START, result)
+        # New flat format: no <think> wrapper
+        self.assertNotIn(REASONING_START, result)
+        self.assertNotIn(REASONING_END, result)
         self.assertIn("Reasoning:", result)
-        self.assertIn(REASONING_END, result)
         self.assertIn("Point:", result)
         self.assertIn("Object:", result)
 
     def test_with_reasoning_has_think_tags(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "Looking at the TV.")
-        self.assertIn(REASONING_START, result)
-        self.assertIn(REASONING_END, result)
+        # New flat format: "Reasoning:" prefix, no <think> wrapper
+        self.assertNotIn(REASONING_START, result)
+        self.assertNotIn(REASONING_END, result)
+        self.assertIn("Reasoning:", result)
         self.assertIn("Looking at the TV.", result)
 
     def test_reasoning_label_present(self):
@@ -57,16 +60,15 @@ class TestBuildWithReasoning(unittest.TestCase):
 
     def test_reasoning_before_point(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "some reasoning")
-        think_pos = result.index(REASONING_START)
+        rsn_pos = result.index("Reasoning:")
         point_pos = result.index("Point:")
-        self.assertLess(think_pos, point_pos)
+        self.assertLess(rsn_pos, point_pos)
 
     def test_think_block_wraps_reasoning(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "abc")
-        start_idx = result.index(REASONING_START)
-        end_idx = result.index(REASONING_END)
-        block = result[start_idx : end_idx + len(REASONING_END)]
-        self.assertIn("Reasoning: abc", block)
+        # New flat format: reasoning inline before Object/Point, no <think> block
+        self.assertIn("Reasoning: abc", result)
+        self.assertNotIn(REASONING_START, result)
 
     def test_base_content_preserved(self):
         base = build_structured_target_text(0.3, 0.7, 5, 100)
