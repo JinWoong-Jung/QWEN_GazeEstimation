@@ -11,6 +11,7 @@ from .utils.data_utils import (
     Record,
     TestGroup,
     apply_train_augmentation,
+    apply_safe_augmentation,
     alias_label_text,
     build_prompt,
     sanitize_bbox_pixels,
@@ -19,7 +20,6 @@ from .utils.data_utils import (
 from .utils.gaze_tokens import (
     GAZE_OBJ_UNKNOWN,
     build_structured_target_text,
-    build_structured_target_text_with_reasoning,
     quantize_coord,
 )
 
@@ -80,8 +80,9 @@ def format_structured_target_text(
     coord_bins: int = 1000,
     reasoning_text: str | None = None,
     force_reasoning_format: bool = False,
+    target_order: str = "object_point",
 ) -> tuple[str, int, float, float]:
-    """Build structured target text, optionally prefixed with a reasoning block.
+    """Build structured target text.
 
     Returns (target_text, resolved_obj_id, target_text_valid, target_object_valid).
     """
@@ -98,33 +99,22 @@ def format_structured_target_text(
         num_classes=int(num_classes),
     )
 
-    if obj_id >= 0:
-        text = build_structured_target_text_with_reasoning(
-            point_x=float(point_x),
-            point_y=float(point_y),
-            obj_id=obj_id,
-            num_classes=int(num_classes),
-            reasoning_text=reasoning_text,
-            coord_bins=int(coord_bins),
-            force_reasoning_format=bool(force_reasoning_format),
-        )
-        text_valid = 1.0
-        object_valid = 1.0
-    else:
-        text = build_structured_target_text_with_reasoning(
-            point_x=float(point_x),
-            point_y=float(point_y),
-            obj_id=None,
-            num_classes=int(num_classes),
-            reasoning_text=reasoning_text,
-            obj_token=GAZE_OBJ_UNKNOWN,
-            coord_bins=int(coord_bins),
-            force_reasoning_format=bool(force_reasoning_format),
-        )
-        text_valid = 1.0
-        object_valid = 0.0
+    obj_tok = None if obj_id >= 0 else GAZE_OBJ_UNKNOWN
+    resolved_obj_id = obj_id if obj_id >= 0 else None
 
-    return text, obj_id, float(text_valid), float(object_valid)
+    text = build_structured_target_text(
+        point_x=float(point_x),
+        point_y=float(point_y),
+        obj_id=resolved_obj_id,
+        num_classes=int(num_classes),
+        obj_token=obj_tok,
+        coord_bins=int(coord_bins),
+        target_order=str(target_order or "object_point"),
+        reasoning_text=reasoning_text,
+        force_reasoning_format=bool(force_reasoning_format),
+    )
+
+    return text, obj_id, 1.0, 1.0 if obj_id >= 0 else 0.0
 
 
 def draw_head_bbox_prompt(
@@ -167,6 +157,8 @@ class GazeDataset(Dataset):
         coord_bins: int = 1000,
         reasoning_index: dict[str, Any] | None = None,
         force_reasoning_format: bool = False,
+        target_order: str = "reasoning_object_point",
+        disable_spatial_aug_for_reasoning: bool = True,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -183,6 +175,8 @@ class GazeDataset(Dataset):
         self.visual_prompting = bool(visual_prompting)
         self.reasoning_index: dict[str, Any] | None = reasoning_index
         self.force_reasoning_format = bool(force_reasoning_format)
+        self.target_order = str(target_order or "reasoning_object_point")
+        self.disable_spatial_aug_for_reasoning = bool(disable_spatial_aug_for_reasoning)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
@@ -227,13 +221,37 @@ class GazeDataset(Dataset):
         gaze_x = float(rec.gaze_x)
         gaze_y = float(rec.gaze_y)
         bbox_px = rec.bbox_px
+
+        # Probe reasoning BEFORE augmentation so aug policy can depend on it.
+        reasoning_text: str | None = None
+        has_reasoning_file = False
+        if self.reasoning_index is not None:
+            from pathlib import Path as _Path
+            folder = _Path(rec.image_rel).parent.name
+            stem = _Path(rec.image_rel).stem
+            key = f"{folder}/{stem}_{int(rec.sample_id)}"
+            rpath = self.reasoning_index.get(key)
+            if rpath is not None:
+                reasoning_text = load_reasoning_text(rpath)
+                has_reasoning_file = reasoning_text is not None
+
         if self.apply_augmentation:
-            scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
-                scene=scene,
-                gaze_x=gaze_x,
-                gaze_y=gaze_y,
-                bbox_px=bbox_px,
-            )
+            # Spatial aug (hflip/crop) invalidates original-image reasoning text.
+            # Use safe (color-jitter-only) aug for reasoning samples.
+            if has_reasoning_file and self.disable_spatial_aug_for_reasoning:
+                scene, gaze_x, gaze_y, bbox_px = apply_safe_augmentation(
+                    scene=scene,
+                    gaze_x=gaze_x,
+                    gaze_y=gaze_y,
+                    bbox_px=bbox_px,
+                )
+            else:
+                scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
+                    scene=scene,
+                    gaze_x=gaze_x,
+                    gaze_y=gaze_y,
+                    bbox_px=bbox_px,
+                )
 
         w, h = scene.size
         x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
@@ -253,16 +271,6 @@ class GazeDataset(Dataset):
         if (not resolved_label_text) and int(rec.label_id) >= 0:
             resolved_label_text = str(self.id2label.get(int(rec.label_id), "")).strip()
 
-        reasoning_text: str | None = None
-        if self.reasoning_index is not None:
-            from pathlib import Path as _Path
-            folder = _Path(rec.image_rel).parent.name
-            stem = _Path(rec.image_rel).stem
-            key = f"{folder}/{stem}_{int(rec.sample_id)}"
-            rpath = self.reasoning_index.get(key)
-            if rpath is not None:
-                reasoning_text = load_reasoning_text(rpath)
-
         target_text, obj_id, target_text_valid, target_object_valid = format_structured_target_text(
             label_text=resolved_label_text,
             label_id=int(rec.label_id),
@@ -275,6 +283,7 @@ class GazeDataset(Dataset):
             coord_bins=self.coord_bins,
             reasoning_text=reasoning_text,
             force_reasoning_format=self.force_reasoning_format,
+            target_order=self.target_order,
         )
 
         bx = quantize_coord(float(gaze_x), bins=self.coord_bins)
@@ -298,7 +307,7 @@ class GazeDataset(Dataset):
             "target_label_text": resolved_label_text,
             "image_rel": str(rec.image_rel),
             "reasoning_text": reasoning_text or "",
-            "has_reasoning": reasoning_text is not None and len(reasoning_text) > 0,
+            "has_reasoning": has_reasoning_file,
         }
 
 
@@ -316,6 +325,7 @@ class GazeTestDataset(Dataset):
         image_cache_size: int = 0,
         coord_bins: int = 1000,
         force_reasoning_format: bool = False,
+        target_order: str = "object_point",
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -331,6 +341,7 @@ class GazeTestDataset(Dataset):
         self.coord_bins = int(coord_bins)
         self.visual_prompting = bool(visual_prompting)
         self.force_reasoning_format = bool(force_reasoning_format)
+        self.target_order = str(target_order or "object_point")
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
@@ -380,6 +391,7 @@ class GazeTestDataset(Dataset):
             point_y=py,
             coord_bins=self.coord_bins,
             force_reasoning_format=self.force_reasoning_format,
+            target_order=self.target_order,
         )
 
         bx = quantize_coord(float(px), bins=self.coord_bins)

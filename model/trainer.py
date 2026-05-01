@@ -45,6 +45,7 @@ from .utils.data_utils import (
     build_reasoning_index,
     load_label_map,
     load_label_text_map,
+    load_reasoning_text,
     load_records,
     load_test_groups,
     load_test_label_map,
@@ -1140,7 +1141,15 @@ def main() -> None:
     if train_stage not in {"sft", "rl"}:
         raise ValueError(f"train_stage must be 'sft' or 'rl', got: {train_stage!r}")
 
-    prompt_text_for_run = str(args.prompt_text or "")
+    _use_reasoning = bool(getattr(args, "use_reasoning", False))
+    _prompt_text_reasoning = str(getattr(args, "prompt_text", "") or "")
+    _prompt_text_direct = str(getattr(args, "prompt_text_direct", "") or "")
+    # Select the prompt that matches the target format so there's no prompt/target mismatch.
+    # Fall back gracefully: if the direct prompt isn't set, use the reasoning prompt for both.
+    if not _use_reasoning and _prompt_text_direct:
+        prompt_text_for_run = _prompt_text_direct
+    else:
+        prompt_text_for_run = _prompt_text_reasoning
     filter_invalid = bool(getattr(args, "filter_invalid_object_samples", True))
     loss_weights = {
         "point": float(getattr(args, "loss_point_weight", 1.0)),
@@ -1273,7 +1282,12 @@ def main() -> None:
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
-                force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
+                force_reasoning_format=bool(getattr(args, "force_reasoning_format_eval", False)),
+                target_order=(
+                    "object_point"
+                    if not bool(getattr(args, "use_reasoning", False))
+                    else str(getattr(args, "target_order", "object_point"))
+                ),
             )
             log_target_example("test_only", test_ds)
             _tnw = int(args.num_workers)
@@ -1405,9 +1419,25 @@ def main() -> None:
         reasoning_dir = _Path(str(getattr(args, "train_reasoning_dir", ""))).resolve()
         if reasoning_dir.exists():
             reasoning_index = build_reasoning_index(reasoning_dir)
-            print(f"[INFO] Loaded reasoning index: {len(reasoning_index)} entries")
+            print(
+                f"[INFO] Loaded reasoning index: {len(reasoning_index)} entries "
+                f"({len(reasoning_index)}/{max(1, len(train_records))} train samples)"
+            )
         else:
             print(f"[WARN] train_reasoning_dir not found: {reasoning_dir}")
+
+    _target_order = str(getattr(args, "target_order", "reasoning_object_point"))
+    _disable_spatial_aug = bool(getattr(args, "disable_spatial_aug_for_reasoning", True))
+    _force_train = bool(getattr(args, "force_reasoning_format_train",
+                                getattr(args, "use_reasoning", False)))
+    _force_eval = bool(getattr(args, "force_reasoning_format_eval", False))
+
+    # use_reasoning=False must guarantee no reasoning scaffold in any dataset.
+    # target_order and force flags from config are irrelevant when reasoning is off.
+    if not bool(getattr(args, "use_reasoning", False)):
+        _target_order = "object_point"
+        _force_train = False
+        _force_eval = False
 
     train_ds = GazeDataset(
         records=train_records,
@@ -1423,7 +1453,9 @@ def main() -> None:
         filter_invalid_object_samples=filter_invalid,
         coord_bins=coord_bins,
         reasoning_index=reasoning_index,
-        force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
+        force_reasoning_format=_force_train,
+        target_order=_target_order,
+        disable_spatial_aug_for_reasoning=_disable_spatial_aug,
     )
     val_ds = GazeDataset(
         records=val_records,
@@ -1438,7 +1470,8 @@ def main() -> None:
         image_cache_size=image_cache_size,
         filter_invalid_object_samples=filter_invalid,
         coord_bins=coord_bins,
-        force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
+        force_reasoning_format=_force_eval,
+        target_order=_target_order,
     )
 
     # Count filtered samples
@@ -1647,7 +1680,8 @@ def main() -> None:
                     visual_prompting=bool(args.visual_prompting),
                     image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                     coord_bins=coord_bins,
-                    force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
+                    force_reasoning_format=_force_eval,
+                    target_order=_target_order,
                 )
                 test_loader = DataLoader(
                     test_ds,
@@ -2081,7 +2115,8 @@ def main() -> None:
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
-                force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
+                force_reasoning_format=_force_eval,
+                target_order=_target_order,
             )
             log_target_example("test", test_ds)
             test_loader = DataLoader(

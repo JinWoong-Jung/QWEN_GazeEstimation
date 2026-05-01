@@ -237,6 +237,23 @@ def apply_train_augmentation(
     return scene, gaze_x, gaze_y, (float(x1), float(y1), float(x2), float(y2))
 
 
+def apply_safe_augmentation(
+    scene: Image.Image,
+    gaze_x: float,
+    gaze_y: float,
+    bbox_px: tuple[float, float, float, float],
+) -> tuple[Image.Image, float, float, tuple[float, float, float, float]]:
+    """Color-jitter-only augmentation for samples with spatial reasoning text.
+
+    Skips hflip and crop so that left/right and spatial-relation words in the
+    reasoning file stay consistent with the augmented image.
+    """
+    scene = color_jitter(scene, p=0.8)
+    w, h = scene.size
+    x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
+    return scene, clamp01(gaze_x), clamp01(gaze_y), (float(x1), float(y1), float(x2), float(y2))
+
+
 def load_vocab2id(vocab2id_path: Path | None) -> tuple[dict[str, int], dict[str, int]]:
     if vocab2id_path is None or (not vocab2id_path.exists()):
         return {}, {}
@@ -944,16 +961,30 @@ def resolve_reasoning_path(
     return reasoning_dir / folder / f"{stem}_{int(sample_id)}.txt"
 
 
-def load_reasoning_text(path: Path) -> str | None:
-    """Extract the Reasoning: line from a GPT reasoning txt file. Returns None on failure."""
+def load_reasoning_record(path: Path) -> dict[str, str | None]:
+    """Parse a GPT reasoning txt file into {object_text, reasoning_text}.
+
+    Expected file format:
+        Object: <object description>
+        Reasoning: <reasoning text>
+    Either line may be absent; missing lines return None.
+    """
+    result: dict[str, str | None] = {"object_text": None, "reasoning_text": None}
     try:
         content = path.read_text(encoding="utf-8").strip()
         for line in content.splitlines():
-            if line.startswith("Reasoning:"):
-                return line[len("Reasoning:"):].strip()
-        return None
+            if line.startswith("Object:") and result["object_text"] is None:
+                result["object_text"] = line[len("Object:"):].strip() or None
+            elif line.startswith("Reasoning:") and result["reasoning_text"] is None:
+                result["reasoning_text"] = line[len("Reasoning:"):].strip() or None
     except (FileNotFoundError, OSError):
-        return None
+        pass
+    return result
+
+
+def load_reasoning_text(path: Path) -> str | None:
+    """Extract the Reasoning: line from a GPT reasoning txt file. Returns None on failure."""
+    return load_reasoning_record(path)["reasoning_text"]
 
 
 def build_reasoning_index(reasoning_dir: Path) -> dict[str, Path]:

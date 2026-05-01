@@ -219,7 +219,7 @@ def build_structured_masks(
                 content_end = think_end_start
                 if content_end > content_start and content_end - 1 >= 0:
                     last_tok = tok_strs[content_end - 1] if content_end - 1 < len(tok_strs) else ""
-                    if last_tok in {"<0x0A>", "\n", "Ċ"}:
+                    if last_tok in {"<0x0A>", "\n", "Ċ", "ĠĊ", "▁\n"}:
                         content_end -= 1
 
                 for off in range(content_start, content_end):

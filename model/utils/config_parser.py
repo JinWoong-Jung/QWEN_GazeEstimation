@@ -154,6 +154,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     # --- prompt ---
     p.add_argument("--prompt_template", type=str, default=str(default_value(d, "prompt_template", "")))
     p.add_argument("--prompt_text", type=str, default=str(default_value(d, "prompt_text", "")))
+    p.add_argument("--prompt_text_direct", type=str, default=str(default_value(d, "prompt_text_direct", "")))
     p.add_argument("--visual_prompting", dest="visual_prompting", action="store_true")
     p.add_argument("--no_visual_prompting", dest="visual_prompting", action="store_false")
     p.set_defaults(visual_prompting=bool(default_value(d, "visual_prompting", False)))
@@ -168,6 +169,18 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--use_reasoning", dest="use_reasoning", action="store_true")
     p.add_argument("--no_use_reasoning", dest="use_reasoning", action="store_false")
     p.set_defaults(use_reasoning=bool(default_value(d, "use_reasoning", False)))
+
+    # --- reasoning sub-config ---
+    p.add_argument("--target_order", type=str, default=str(default_value(d, "target_order", "reasoning_object_point")))
+    p.add_argument("--disable_spatial_aug_for_reasoning", dest="disable_spatial_aug_for_reasoning", action="store_true")
+    p.add_argument("--no_disable_spatial_aug_for_reasoning", dest="disable_spatial_aug_for_reasoning", action="store_false")
+    p.set_defaults(disable_spatial_aug_for_reasoning=bool(default_value(d, "disable_spatial_aug_for_reasoning", True)))
+    p.add_argument("--force_reasoning_format_train", dest="force_reasoning_format_train", action="store_true")
+    p.add_argument("--no_force_reasoning_format_train", dest="force_reasoning_format_train", action="store_false")
+    p.set_defaults(force_reasoning_format_train=bool(default_value(d, "force_reasoning_format_train", True)))
+    p.add_argument("--force_reasoning_format_eval", dest="force_reasoning_format_eval", action="store_true")
+    p.add_argument("--no_force_reasoning_format_eval", dest="force_reasoning_format_eval", action="store_false")
+    p.set_defaults(force_reasoning_format_eval=bool(default_value(d, "force_reasoning_format_eval", False)))
 
     # --- structured loss weights ---
     p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 1.0)))

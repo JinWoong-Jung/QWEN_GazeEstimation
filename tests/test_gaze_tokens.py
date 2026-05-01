@@ -240,5 +240,169 @@ class TestParseStructuredOutputText(unittest.TestCase):
         self.assertAlmostEqual(py, 0.612, delta=0.002)
 
 
+class TestTargetOrders(unittest.TestCase):
+    """Verify build_structured_target_text and parser round-trip for all four orders."""
+
+    def _parse(self, text: str) -> dict:
+        return parse_structured_output_text(text, 100)
+
+    # --- object_point (new default) ---
+    def test_object_point_order(self):
+        t = build_structured_target_text(0.5, 0.3, 7, 100, target_order="object_point")
+        self.assertTrue(t.index(OBJECT_PREFIX) < t.index(POINT_PREFIX))
+        p = self._parse(t)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 7)
+
+    def test_object_point_roundtrip_coords(self):
+        t = build_structured_target_text(0.25, 0.75, 42, 100, target_order="object_point")
+        p = self._parse(t)
+        self.assertTrue(p["valid_format"])
+        px, py = p["point_xy"]
+        self.assertAlmostEqual(px, 0.25, delta=0.002)
+        self.assertAlmostEqual(py, 0.75, delta=0.002)
+
+    # --- reasoning_object_point ---
+    def test_reasoning_object_point_order(self):
+        from model.utils.gaze_tokens import REASONING_START, REASONING_END
+        t = build_structured_target_text(
+            0.5, 0.5, 10, 100,
+            target_order="reasoning_object_point",
+            reasoning_text="The person looks at the screen.",
+        )
+        think_pos = t.index(REASONING_START)
+        obj_pos = t.index(OBJECT_PREFIX)
+        pt_pos = t.index(POINT_PREFIX)
+        self.assertLess(think_pos, obj_pos)
+        self.assertLess(obj_pos, pt_pos)
+        p = self._parse(t)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 10)
+
+    def test_reasoning_object_point_no_reasoning_falls_back_to_object_point(self):
+        t = build_structured_target_text(0.5, 0.5, 5, 100, target_order="reasoning_object_point")
+        # No reasoning text → falls back to object_point (no <think> block)
+        self.assertNotIn("<think>", t)
+        self.assertTrue(t.index(OBJECT_PREFIX) < t.index(POINT_PREFIX))
+        p = self._parse(t)
+        self.assertTrue(p["valid_format"])
+
+    def test_reasoning_object_point_forced_empty(self):
+        from model.utils.gaze_tokens import REASONING_START, REASONING_END
+        t = build_structured_target_text(
+            0.5, 0.5, 3, 100,
+            target_order="reasoning_object_point",
+            force_reasoning_format=True,
+        )
+        self.assertIn(REASONING_START, t)
+        self.assertIn("Reasoning:", t)
+        self.assertIn(REASONING_END, t)
+        p = self._parse(t)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 3)
+
+    # --- point_object (legacy) ---
+    def test_point_object_order(self):
+        t = build_structured_target_text(0.5, 0.3, 7, 100, target_order="point_object")
+        self.assertTrue(t.index(POINT_PREFIX) < t.index(OBJECT_PREFIX))
+        p = self._parse(t)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 7)
+
+    # --- point_object_reasoning (legacy post-hoc) ---
+    def test_point_object_reasoning_order(self):
+        from model.utils.gaze_tokens import REASONING_START
+        t = build_structured_target_text(
+            0.5, 0.5, 2, 100,
+            target_order="point_object_reasoning",
+            reasoning_text="Some reason.",
+        )
+        self.assertLess(t.index(POINT_PREFIX), t.index(OBJECT_PREFIX))
+        self.assertLess(t.index(OBJECT_PREFIX), t.index(REASONING_START))
+        p = self._parse(t)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 2)
+
+    # --- parser: masks disjoint, all orders accepted ---
+    def test_parser_accepts_all_orders(self):
+        orders = ["object_point", "reasoning_object_point", "point_object", "point_object_reasoning"]
+        for order in orders:
+            t = build_structured_target_text(
+                0.4, 0.6, 15, 100,
+                target_order=order,
+                reasoning_text="reason" if "reasoning" in order else None,
+            )
+            p = self._parse(t)
+            self.assertTrue(p["valid_format"], f"Failed for target_order={order!r}")
+            self.assertEqual(p["object_id"], 15, f"Wrong object_id for target_order={order!r}")
+
+    def test_parser_rejects_missing_point(self):
+        p = parse_structured_output_text("Object: <obj_010>", 100)
+        self.assertFalse(p["valid_format"])
+
+    def test_parser_rejects_missing_object(self):
+        p = parse_structured_output_text("Point: <loc_500><loc_500>", 100)
+        self.assertFalse(p["valid_format"])
+
+
+class TestSafeAugmentation(unittest.TestCase):
+    """Verify apply_safe_augmentation applies no spatial transforms."""
+
+    def test_safe_aug_preserves_coords(self):
+        from model.utils.data_utils import apply_safe_augmentation
+        import random
+        from PIL import Image
+        # Deterministic seed: safe aug uses random for color jitter probability.
+        random.seed(0)
+        img = Image.new("RGB", (512, 512), color=(128, 128, 128))
+        gaze_x, gaze_y = 0.3, 0.7
+        bbox = (100.0, 100.0, 200.0, 200.0)
+        out_img, out_x, out_y, out_bbox = apply_safe_augmentation(img, gaze_x, gaze_y, bbox)
+        # Coords must be unchanged (no crop/flip)
+        self.assertAlmostEqual(out_x, gaze_x, places=6)
+        self.assertAlmostEqual(out_y, gaze_y, places=6)
+        # Bbox should be clamped/unchanged in safe aug
+        self.assertEqual(out_img.size, (512, 512))
+
+
+class TestLoadReasoningRecord(unittest.TestCase):
+    """Verify load_reasoning_record parses both Object: and Reasoning: lines."""
+
+    def test_parses_both_lines(self):
+        import tempfile
+        from pathlib import Path
+        from model.utils.data_utils import load_reasoning_record
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("Object: the television screen\nReasoning: The person looks at the TV.\n")
+            path = Path(f.name)
+        try:
+            rec = load_reasoning_record(path)
+            self.assertEqual(rec["object_text"], "the television screen")
+            self.assertEqual(rec["reasoning_text"], "The person looks at the TV.")
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_missing_object_line(self):
+        import tempfile
+        from pathlib import Path
+        from model.utils.data_utils import load_reasoning_record
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("Reasoning: Looking left.\n")
+            path = Path(f.name)
+        try:
+            rec = load_reasoning_record(path)
+            self.assertIsNone(rec["object_text"])
+            self.assertEqual(rec["reasoning_text"], "Looking left.")
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_file_not_found_returns_nones(self):
+        from pathlib import Path
+        from model.utils.data_utils import load_reasoning_record
+        rec = load_reasoning_record(Path("/nonexistent/xyz_12345.txt"))
+        self.assertIsNone(rec["object_text"])
+        self.assertIsNone(rec["reasoning_text"])
+
+
 if __name__ == "__main__":
     unittest.main()

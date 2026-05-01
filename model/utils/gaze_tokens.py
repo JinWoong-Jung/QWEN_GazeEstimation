@@ -16,20 +16,37 @@ REASONING_END: str = "</think>"
 
 _LOC_RE = re.compile(r"^<loc_(\d+)>$")
 _OBJ_RE = re.compile(r"^<obj_(\d+)>$")
-# ANSWER_END (<|im_end|>) is the chat-template EOS; it appears at the tail of
-# generated output and is made optional so the regex matches with or without it.
-# The optional <think>...</think> block follows Point/Object (point-first format).
+
+# --- parsing regexes (DOTALL so .* spans newlines) ---
+
+# Legacy point-first: "Point: <loc_X><loc_Y>\nObject: <obj_K>  [<think>...</think>]"
+# Groups: 1=loc_x, 2=loc_y, 3=obj
 _STRICT_RE = re.compile(
     r"^\s*"
-    r"Point:\s*"
-    r"(<loc_\d+>)"
-    r"(<loc_\d+>)"
-    r"\s*"
-    r"Object:\s*"
-    r"(<obj_\d+>|<obj_unknown>)"
-    r"\s*"
-    r"(?:<think>.*?</think>\s*)?"
+    r"Point:\s*(<loc_\d+>)(<loc_\d+>)"
+    r"\s*Object:\s*(<obj_\d+>|<obj_unknown>)"
+    r"\s*(?:<think>.*?</think>\s*)?"
     r"(?:<\|im_end\|>)?\s*$",
+    re.DOTALL,
+)
+
+# Object-first direct: "Object: <obj_K>\nPoint: <loc_X><loc_Y>"
+# Groups: 1=obj, 2=loc_x, 3=loc_y
+_STRICT_RE_OBJ_FIRST = re.compile(
+    r"^\s*"
+    r"Object:\s*(<obj_\d+>|<obj_unknown>)"
+    r"\s*Point:\s*(<loc_\d+>)(<loc_\d+>)"
+    r"\s*(?:<\|im_end\|>)?\s*$",
+    re.DOTALL,
+)
+
+# Reasoning-first: "<think>...</think>\nObject: <obj_K>\nPoint: <loc_X><loc_Y>"
+# Groups: 1=obj, 2=loc_x, 3=loc_y
+_STRICT_RE_REASONING_FIRST = re.compile(
+    r"^\s*<think>.*?</think>"
+    r"\s*Object:\s*(<obj_\d+>|<obj_unknown>)"
+    r"\s*Point:\s*(<loc_\d+>)(<loc_\d+>)"
+    r"\s*(?:<\|im_end\|>)?\s*$",
     re.DOTALL,
 )
 
@@ -105,7 +122,18 @@ def build_structured_target_text(
     *,
     obj_token: str | None = None,
     coord_bins: int = COORD_BINS,
+    target_order: str = "object_point",
+    reasoning_text: str | None = None,
+    force_reasoning_format: bool = False,
 ) -> str:
+    """Build structured target text.
+
+    target_order values:
+      "object_point"           — Object → Point  (direct baseline default)
+      "point_object"           — Point → Object  (legacy)
+      "point_object_reasoning" — Point → Object → Reasoning  (legacy post-hoc)
+      "reasoning_object_point" — Reasoning → Object → Point  (causal reasoning)
+    """
     coord_n = int(coord_bins)
     bx = quantize_coord(float(point_x), bins=coord_n)
     by = quantize_coord(float(point_y), bins=coord_n)
@@ -114,15 +142,35 @@ def build_structured_target_text(
         resolved_obj_tok = str(obj_token).strip()
     else:
         w = _obj_token_width(num_classes)
-        resolved_obj_tok = format_obj_token(int(obj_id), w)
-    return (
-        f"{POINT_PREFIX} "
-        f"{format_loc_token(bx, loc_w)}"
-        f"{format_loc_token(by, loc_w)}"
-        f"\n"
-        f"{OBJECT_PREFIX} "
-        f"{resolved_obj_tok}"
-    )
+        resolved_obj_tok = format_obj_token(int(obj_id), w) if obj_id is not None else GAZE_OBJ_UNKNOWN
+
+    point_str = f"{POINT_PREFIX} {format_loc_token(bx, loc_w)}{format_loc_token(by, loc_w)}"
+    object_str = f"{OBJECT_PREFIX} {resolved_obj_tok}"
+
+    order = str(target_order or "object_point").strip()
+
+    if order == "reasoning_object_point":
+        reasoning_body = str(reasoning_text or "").strip()
+        if reasoning_body or bool(force_reasoning_format):
+            content_line = f"Reasoning: {reasoning_body}" if reasoning_body else "Reasoning:"
+            reasoning_block = f"{REASONING_START}\n{content_line}\n{REASONING_END}"
+            return f"{reasoning_block}\n{object_str}\n{point_str}"
+        return f"{object_str}\n{point_str}"
+
+    if order == "point_object_reasoning":
+        base = f"{point_str}\n{object_str}"
+        reasoning_body = str(reasoning_text or "").strip()
+        if reasoning_body or bool(force_reasoning_format):
+            content_line = f"Reasoning: {reasoning_body}" if reasoning_body else "Reasoning:"
+            reasoning_block = f"{REASONING_START}\n{content_line}\n{REASONING_END}"
+            return f"{base}\n{reasoning_block}"
+        return base
+
+    if order == "point_object":
+        return f"{point_str}\n{object_str}"
+
+    # default: "object_point"
+    return f"{object_str}\n{point_str}"
 
 
 def build_structured_target_text_with_reasoning(
@@ -135,45 +183,49 @@ def build_structured_target_text_with_reasoning(
     obj_token: str | None = None,
     coord_bins: int = COORD_BINS,
     force_reasoning_format: bool = False,
+    target_order: str = "reasoning_object_point",
 ) -> str:
-    """Build target text with an optional <think>...</think> reasoning prefix."""
-    base = build_structured_target_text(
+    """Build target text, delegating to build_structured_target_text.
+
+    When reasoning_text is present (or force_reasoning_format=True), uses
+    target_order (default: reasoning_object_point).  When neither, falls back
+    to object_point so the result matches build_structured_target_text().
+    """
+    effective_order = str(target_order or "reasoning_object_point").strip()
+    has_reasoning = bool(reasoning_text) or bool(force_reasoning_format)
+    if not has_reasoning:
+        # No reasoning content → direct object_point baseline
+        effective_order = "object_point"
+    return build_structured_target_text(
         point_x=point_x,
         point_y=point_y,
         obj_id=obj_id,
         num_classes=num_classes,
         obj_token=obj_token,
         coord_bins=coord_bins,
+        target_order=effective_order,
+        reasoning_text=reasoning_text,
+        force_reasoning_format=force_reasoning_format,
     )
-    if not reasoning_text and not bool(force_reasoning_format):
-        return base
-    reasoning_body = str(reasoning_text or "").strip()
-    reasoning_block = (
-        f"{REASONING_START}\n"
-        f"Reasoning: {reasoning_body}\n"
-        f"{REASONING_END}"
-    )
-    return f"{base}\n{reasoning_block}"
 
 
-def parse_structured_output_text(
-    text: str,
+def _extract_from_match(
+    m: re.Match[str],
+    *,
+    obj_group: int,
+    x_group: int,
+    y_group: int,
     num_classes: int,
-    coord_bins: int = COORD_BINS,
+    coord_bins: int,
 ) -> dict:
-    s = str(text or "").strip()
-    m = _STRICT_RE.match(s)
-    if m is None:
-        return {
-            "valid_format": False,
-            "has_extra_text": bool(s),
-            "point_bins": None,
-            "point_xy": None,
-            "object_id": None,
-            "object_unknown": False,
-        }
+    """Extract and validate point/object from a regex match."""
+    obj_tok = m.group(obj_group)
+    loc_x_tok = m.group(x_group)
+    loc_y_tok = m.group(y_group)
 
-    loc_x_tok, loc_y_tok, obj_tok = m.group(1), m.group(2), m.group(3)
+    coord_n = int(coord_bins)
+    nc = int(num_classes)
+
     try:
         bx = int(_LOC_RE.match(loc_x_tok).group(1))  # type: ignore[union-attr]
         by = int(_LOC_RE.match(loc_y_tok).group(1))  # type: ignore[union-attr]
@@ -186,11 +238,6 @@ def parse_structured_output_text(
             "object_id": None,
             "object_unknown": False,
         }
-
-    nc = int(num_classes)
-    coord_n = int(coord_bins)
-    if coord_n <= 0:
-        raise ValueError(f"coord_bins must be positive, got: {coord_bins!r}")
 
     if bx >= coord_n or by >= coord_n:
         return {
@@ -213,7 +260,7 @@ def parse_structured_output_text(
         }
 
     try:
-        oid = int(_OBJ_RE.match(obj_tok).group(1))    # type: ignore[union-attr]
+        oid = int(_OBJ_RE.match(obj_tok).group(1))  # type: ignore[union-attr]
     except Exception:
         return {
             "valid_format": False,
@@ -233,6 +280,53 @@ def parse_structured_output_text(
         "object_id": oid,
         "object_unknown": False,
     }
+
+
+def parse_structured_output_text(
+    text: str,
+    num_classes: int,
+    coord_bins: int = COORD_BINS,
+) -> dict:
+    """Parse generated text, accepting all four target orders.
+
+    Tries patterns in priority order:
+      1. object_point          Object → Point
+      2. reasoning_object_point  Reasoning → Object → Point
+      3. point_object / point_object_reasoning  (legacy)
+    """
+    s = str(text or "").strip()
+    coord_n = int(coord_bins)
+    if coord_n <= 0:
+        raise ValueError(f"coord_bins must be positive, got: {coord_bins!r}")
+
+    _invalid = {
+        "valid_format": False,
+        "has_extra_text": bool(s),
+        "point_bins": None,
+        "point_xy": None,
+        "object_id": None,
+        "object_unknown": False,
+    }
+
+    # object_point: groups obj=1, x=2, y=3
+    m = _STRICT_RE_OBJ_FIRST.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    # reasoning_object_point: groups obj=1, x=2, y=3
+    m = _STRICT_RE_REASONING_FIRST.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    # legacy point_object / point_object_reasoning: groups x=1, y=2, obj=3
+    m = _STRICT_RE.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=3, x_group=1, y_group=2,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    return _invalid
 
 
 def parse_structured_output_ids(

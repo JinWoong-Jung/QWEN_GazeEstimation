@@ -12,7 +12,7 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
-  train_reasoning_dir: "data/gazefollow_reason_train"
+  train_reasoning_dir: "data/bucket_data/data/gazefollow_reason/output/train"
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
@@ -44,6 +44,12 @@ train:
   save_last_every_n_epochs: 5
   use_reasoning: true
 
+reasoning:
+  target_order: "reasoning_object_point"   # object_point | point_object | point_object_reasoning | reasoning_object_point
+  force_reasoning_format_train: true        # force <think> scaffold even when no reasoning file
+  force_reasoning_format_eval: false        # do NOT force empty scaffold on val/test
+  disable_spatial_aug_for_reasoning: true   # skip hflip/crop for samples with reasoning files
+
 eval:
   test_batch_size: 16
   show_tqdm: true
@@ -54,27 +60,36 @@ eval:
   run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 64       # point-first: Point/Object ~12 tokens, stop_at_object_end halts before reasoning
+  generation_max_new_tokens: 128      # reasoning_object_point: ~15-50 reasoning + ~10 answer tokens
   generation_num_beams: 1
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
-  generation_stop_at_object_end: true
+  generation_stop_at_object_end: false  # stop at natural EOS; reasoning_object_point needs full output
 
 prompt:
   visual_prompting: true
   prompt_template: ""
+  # Used when use_reasoning=true (reasoning_object_point target order)
   prompt_text: |
+    The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
+    Briefly reason about where this person is looking, then output the object and gaze point.
+    Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
+    Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
+    Return exactly:
+    <think>
+    Reasoning: <your reasoning here>
+    </think>
+    Object: <obj_KKK>
+    Point: <loc_NNN><loc_MMM>
+  # Used when use_reasoning=false (object_point target order, no <think> block)
+  prompt_text_direct: |
     The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
     Predict the gaze point and the object at that point.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Then briefly reason about where this person is looking.
     Return exactly:
-    Point: <loc_NNN><loc_MMM>
     Object: <obj_KKK>
-    <think>
-    Reasoning: <your reasoning here>
-    </think>
+    Point: <loc_NNN><loc_MMM>
 
 model:
   coord_bins: 128
