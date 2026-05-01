@@ -10,6 +10,8 @@ from .common import chat_text
 from .gaze_tokens import (
     ANSWER_END,
     GAZE_OBJ_UNKNOWN,
+    REASONING_START,
+    REASONING_END,
 )
 from .gaze_tokens import _LOC_RE, _OBJ_RE
 
@@ -103,28 +105,53 @@ def build_structured_masks(
     joint_inputs: dict[str, Any],
     target_texts: list[str],
     target_valid: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build per-category bool masks [B, L] for structured answer targets.
 
-    Returns (loss_mask_point, loss_mask_object, loss_mask_format).
-    point  = tokens matching <loc_*>
-    object = tokens matching <obj_*> or <obj_unknown>
-    format = all other tokens inside the answer span
+    Returns (loss_mask_point, loss_mask_object, loss_mask_format, loss_mask_reasoning).
+    point     = tokens matching <loc_*>
+    object    = tokens matching <obj_*> or <obj_unknown>
+    reasoning = Reasoning: content tokens inside <think>...</think>
+    format    = all other tokens inside the answer span (structure tokens, Point:, Object:, etc.)
+
+    Mask boundary rules (disjoint, union = full answer span):
+      <think> token + following \\n        → format
+      "Reasoning:" label + following space  → format
+      text after "Reasoning: " until \\n before </think>  → reasoning
+      \\n before </think>                   → format
+      </think> token                        → format
+      <loc_*>                               → point
+      <obj_*> / <obj_unknown>               → object
+      everything else                       → format
     """
     input_ids = joint_inputs["input_ids"]
     if not torch.is_tensor(input_ids):
         bsz = len(target_texts)
         z = torch.zeros((bsz, 1), dtype=torch.bool)
-        return z, z, z
+        return z, z, z, z
 
     bsz, seqlen = int(input_ids.shape[0]), int(input_ids.shape[1])
-    mask_pt = torch.zeros((bsz, seqlen), dtype=torch.bool)
+    mask_pt  = torch.zeros((bsz, seqlen), dtype=torch.bool)
     mask_obj = torch.zeros((bsz, seqlen), dtype=torch.bool)
     mask_fmt = torch.zeros((bsz, seqlen), dtype=torch.bool)
+    mask_rsn = torch.zeros((bsz, seqlen), dtype=torch.bool)
 
     tokenizer = getattr(processor, "tokenizer", None)
     if tokenizer is None:
-        return mask_pt, mask_obj, mask_fmt
+        return mask_pt, mask_obj, mask_fmt, mask_rsn
+
+    # Pre-compute boundary token id sequences for <think> / </think> / "Reasoning:".
+    think_start_ids: list[int] = []
+    think_end_ids: list[int] = []
+    reasoning_label_ids: list[int] = []
+    if hasattr(tokenizer, "__call__"):
+        def _tok_ids(s: str) -> list[int]:
+            out = tokenizer(s, add_special_tokens=False, return_attention_mask=False)
+            ids = out.get("input_ids", [])
+            return [int(x) for x in ids] if ids else []
+        think_start_ids = _tok_ids(REASONING_START)
+        think_end_ids   = _tok_ids(REASONING_END)
+        reasoning_label_ids = _tok_ids("Reasoning:")
 
     # Batch tokenize all target texts once (1 call instead of bsz calls).
     raw_out = tokenizer(
@@ -157,11 +184,54 @@ def build_structured_masks(
         else:
             tok_strs = [str(tid) for tid in ans_ids]
 
+        # Detect reasoning block span within ans_ids (offset indices).
+        rsn_content_offsets: set[int] = set()
+        if think_start_ids and think_end_ids:
+            ts = find_subseq(ans_ids, think_start_ids, from_right=False)
+            te = find_subseq(ans_ids, think_end_ids, from_right=False)
+            if ts >= 0 and te > ts:
+                # Indices of tokens that are reasoning CONTENT (not structure).
+                # Structure tokens: <think>(ts..ts+len-1), \n after <think>,
+                #                   "Reasoning:" label tokens, \n before </think>,
+                #                   </think>(te..te+len-1).
+                think_start_end = ts + len(think_start_ids)      # first token after <think>
+                think_end_start = te                              # first token of </think>
+
+                # Tokens right after <think> that belong to "Reasoning:" label
+                rl_len = len(reasoning_label_ids)
+                rsn_label_start = think_start_end
+                # skip a leading newline token after <think> (structure)
+                # use tok_strs — avoids fragile convert_tokens_to_ids("\n") lookup
+                if rsn_label_start < len(tok_strs) and tok_strs[rsn_label_start] in {"<0x0A>", "\n", "Ċ", "▁\n"}:
+                    rsn_label_start += 1
+                rsn_label_end = rsn_label_start + rl_len  # exclusive
+
+                # Content: from after "Reasoning: " (including space token) up to
+                # the \n token that immediately precedes </think>.
+                content_start = rsn_label_end
+                # skip a space token after "Reasoning:"
+                if content_start < len(ans_ids):
+                    space_str = tok_strs[content_start] if content_start < len(tok_strs) else ""
+                    if space_str in {"▁", " ", "Ġ"} or (len(space_str) == 1 and space_str.isspace()):
+                        content_start += 1
+
+                # The \n immediately before </think> is structure (format).
+                content_end = think_end_start
+                if content_end > content_start and content_end - 1 >= 0:
+                    last_tok = tok_strs[content_end - 1] if content_end - 1 < len(tok_strs) else ""
+                    if last_tok in {"<0x0A>", "\n", "Ċ"}:
+                        content_end -= 1
+
+                for off in range(content_start, content_end):
+                    rsn_content_offsets.add(off)
+
         for off, tok_str in enumerate(tok_strs):
             pos = ans_start + off
             if pos >= seqlen:
                 continue
-            if _LOC_RE.match(tok_str):
+            if off in rsn_content_offsets:
+                mask_rsn[i, pos] = True
+            elif _LOC_RE.match(tok_str):
                 mask_pt[i, pos] = True
             elif tok_str == GAZE_OBJ_UNKNOWN or _OBJ_RE.match(tok_str):
                 mask_obj[i, pos] = True
@@ -176,7 +246,7 @@ def build_structured_masks(
             if isinstance(im_end_id, int) and im_end_id >= 0 and seq_ids[ans_end_pos] == im_end_id:
                 mask_fmt[i, ans_end_pos] = True
 
-    return mask_pt, mask_obj, mask_fmt
+    return mask_pt, mask_obj, mask_fmt, mask_rsn
 
 
 def build_train_inputs(
@@ -189,7 +259,7 @@ def build_train_inputs(
     target_object_valid: torch.Tensor,
     target_format_valid: torch.Tensor,
     max_text_length: int,
-) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not (len(scene_images) == len(text_inputs) == len(target_texts)):
         raise ValueError("scene/text/target batch sizes must match.")
 
@@ -221,7 +291,7 @@ def build_train_inputs(
         pad_token_id=pad_token_id,
     )
 
-    mask_pt, mask_obj, mask_fmt = build_structured_masks(
+    mask_pt, mask_obj, mask_fmt, mask_rsn = build_structured_masks(
         processor=processor,
         joint_inputs=dict(joint_inputs),
         target_texts=target_texts,
@@ -239,6 +309,7 @@ def build_train_inputs(
             mask_pt[bad_text] = False
             mask_obj[bad_text] = False
             mask_fmt[bad_text] = False
+            mask_rsn[bad_text] = False
     if int(tv_point.numel()) == bsz:
         bad_point = tv_point.le(0)
         if torch.any(bad_point):
@@ -251,8 +322,9 @@ def build_train_inputs(
         bad_format = tv_format.le(0)
         if torch.any(bad_format):
             mask_fmt[bad_format] = False
+            mask_rsn[bad_format] = False
 
-    supervised = mask_pt.any(dim=1) | mask_obj.any(dim=1) | mask_fmt.any(dim=1)
+    supervised = mask_pt.any(dim=1) | mask_obj.any(dim=1) | mask_fmt.any(dim=1) | mask_rsn.any(dim=1)
     if torch.any(~supervised):
         labels[~supervised] = -100
 
@@ -265,11 +337,12 @@ def build_train_inputs(
             "point_tokens=", int(mask_pt.sum().item()),
             "object_tokens=", int(mask_obj.sum().item()),
             "format_tokens=", int(mask_fmt.sum().item()),
+            "reasoning_tokens=", int(mask_rsn.sum().item()),
             "supervised_samples=", int(supervised.sum().item()),
             "batch=", bsz,
         )
 
-    return dict(joint_inputs), labels, mask_pt, mask_obj, mask_fmt
+    return dict(joint_inputs), labels, mask_pt, mask_obj, mask_fmt, mask_rsn
 
 
 def build_infer_inputs(
@@ -335,7 +408,7 @@ class QwenTrainCollator:
 
         (
             joint_inputs, labels,
-            loss_mask_point, loss_mask_object, loss_mask_format,
+            loss_mask_point, loss_mask_object, loss_mask_format, loss_mask_reasoning,
         ) = build_train_inputs(
             processor=self.processor,
             scene_images=scene_images,
@@ -366,6 +439,7 @@ class QwenTrainCollator:
             "loss_mask_point": loss_mask_point,
             "loss_mask_object": loss_mask_object,
             "loss_mask_format": loss_mask_format,
+            "loss_mask_reasoning": loss_mask_reasoning,
             "target_point_bin": target_point_bin,
             "target_object_id": target_object_id,
             "image_rel": [str(x.get("image_rel", "")) for x in batch],

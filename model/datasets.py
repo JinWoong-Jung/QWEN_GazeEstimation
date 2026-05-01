@@ -14,8 +14,14 @@ from .utils.data_utils import (
     alias_label_text,
     build_prompt,
     sanitize_bbox_pixels,
+    load_reasoning_text,
 )
-from .utils.gaze_tokens import GAZE_OBJ_UNKNOWN, build_structured_target_text, quantize_coord
+from .utils.gaze_tokens import (
+    GAZE_OBJ_UNKNOWN,
+    build_structured_target_text,
+    build_structured_target_text_with_reasoning,
+    quantize_coord,
+)
 
 
 class _ImageLRUCache:
@@ -72,8 +78,10 @@ def format_structured_target_text(
     point_x: float,
     point_y: float,
     coord_bins: int = 1000,
+    reasoning_text: str | None = None,
+    force_reasoning_format: bool = False,
 ) -> tuple[str, int, float, float]:
-    """Build structured 7-token target text.
+    """Build structured target text, optionally prefixed with a reasoning block.
 
     Returns (target_text, resolved_obj_id, target_text_valid, target_object_valid).
     """
@@ -91,23 +99,27 @@ def format_structured_target_text(
     )
 
     if obj_id >= 0:
-        text = build_structured_target_text(
+        text = build_structured_target_text_with_reasoning(
             point_x=float(point_x),
             point_y=float(point_y),
             obj_id=obj_id,
             num_classes=int(num_classes),
+            reasoning_text=reasoning_text,
             coord_bins=int(coord_bins),
+            force_reasoning_format=bool(force_reasoning_format),
         )
         text_valid = 1.0
         object_valid = 1.0
     else:
-        text = build_structured_target_text(
+        text = build_structured_target_text_with_reasoning(
             point_x=float(point_x),
             point_y=float(point_y),
             obj_id=None,
             num_classes=int(num_classes),
+            reasoning_text=reasoning_text,
             obj_token=GAZE_OBJ_UNKNOWN,
             coord_bins=int(coord_bins),
+            force_reasoning_format=bool(force_reasoning_format),
         )
         text_valid = 1.0
         object_valid = 0.0
@@ -153,6 +165,8 @@ class GazeDataset(Dataset):
         image_cache_size: int = 0,
         filter_invalid_object_samples: bool = True,
         coord_bins: int = 1000,
+        reasoning_index: dict[str, Any] | None = None,
+        force_reasoning_format: bool = False,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -167,6 +181,8 @@ class GazeDataset(Dataset):
         self.num_classes = int(num_classes)
         self.coord_bins = int(coord_bins)
         self.visual_prompting = bool(visual_prompting)
+        self.reasoning_index: dict[str, Any] | None = reasoning_index
+        self.force_reasoning_format = bool(force_reasoning_format)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
@@ -237,6 +253,16 @@ class GazeDataset(Dataset):
         if (not resolved_label_text) and int(rec.label_id) >= 0:
             resolved_label_text = str(self.id2label.get(int(rec.label_id), "")).strip()
 
+        reasoning_text: str | None = None
+        if self.reasoning_index is not None:
+            from pathlib import Path as _Path
+            folder = _Path(rec.image_rel).parent.name
+            stem = _Path(rec.image_rel).stem
+            key = f"{folder}/{stem}_{int(rec.sample_id)}"
+            rpath = self.reasoning_index.get(key)
+            if rpath is not None:
+                reasoning_text = load_reasoning_text(rpath)
+
         target_text, obj_id, target_text_valid, target_object_valid = format_structured_target_text(
             label_text=resolved_label_text,
             label_id=int(rec.label_id),
@@ -247,6 +273,8 @@ class GazeDataset(Dataset):
             point_x=float(gaze_x),
             point_y=float(gaze_y),
             coord_bins=self.coord_bins,
+            reasoning_text=reasoning_text,
+            force_reasoning_format=self.force_reasoning_format,
         )
 
         bx = quantize_coord(float(gaze_x), bins=self.coord_bins)
@@ -269,6 +297,8 @@ class GazeDataset(Dataset):
             "gt_points": torch.tensor([[float(gaze_x), float(gaze_y)]], dtype=torch.float32),
             "target_label_text": resolved_label_text,
             "image_rel": str(rec.image_rel),
+            "reasoning_text": reasoning_text or "",
+            "has_reasoning": reasoning_text is not None and len(reasoning_text) > 0,
         }
 
 
@@ -285,6 +315,7 @@ class GazeTestDataset(Dataset):
         visual_prompting: bool = False,
         image_cache_size: int = 0,
         coord_bins: int = 1000,
+        force_reasoning_format: bool = False,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -299,6 +330,7 @@ class GazeTestDataset(Dataset):
         self.num_classes = int(num_classes)
         self.coord_bins = int(coord_bins)
         self.visual_prompting = bool(visual_prompting)
+        self.force_reasoning_format = bool(force_reasoning_format)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
@@ -347,6 +379,7 @@ class GazeTestDataset(Dataset):
             point_x=px,
             point_y=py,
             coord_bins=self.coord_bins,
+            force_reasoning_format=self.force_reasoning_format,
         )
 
         bx = quantize_coord(float(px), bins=self.coord_bins)

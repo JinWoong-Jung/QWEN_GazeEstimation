@@ -63,7 +63,7 @@ def output_dir_from_run_name(output_dir: str, run_name: str) -> str:
 def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
     d = defaults or {}
     p = argparse.ArgumentParser("Qwen structured-token gaze LoRA trainer")
-    p.add_argument("--config", type=str, default=str(default_value(d, "config", "config.yaml")))
+    p.add_argument("--config", type=str, default=str(default_value(d, "config", "sft.yaml")))
     p.add_argument("--run_name", type=str, default=normalize_run_name(default_value(d, "run_name", default_value(d, "wandb_run_name", ""))))
 
     # --- paths ---
@@ -164,11 +164,16 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_true")
     p.add_argument("--no_filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_false")
     p.set_defaults(filter_invalid_object_samples=bool(default_value(d, "filter_invalid_object_samples", True)))
+    p.add_argument("--train_reasoning_dir", type=str, default=str(default_value(d, "train_reasoning_dir", "")))
+    p.add_argument("--use_reasoning", dest="use_reasoning", action="store_true")
+    p.add_argument("--no_use_reasoning", dest="use_reasoning", action="store_false")
+    p.set_defaults(use_reasoning=bool(default_value(d, "use_reasoning", False)))
 
     # --- structured loss weights ---
     p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 1.0)))
     p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 1.0)))
     p.add_argument("--loss_format_weight", type=float, default=float(default_value(d, "loss_format_weight", 0.25)))
+    p.add_argument("--loss_reasoning_weight", type=float, default=float(default_value(d, "loss_reasoning_weight", 0.3)))
 
     # --- RL (disabled by default) ---
     p.add_argument("--rl_enabled", dest="rl_enabled", action="store_true")

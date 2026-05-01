@@ -42,6 +42,7 @@ from .utils.config_parser import (
     output_dir_from_run_name,
 )
 from .utils.data_utils import (
+    build_reasoning_index,
     load_label_map,
     load_label_text_map,
     load_records,
@@ -88,6 +89,25 @@ def resolve_path(path: str) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
+def _download_model_to_local_dir(repo_id: str, local_dir: Path) -> str:
+    """Download a Hugging Face model repo into the requested local directory."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface_hub is required to download missing model paths. "
+            "Install it or place the model files under the configured model_path."
+        ) from exc
+
+    local_dir = Path(local_dir)
+    local_dir.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=str(repo_id),
+        local_dir=str(local_dir),
+    )
+    return str(local_dir)
+
+
 def resolve_model_source(path: str, *, default_namespace: str = "Qwen") -> str:
     raw = str(path).strip()
     if not raw:
@@ -102,9 +122,9 @@ def resolve_model_source(path: str, *, default_namespace: str = "Qwen") -> str:
         inferred_repo_id = f"{default_namespace}/{model_name}"
         print(
             f"[INFO] local model path not found: {raw}. "
-            f"Falling back to Hugging Face repo id: {inferred_repo_id}"
+            f"Downloading Hugging Face repo {inferred_repo_id} to {local_path}"
         )
-        return inferred_repo_id
+        return _download_model_to_local_dir(inferred_repo_id, local_path)
 
     path_like_prefixes = ("./", "../", "model/", "models/", "checkpoints/", "data/")
     if raw.startswith(path_like_prefixes):
@@ -112,20 +132,28 @@ def resolve_model_source(path: str, *, default_namespace: str = "Qwen") -> str:
         inferred_repo_id = f"{default_namespace}/{model_name}"
         print(
             f"[INFO] local model path not found: {local_path}. "
-            f"Falling back to Hugging Face repo id: {inferred_repo_id}"
+            f"Downloading Hugging Face repo {inferred_repo_id} to {local_path}"
         )
-        return inferred_repo_id
+        return _download_model_to_local_dir(inferred_repo_id, local_path)
 
     if raw.count("/") == 1:
-        return raw
+        model_name = raw.split("/", 1)[1]
+        local_model_dir = ROOT / "model" / model_name
+        if local_model_dir.exists():
+            return str(local_model_dir)
+        print(f"[INFO] downloading Hugging Face repo {raw} to {local_model_dir}")
+        return _download_model_to_local_dir(raw, local_model_dir)
 
     model_name = Path(raw).name
     inferred_repo_id = f"{default_namespace}/{model_name}"
+    local_model_dir = ROOT / "model" / model_name
+    if local_model_dir.exists():
+        return str(local_model_dir)
     print(
-        f"[INFO] treating missing local model path as Hugging Face repo id: "
-        f"{inferred_repo_id}"
+        f"[INFO] treating missing local model path as Hugging Face repo id "
+        f"{inferred_repo_id}; downloading to {local_model_dir}"
     )
-    return inferred_repo_id
+    return _download_model_to_local_dir(inferred_repo_id, local_model_dir)
 
 
 def set_seed(seed: int) -> None:
@@ -319,10 +347,8 @@ def test_log_payload(test_metrics: dict[str, float]) -> dict[str, float]:
         "test/FormatValid": float(test_metrics.get("FormatValid", 0.0)),
         "test/Avg_L2": float(test_metrics.get("Avg L2", 0.0)),
         "test/Min_L2": float(test_metrics.get("Min L2", 0.0)),
-        "test/PointBinExact": float(test_metrics.get("PointBinExact", 0.0)),
         "test/ObjectAcc": float(test_metrics.get("ObjectAcc", 0.0)),
         "test/MultiAcc@1": float(test_metrics.get("MultiAcc@1", 0.0)),
-        "test/JointExact": float(test_metrics.get("JointExact", 0.0)),
         "test/ExtraTextRate": float(test_metrics.get("ExtraTextRate", 0.0)),
         "test/num_samples": float(test_metrics.get("num_samples", 0.0)),
     }
@@ -800,7 +826,7 @@ def _run_rl_training(
             exp_texts: list[str] = [text_inputs_b[k // G] for k in range(B * G)]
             tv_ones = torch.ones(B * G, dtype=torch.float32)
 
-            lp_joint, _labels, _mpt, _mobj, _mfmt = build_train_inputs(
+            lp_joint, _labels, _mpt, _mobj, _mfmt, _mrsn = build_train_inputs(
                 processor=processor,
                 scene_images=exp_scenes,
                 text_inputs=exp_texts,
@@ -1064,7 +1090,7 @@ def _run_rl_training(
 
 def main() -> None:
     config_parser = argparse.ArgumentParser(add_help=False)
-    config_parser.add_argument("--config", type=str, default="config.yaml")
+    config_parser.add_argument("--config", type=str, default="sft.yaml")
     cfg_args, _ = config_parser.parse_known_args()
     config_path = resolve_path(cfg_args.config)
     config_defaults = load_yaml_config(config_path)
@@ -1120,6 +1146,7 @@ def main() -> None:
         "point": float(getattr(args, "loss_point_weight", 1.0)),
         "object": float(getattr(args, "loss_object_weight", 1.0)),
         "format": float(getattr(args, "loss_format_weight", 0.25)),
+        "reasoning": float(getattr(args, "loss_reasoning_weight", 0.3)),
     }
     coord_bins = int(getattr(args, "coord_bins", 1000))
     if coord_bins <= 0:
@@ -1246,6 +1273,7 @@ def main() -> None:
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
+                force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
             )
             log_target_example("test_only", test_ds)
             _tnw = int(args.num_workers)
@@ -1370,6 +1398,17 @@ def main() -> None:
     )
 
     image_cache_size = max(0, int(getattr(args, "image_cache_size", 0)))
+
+    reasoning_index = None
+    if getattr(args, "use_reasoning", False):
+        from pathlib import Path as _Path
+        reasoning_dir = _Path(str(getattr(args, "train_reasoning_dir", ""))).resolve()
+        if reasoning_dir.exists():
+            reasoning_index = build_reasoning_index(reasoning_dir)
+            print(f"[INFO] Loaded reasoning index: {len(reasoning_index)} entries")
+        else:
+            print(f"[WARN] train_reasoning_dir not found: {reasoning_dir}")
+
     train_ds = GazeDataset(
         records=train_records,
         prompt_template=args.prompt_template,
@@ -1383,6 +1422,8 @@ def main() -> None:
         image_cache_size=image_cache_size,
         filter_invalid_object_samples=filter_invalid,
         coord_bins=coord_bins,
+        reasoning_index=reasoning_index,
+        force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
     )
     val_ds = GazeDataset(
         records=val_records,
@@ -1397,6 +1438,7 @@ def main() -> None:
         image_cache_size=image_cache_size,
         filter_invalid_object_samples=filter_invalid,
         coord_bins=coord_bins,
+        force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
     )
 
     # Count filtered samples
@@ -1605,6 +1647,7 @@ def main() -> None:
                     visual_prompting=bool(args.visual_prompting),
                     image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                     coord_bins=coord_bins,
+                    force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
                 )
                 test_loader = DataLoader(
                     test_ds,
@@ -1682,7 +1725,8 @@ def main() -> None:
 
     print(
         f"[INFO] structured SFT loss: point_w={loss_weights['point']:.2f} "
-        f"object_w={loss_weights['object']:.2f} format_w={loss_weights['format']:.2f}"
+        f"object_w={loss_weights['object']:.2f} format_w={loss_weights['format']:.2f} "
+        f"reasoning_w={loss_weights['reasoning']:.2f}"
     )
     checkpoint_monitor = str(getattr(args, "checkpoint_monitor", "val_dist")).strip() or "val_dist"
     checkpoint_monitor_mode = infer_checkpoint_monitor_mode(
@@ -1757,9 +1801,11 @@ def main() -> None:
                     loss_mask_point=batch.get("loss_mask_point", None),
                     loss_mask_object=batch.get("loss_mask_object", None),
                     loss_mask_format=batch.get("loss_mask_format", None),
+                    loss_mask_reasoning=batch.get("loss_mask_reasoning", None),
                     weight_point=loss_weights["point"],
                     weight_object=loss_weights["object"],
                     weight_format=loss_weights["format"],
+                    weight_reasoning=loss_weights["reasoning"],
                     compute_format_rate=_compute_fmt_rate,
                 )
                 raw_loss = losses["loss"]
@@ -1801,6 +1847,8 @@ def main() -> None:
                                 "train/loss_point": float(losses["loss_point"].detach().item()),
                                 "train/loss_object": float(losses["loss_object"].detach().item()),
                                 "train/loss_format": float(losses["loss_format"].detach().item()),
+                                "train/loss_reasoning": float(losses.get("loss_reasoning", losses["loss_format"] * 0).detach().item()),
+                                "train/n_reasoning_tokens": int(losses.get("n_reasoning_tokens", 0)),
                                 "train/FormatValidRate": float(losses["format_valid_rate"].detach().item()),
                                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "train/grad_norm": grad_norm_value,
@@ -1903,10 +1951,6 @@ def main() -> None:
                 "val/loss_point": float(val_metrics.get("loss_point", 0.0)),
                 "val/loss_object": float(val_metrics.get("loss_object", 0.0)),
                 "val/loss_format": float(val_metrics.get("loss_format", 0.0)),
-                "time/fwd_per_step_s": _t_fwd_sum / n_steps,
-                "time/bwd_per_step_s": _t_bwd_sum / n_steps,
-                "time/val_loss_s": _t_val_loss,
-                "time/val_gen_s": _t_val_gen,
             }
             if isinstance(val_gen_metrics, dict):
                 payload.update(val_metric_log_payload(val_gen_metrics))
@@ -2037,6 +2081,7 @@ def main() -> None:
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
+                force_reasoning_format=bool(getattr(args, "use_reasoning", False)),
             )
             log_target_example("test", test_ds)
             test_loader = DataLoader(

@@ -9,7 +9,7 @@ VLM 기반 시선 추정 시스템. Qwen3-VL-4B-Instruct 모델을 LoRA fine-tun
 ```
 QWEN_GazeEstimation/
 ├── main.py                        # 학습 진입점 (trainer.run() 호출)
-├── config.yaml                    # 전체 하이퍼파라미터 및 경로 설정
+├── sft.yaml                       # Stage1-SFT 하이퍼파라미터 및 경로 설정
 ├── model/
 │   ├── model.py                   # QwenTextGenerationModel (LoRA 래퍼, 순수 forward)
 │   ├── trainer.py                 # 학습/평가 전 파이프라인
@@ -39,13 +39,13 @@ QWEN_GazeEstimation/
 
 ```bash
 # 학습
-python main.py --config config.yaml
+python main.py --config sft.yaml
 
 # 특정 설정 오버라이드
-python main.py --config config.yaml train.lr=5e-5 train.epochs=5
+python main.py --config sft.yaml train.lr=5e-5 train.epochs=5
 ```
 
-## Key Configuration (`config.yaml`)
+## Key Configuration (`sft.yaml`)
 
 config.yaml은 8개 섹션으로 구성된다. `flatten_config()`로 평탄화하여 argparse에 주입.
 

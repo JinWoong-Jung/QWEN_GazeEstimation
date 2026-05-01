@@ -4,6 +4,7 @@ import unittest
 
 from model.utils.gaze_tokens import (
     ANSWER_END,
+    ANSWER_START,
     COORD_BINS,
     GAZE_OBJ_UNKNOWN,
     OBJECT_PREFIX,

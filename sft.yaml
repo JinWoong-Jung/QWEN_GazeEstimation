@@ -12,6 +12,7 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
+  train_reasoning_dir: "data/gazefollow_reason_train"
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
@@ -39,9 +40,9 @@ train:
   weight_decay: 0.01
   warmup_ratio: 0.05
   max_grad_norm: 1.0
-  train_stage: "sft"  # sft | rl
   filter_invalid_object_samples: false
   save_last_every_n_epochs: 5
+  use_reasoning: true
 
 eval:
   test_batch_size: 16
@@ -53,7 +54,7 @@ eval:
   run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 16       # <|im_start|> Point: <loc><loc>\nObject: <obj><|im_end|> ≈ 12 tokens + buffer
+  generation_max_new_tokens: 64       # point-first: Point/Object ~12 tokens, stop_at_object_end halts before reasoning
   generation_num_beams: 1
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
@@ -64,18 +65,21 @@ prompt:
   prompt_template: ""
   prompt_text: |
     The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
-    Predict the gaze point that this person is looking at, and the object located at that gaze point.
+    Predict the gaze point and the object at that point.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Return exactly the two-line format below, with no extra text before or after it.
+    Then briefly reason about where this person is looking.
     Return exactly:
     Point: <loc_NNN><loc_MMM>
     Object: <obj_KKK>
+    <think>
+    Reasoning: <your reasoning here>
+    </think>
 
 model:
   coord_bins: 128
   attn_implementation: "sdpa"
-  max_text_length: 256
+  max_text_length: 512
   lora_r: 16
   lora_alpha: 32
   lora_dropout: 0.05
@@ -83,29 +87,16 @@ model:
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 loss:
-  loss_point_weight: 1.0
+  loss_point_weight: 2.0
   loss_object_weight: 1.0
-  loss_format_weight: 1.0
-
-rl:
-  rl_enabled: false
-  rl_group_size: 4
-  rl_clip_eps: 0.2
-  rl_kl_beta: 0.02
-  rl_lr: 1e-5
-  reward_point_weight: 1.0
-  reward_object_weight: 0.75
-  reward_joint_bonus: 0.25     # bonus when both point and object are correct
-  reward_extra_penalty: 0.5    # penalty for extra text in output
-  reward_point_beta: 10.0      # beta in exp(-beta * min_l2)
-  rl_temperature: 0.7          # sampling temperature during rollout
-  rl_top_p: 0.9                # top-p for rollout sampling
+  loss_format_weight: 0.5
+  loss_reasoning_weight: 0.5
 
 wandb:
   enabled: true
   project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "baseline_2B"
+  run_name: "1_reasoning_SFT"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

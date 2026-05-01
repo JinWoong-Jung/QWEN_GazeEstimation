@@ -11,19 +11,26 @@ OBJECT_PREFIX: str = "Object:"
 GAZE_OBJ_UNKNOWN: str = "<obj_unknown>"
 FORMAT_TOKENS: list[str] = []
 
+REASONING_START: str = "<think>"
+REASONING_END: str = "</think>"
+
 _LOC_RE = re.compile(r"^<loc_(\d+)>$")
 _OBJ_RE = re.compile(r"^<obj_(\d+)>$")
 # ANSWER_END (<|im_end|>) is the chat-template EOS; it appears at the tail of
 # generated output and is made optional so the regex matches with or without it.
+# The optional <think>...</think> block follows Point/Object (point-first format).
 _STRICT_RE = re.compile(
-    r"^\s*Point:\s*"
+    r"^\s*"
+    r"Point:\s*"
     r"(<loc_\d+>)"
     r"(<loc_\d+>)"
     r"\s*"
     r"Object:\s*"
     r"(<obj_\d+>|<obj_unknown>)"
     r"\s*"
-    r"(?:<\|im_end\|>)?\s*$"
+    r"(?:<think>.*?</think>\s*)?"
+    r"(?:<\|im_end\|>)?\s*$",
+    re.DOTALL,
 )
 
 
@@ -116,6 +123,37 @@ def build_structured_target_text(
         f"{OBJECT_PREFIX} "
         f"{resolved_obj_tok}"
     )
+
+
+def build_structured_target_text_with_reasoning(
+    point_x: float,
+    point_y: float,
+    obj_id: int | None,
+    num_classes: int,
+    reasoning_text: str | None = None,
+    *,
+    obj_token: str | None = None,
+    coord_bins: int = COORD_BINS,
+    force_reasoning_format: bool = False,
+) -> str:
+    """Build target text with an optional <think>...</think> reasoning prefix."""
+    base = build_structured_target_text(
+        point_x=point_x,
+        point_y=point_y,
+        obj_id=obj_id,
+        num_classes=num_classes,
+        obj_token=obj_token,
+        coord_bins=coord_bins,
+    )
+    if not reasoning_text and not bool(force_reasoning_format):
+        return base
+    reasoning_body = str(reasoning_text or "").strip()
+    reasoning_block = (
+        f"{REASONING_START}\n"
+        f"Reasoning: {reasoning_body}\n"
+        f"{REASONING_END}"
+    )
+    return f"{base}\n{reasoning_block}"
 
 
 def parse_structured_output_text(

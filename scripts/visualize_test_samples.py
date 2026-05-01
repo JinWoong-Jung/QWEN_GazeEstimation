@@ -43,7 +43,7 @@ from model.utils.processor_collate import QwenTestCollator
 
 def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("Visualize test predictions on images")
-    p.add_argument("--config", type=str, default="config.yaml")
+    p.add_argument("--config", type=str, default="sft.yaml")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints/qwen_ge/best")
     p.add_argument("--output_dir", type=str, default="outputs/test_visualization")
     p.add_argument("--num_samples", type=int, default=10)

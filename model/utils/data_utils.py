@@ -927,3 +927,42 @@ def load_test_groups(
     if max_groups > 0:
         groups = groups[: int(max_groups)]
     return groups
+
+
+# ---------------------------------------------------------------------------
+# Reasoning file utilities (R1)
+# ---------------------------------------------------------------------------
+
+def resolve_reasoning_path(
+    image_rel: str,
+    sample_id: int,
+    reasoning_dir: Path,
+) -> Path:
+    """Map train/00000106/00106978.jpg + 57936 → reasoning_dir/00000106/00106978_57936.txt"""
+    stem = Path(image_rel).stem
+    folder = Path(image_rel).parent.name
+    return reasoning_dir / folder / f"{stem}_{int(sample_id)}.txt"
+
+
+def load_reasoning_text(path: Path) -> str | None:
+    """Extract the Reasoning: line from a GPT reasoning txt file. Returns None on failure."""
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        for line in content.splitlines():
+            if line.startswith("Reasoning:"):
+                return line[len("Reasoning:"):].strip()
+        return None
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def build_reasoning_index(reasoning_dir: Path) -> dict[str, Path]:
+    """Scan reasoning_dir and return {folder/stem: Path} index for fast lookup.
+
+    key format: "00000106/00106978_57936"  (parent_name/stem, no extension)
+    """
+    index: dict[str, Path] = {}
+    for txt in reasoning_dir.rglob("*.txt"):
+        key = f"{txt.parent.name}/{txt.stem}"
+        index[key] = txt
+    return index
