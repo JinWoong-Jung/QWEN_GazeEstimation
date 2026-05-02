@@ -1,438 +1,248 @@
-# TODO: Multi-view SFT for Reasoning as Train-time Auxiliary Supervision
+# SFT 수정 계획
 
-## 0. Goal
+## 배경
 
-Current reasoning SFT should move away from requiring reasoning at inference time. Use reasoning as an auxiliary train-time view while keeping validation and test on the short direct prediction path.
+- 훈련 샘플: 108,955개, 전부 reasoning 파일 존재 확인 (`data/bucket_data/data/gazefollow_reason/output/train/`, 108,955개 1:1 커버리지)
+- 세 가지 목표 변경 사항 (독립적이므로 순서대로 구현 가능)
 
-```text
-Train View A: Direct View
-Prompt: predict object and point only
-Target: Object -> Point
+---
 
-Train View B: Reasoning View
-Prompt: produce one short visual reasoning sentence, then object and point
-Target: Reasoning -> Object -> Point
+## Task 1 — Full Dual-View Training (217,910 samples/epoch)
 
-Val/Test:
-Always Direct View only
-Prompt/Target/Eval format: Object -> Point
+### 목표
+- 현재: `WeightedRandomSampler(num_samples=108955)`로 매 에폭당 108,955개만 샘플링 (direct 80% + reasoning 20% 비율)
+- 변경: 모든 뷰(direct 108,955 + reasoning 108,955 = **217,910**)를 매 에폭에 전부 학습
+
+### 수정 파일
+
+**`model/trainer.py`** (lines ~1542-1554)
+- `WeightedRandomSampler` 생성 블록 제거
+- `_train_sampler = None` 고정 (DataLoader가 `shuffle=True`로 직접 전체 217,910개를 섞음)
+- `train_records` → `train_ds` 기준으로 스텝 수 재계산하는 부분 확인 (현재 `updates_per_epoch`가 `len(train_loader)` 기준이라면 자동 반영됨)
+
+**`sft.yaml`**
+- `reasoning.direct_view_ratio` / `reasoning.reasoning_view_ratio`: 삭제하거나 주석 처리 (코드에서 더 이상 사용 안 됨)
+
+### 주의
+- 에폭당 스텝 수가 2배 증가 → `warmup_ratio` 기반 warmup steps 자동 증가 (문제없음)
+- `epochs: 20` → 실질적 학습량이 2배 → 필요 시 `epochs: 10`으로 줄이는 것 고려
+
+---
+
+## Task 2 — 출력 순서 변경: reasoning → point → object
+
+### 목표
+- 현재 포맷 (`reasoning_object_point`):
+  ```
+  Reasoning: <text>
+  Object: <obj_KKK>
+  Point: <loc_NNN><loc_MMM>
+  ```
+- 변경 포맷 (`reasoning_point_object`):
+  ```
+  Reasoning: <text>
+  Point: <loc_NNN><loc_MMM>
+  Object: <obj_KKK>
+  ```
+- 근거: primary metric이 point distance → point 예측을 autoregressive chain의 앞쪽에 배치 → object는 reasoning+point 양쪽 모두 conditioning
+
+### 수정 파일
+
+#### (A) `model/utils/gaze_tokens.py`
+
+1. **`_STRICT_RE_REASONING_POINT_OBJ` 정규식 추가** (line ~45 근처에 삽입):
+   ```python
+   # reasoning_point_object: "Reasoning: ...\nPoint: <loc_X><loc_Y>\nObject: <obj_K>"
+   # Groups: 1=loc_x, 2=loc_y, 3=obj
+   _STRICT_RE_REASONING_POINT_OBJ = re.compile(
+       r"^\s*Reasoning:.*?"
+       r"\s*Point:\s*(<loc_\d+>)(<loc_\d+>)"
+       r"\s*Object:\s*(<obj_\d+>|<obj_unknown>)"
+       r"\s*(?:<\|im_end\|>)?\s*$",
+       re.DOTALL,
+   )
+   ```
+
+2. **`build_structured_target_text()` — 신규 케이스 추가** (line ~178 `if order == "reasoning_object_point":` 블록 다음에):
+   ```python
+   if order == "reasoning_point_object":
+       reasoning_body = normalize_reasoning_text(str(reasoning_text or "").strip())
+       if reasoning_body or bool(force_reasoning_format):
+           content_line = f"{REASONING_PREFIX} {reasoning_body}" if reasoning_body else REASONING_PREFIX
+           return f"{content_line}\n{point_str}\n{object_str}"
+       return f"{point_str}\n{object_str}"
+   ```
+   - docstring에 `"reasoning_point_object"` 항목 추가
+
+3. **`parse_structured_output_text()` — 우선순위 삽입** (line ~343 `_STRICT_RE_OBJ_FIRST.match` 다음, reasoning_first 전에):
+   ```python
+   # reasoning_point_object: "Reasoning: ...\nPoint: ...\nObject: ..."
+   m = _STRICT_RE_REASONING_POINT_OBJ.match(s)
+   if m is not None:
+       return _extract_from_match(m, obj_group=3, x_group=1, y_group=2,
+                                  num_classes=num_classes, coord_bins=coord_n)
+   ```
+   - 함수 docstring에 새 포맷 언급 추가
+
+#### (B) `model/datasets.py`
+
+- `MultiViewGazeDataset.__getitem__()` line 443:
+  ```python
+  # 기존:
+  target_order = "reasoning_object_point"
+  # 변경:
+  target_order = "reasoning_point_object"
+  ```
+
+#### (C) `sft.yaml`
+
+- `reasoning.target_order`: `"reasoning_object_point"` → `"reasoning_point_object"`
+- `prompt.prompt_text` — Point/Object 순서 교체:
+  ```yaml
+  prompt_text: |
+    The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
+    Briefly reason about where this person is looking, then output the gaze point and object.
+    Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
+    Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
+    Return exactly:
+    Reasoning: <your reasoning here>
+    Point: <loc_NNN><loc_MMM>
+    Object: <obj_KKK>
+  ```
+- `eval.generation_max_new_tokens`: `24` → `80`
+  - 근거: reasoning(~30 words ≈ 40 tokens) + "Reasoning: \n" (4 tokens) + "Point: <loc_X><loc_Y>\n" (6 tokens) + "Object: <obj_K>" (3 tokens) ≈ 53 tokens 최소 필요 → 여유 있게 80
+
+#### (D) `model/utils/processor_collate.py`
+
+- `build_structured_masks()` 내 reasoning content offset 탐지 로직 (`elif rl_pos >= 0:` 블록, line ~217):
+  - 현재 구현이 "Reasoning: 이후 첫 번째 줄바꿈까지" 를 reasoning 마스크로 지정 → 그 뒤 `<loc_*>` / `<obj_*>` 는 tok_str 패턴 매칭으로 처리
+  - `reasoning_point_object` 순서에서도 동작 확인: Point가 Object 앞에 와도 `_LOC_RE` / `_OBJ_RE` 패턴 매칭 기반이라 **코드 수정 불필요** (이미 order-agnostic)
+  - 단, `"reasoning_point_object"` 에서 direct view의 `target_order = "object_point"` 유지 확인 필요 (line 455: 이미 `"object_point"` 고정 → 이상 없음)
+
+---
+
+## Task 3 — Gaussian Soft-Label CE for Point Loss (σ=7)
+
+### 목표
+- 현재: `<loc_33>` vs `<loc_34>` 예측 → 표준 CE에서 동일하게 틀린 것으로 처리
+- 변경: GT bin `b*` 기준으로 Gaussian 분포 soft label 생성 → 인접 bin에 gradient 부여
+- σ=7 (128-bin 기준, 좌표 오차 ~7/127 ≈ 0.055 단위의 유연도)
+
+### 구현 원리
 ```
+soft_label[k] = exp(-0.5 * (k - b*)² / σ²),  k ∈ {0..C-1}
+soft_label = soft_label / sum(soft_label)
 
-Core principle:
-
-```text
-Use reasoning as train-time auxiliary supervision, not as the required inference-time output.
+L_pt = -Σ_k soft_label[k] * log_softmax(logits)[loc_token_ids[k]]
 ```
-
-Because training time and compute are limited, do not plan broad ablations now. Implement one conservative default recipe and add enough logging to quickly detect whether reasoning is hurting direct gaze prediction.
-
-Default policy:
-
-```text
-reasoning annotations used = all valid train reasoning files
-direct train view = 100% of train records
-reasoning train view = 100% of train records with valid reasoning
-train sampling ratio = direct 80%, reasoning 20%
-val/test reasoning usage = 0%
-```
-
-## 0.1 Immediate Low-risk Config Changes
-
-Before the full multi-view refactor, apply the safe config changes that reduce the chance of reasoning CE hurting point/object learning:
-
-```yaml
-reasoning:
-  force_reasoning_format_train: false
-  force_reasoning_format_eval: false
-
-eval:
-  generation_max_new_tokens: 24
-  generation_stop_at_object_end: false
-
-loss:
-  loss_reasoning_weight: 0.05
-```
-
-Rationale:
-
-- `loss_reasoning_weight: 0.5` is too high for a `val/dist`-first objective.
-- `generation_max_new_tokens: 128` is unnecessary for direct eval and encourages verbose output.
-- `force_reasoning_format_train: true` can create empty reasoning scaffolds and misleading `n_reasoning_tokens`.
-- Keep `generation_stop_at_object_end: false` because `Object -> Point` must not stop after object generation.
-
-## 1. Dataset Structure
-
-### TODO 1.1 Expand train records into direct and reasoning views
-
-For each train record, create a direct view:
-
-```python
-{
-    "base_record": record,
-    "view_type": "direct",
-    "prompt_type": "direct_object_point",
-    "target_type": "object_point",
-    "use_reasoning": False,
-    "augmentation_policy": "full",
-}
-```
-
-For each train record with a valid `Reasoning:` line, create a reasoning view:
-
-```python
-{
-    "base_record": record,
-    "view_type": "reasoning",
-    "prompt_type": "reasoning_object_point",
-    "target_type": "reasoning_object_point",
-    "use_reasoning": True,
-    "augmentation_policy": "safe",
-}
-```
-
-Requirements:
-
-- Direct view must exist for every train record.
-- Reasoning view should exist for every train record with valid reasoning text.
-- Do not create fake empty reasoning views in normal training.
-- Return `view_type`, `prompt_type`, `target_type`, and `augmentation_policy` in each sample so the trainer can log view-specific metrics.
-
-### TODO 1.2 Keep val/test direct-only
-
-Val/test datasets must never create reasoning views.
-
-```python
-{
-    "view_type": "direct",
-    "prompt_type": "direct_object_point",
-    "target_type": "object_point",
-    "use_reasoning": False,
-    "augmentation_policy": "none",
-}
-```
-
-Requirements:
-
-- Val/test prompt must not mention reasoning, explanation, or why.
-- Val/test target format must be exactly `Object -> Point`.
-- Val/test generation preview must use the direct prompt.
-
-## 2. Sampling
-
-### TODO 2.1 Add weighted sampling for train views
-
-Expanded train dataset is approximately:
-
-```text
-direct N + reasoning N
-```
-
-Uniform sampling would produce a 1:1 ratio, which is too much reasoning for a `val/dist`-first objective. Add `WeightedRandomSampler` or an equivalent custom sampler.
-
-Default config:
-
-```yaml
-train:
-  use_multiview_sft: true
-  direct_view_ratio: 0.8
-  reasoning_view_ratio: 0.2
-```
-
-Recommended weighting:
-
-```python
-direct_weight = desired_direct_ratio / num_direct_views
-reasoning_weight = desired_reasoning_ratio / num_reasoning_views
-
-sampler = WeightedRandomSampler(
-    weights=weights,
-    num_samples=len(train_records),
-    replacement=True,
-)
-```
-
-Compute-constrained decision:
-
-- Do not run 9:1, 8:2, 7:3 ablations now.
-- Use fixed `8:2` as the first default.
-- If early logs show direct format degradation or reasoning leakage into direct output, switch default to `9:1`.
-
-## 3. Prompt Design
-
-### TODO 3.1 Split direct and reasoning prompts
-
-Do not use one prompt for both direct and reasoning samples. The prompt should clearly identify which task the model is doing.
-
-Direct prompt:
-
-```text
-You are given an image with a marked person.
-Predict the gaze target object and gaze point of the marked person.
-
-Return only:
-Object: <object_token>
-Point: <x_token><y_token>
-```
-
-Reasoning prompt:
-
-```text
-You are given an image with a marked person.
-First provide one short visual reasoning sentence about where the person is looking.
-Then predict the gaze target object and gaze point.
-
-Return exactly:
-Reasoning: <one short sentence>
-Object: <object_token>
-Point: <x_token><y_token>
-```
-
-Requirements:
-
-- Direct prompt must not include "reasoning", "explain", "why", or similar words.
-- Reasoning prompt must request one short sentence.
-- Do not encourage long chain-of-thought.
-- Final answer block must always use `Object -> Point`.
-- New multi-view targets must not use `<think>...</think>`.
-- Keep legacy `<think>...</think>` parser support only for old checkpoints/debugging if needed.
-
-### TODO 3.2 Explicitly migrate away from `<think>...</think>`
-
-Current code still has `<think>...</think>` assumptions in target generation, parser, and reasoning masks. The multi-view design intentionally removes this wrapper.
-
-Migration requirements:
-
-- Target generation must output `Reasoning: ...` as a normal first line, not a `<think>` block.
-- `build_structured_target_text()` and compatibility helpers must support non-`<think>` reasoning targets.
-- `build_structured_masks()` must identify reasoning content after the `Reasoning:` label without relying on `<think>` / `</think>` boundaries.
-- `parse_structured_output_text()` should support direct `Object -> Point` for metrics and `Reasoning -> Object -> Point` for preview/debug.
-- Existing `<think>` parsing may remain only as legacy compatibility, not as the new training default.
-- Unit tests must cover both new no-`<think>` multi-view targets and legacy `<think>` inputs if legacy support is kept.
-
-## 4. Target Builders
-
-### TODO 4.1 Direct target builder
-
-Direct view target:
-
-```text
-Object: <obj_255>
-Point: <loc_042><loc_087>
-```
-
-Example:
-
-```python
-def build_direct_target(object_token: str, x_token: str, y_token: str) -> str:
-    return f"Object: {object_token}\nPoint: {x_token}{y_token}"
-```
-
-### TODO 4.2 Reasoning target builder
-
-Reasoning view target:
-
-```text
-Reasoning: <short normalized reasoning>
-Object: <obj_255>
-Point: <loc_042><loc_087>
-```
-
-Example:
-
-```python
-def build_reasoning_target(
-    reasoning_text: str,
-    object_token: str,
-    x_token: str,
-    y_token: str,
-) -> str:
-    reasoning_text = normalize_reasoning_text(reasoning_text)
-    return (
-        f"Reasoning: {reasoning_text}\n"
-        f"Object: {object_token}\n"
-        f"Point: {x_token}{y_token}"
-    )
-```
-
-### TODO 4.3 Normalize and limit reasoning length
-
-Reasoning is auxiliary. Keep it short so it does not dominate token budget or compete with point/object learning.
-
-Config:
-
-```yaml
-reasoning:
-  max_reasoning_words: 30
-  max_reasoning_chars: 220
-```
-
-Normalization:
-
-```python
-def normalize_reasoning_text(text: str) -> str:
-    text = text.strip()
-    text = text.replace("\n", " ")
-    text = collapse_spaces(text)
-    text = truncate_to_max_words(text, max_words=30)
-    text = truncate_to_max_chars(text, max_chars=220)
-    if text and not text.endswith("."):
-        text += "."
-    return text
-```
-
-Requirements:
-
-- Missing reasoning should remove the reasoning view, not create an empty scaffold.
-- Multi-line reasoning should become one line.
-- Very long reasoning should be truncated.
-- Directional words are acceptable only because reasoning view uses safe augmentation.
-
-## 5. Object Label Handling
-
-### TODO 5.1 Use canonical object token as supervised target
-
-Do not use free-form `Object:` text from reasoning files as the supervised object target.
-
-Reason:
-
-- Reasoning object text is free-form.
-- Current object vocabulary is a 346-class closed set.
-- Reasoning object phrases can be fine-grained, e.g. `the dessert on the plate`, `the red-and-white circular print on the table`, or `the computer monitor screen`.
-
-The supervised object token must come from the existing label pipeline:
-
-```python
-object_token = object_id_to_special_token(label_id)
-```
-
-### TODO 5.2 Use reasoning `Object:` line only for diagnostics
-
-Reasoning file parser should read both:
-
-```python
-{
-    "object_text": str | None,
-    "reasoning_text": str | None,
-}
-```
-
-Use `object_text` for:
-
-- Debugging.
-- Object label consistency checks.
-- Bad reasoning sample filtering.
-- Future canonicalization table construction.
-
-Logging example:
-
-```text
-reasoning/object_text: the computer monitor screen
-canonical_label: screen
-object_token: <obj_255>
-match: true
-```
-
-Do not silently replace canonical object labels with reasoning file object text.
-
-## 6. Augmentation
-
-### TODO 6.1 Direct view uses full augmentation
-
-Direct view should keep strong augmentation:
-
-```text
-random crop
-horizontal flip
-color jitter
-resize
-```
-
-Reason: direct view is the final val/test path and should retain spatial generalization.
-
-### TODO 6.2 Reasoning view uses safe augmentation
-
-Reasoning text is generated from the original image. Spatial transforms can make text wrong, especially left/right/up/down and relation phrases.
-
-Reasoning view augmentation:
-
-```text
-resize
-color jitter
-no horizontal flip
-no random crop, unless proven safe
-```
-
-Config:
-
-```yaml
-augmentation:
-  direct:
-    use_random_crop: true
-    use_hflip: true
-    use_color_jitter: true
-
-  reasoning:
-    use_random_crop: false
-    use_hflip: false
-    use_color_jitter: true
-```
-
-Requirements:
-
-- Do not use one global augmentation path for both views.
-- Log `augmentation_policy` for sampled batches.
-
-## 7. Loss Masks and Weights
-
-### TODO 7.1 Build view-aware token masks
-
-Direct target:
-
-```text
-Object: <obj_255>
-Point: <loc_042><loc_087>
-```
-
-Mask categories:
-
-```text
-Object:, Point:     -> format loss
-<obj_255>           -> object loss
-<loc_042><loc_087>  -> point loss
-reasoning loss      -> none
-```
-
-Reasoning target:
-
-```text
-Reasoning: short sentence.
-Object: <obj_255>
-Point: <loc_042><loc_087>
-```
-
-Mask categories:
-
-```text
-Reasoning:          -> format loss
-short sentence      -> reasoning loss
-Object:, Point:     -> format loss
-<obj_255>           -> object loss
-<loc_042><loc_087>  -> point loss
-```
-
-Requirements:
-
-- Reasoning mask must exclude whitespace-only tokens.
-- Empty/missing reasoning must not produce `n_reasoning_tokens = batch_size`.
-- Point mask must cover exactly two loc tokens.
-- Object mask must cover exactly one obj token or `<obj_unknown>`.
-- Add tests for direct view and reasoning view masks.
-
-### TODO 7.2 Use conservative reasoning loss weight
-
-Primary objective is `val/dist`, so point loss should dominate.
-
-Recommended:
+- `log_softmax`는 전체 vocab에 대해 계산, loc token 위치만 사용
+
+### 수정 파일
+
+#### (A) `model/utils/loss_utils.py`
+
+1. **`gaussian_soft_label_ce()` 함수 추가** (파일 하단 또는 `masked_token_ce` 다음):
+   ```python
+   def gaussian_soft_label_ce(
+       logits_at_pt: torch.Tensor,    # [N, V] — logits at N point-token positions
+       gt_loc_ids: torch.Tensor,      # [N]    — GT loc token IDs in vocab
+       loc_token_ids: torch.Tensor,   # [C]    — all loc vocab IDs, sorted by bin index
+       sigma: float = 7.0,
+   ) -> torch.Tensor:
+       """Gaussian soft-label cross-entropy over loc token bins.
+
+       Treats each loc token as a bin; nearby bins get partial credit.
+       """
+       C = int(loc_token_ids.shape[0])
+       N = int(logits_at_pt.shape[0])
+       if N <= 0 or C <= 0:
+           return torch.zeros((), device=logits_at_pt.device, dtype=logits_at_pt.dtype)
+
+       # GT bin index (0..C-1): position of gt_loc_ids within loc_token_ids
+       loc_ids_dev = loc_token_ids.to(device=logits_at_pt.device)
+       gt_bin = (gt_loc_ids.to(device=logits_at_pt.device).unsqueeze(1)
+                 == loc_ids_dev.unsqueeze(0)).float().argmax(dim=1)  # [N]
+
+       # Gaussian soft labels [N, C]
+       k = torch.arange(C, device=logits_at_pt.device, dtype=logits_at_pt.dtype)
+       diff = k.unsqueeze(0) - gt_bin.to(logits_at_pt.dtype).unsqueeze(1)  # [N, C]
+       soft = torch.exp(-0.5 * diff ** 2 / (float(sigma) ** 2))
+       soft = soft / soft.sum(dim=1, keepdim=True)                          # [N, C]
+
+       # log_softmax over full vocab, slice to loc positions
+       log_p = F.log_softmax(logits_at_pt, dim=-1)[:, loc_ids_dev]          # [N, C]
+       return -(soft * log_p).sum(dim=-1).mean()
+   ```
+
+2. **`compute_structured_loss()` 수정** — パラメータ 추가 및 point CE 교체:
+   ```python
+   def compute_structured_loss(
+       *,
+       logits, labels,
+       loss_mask_point, loss_mask_object, loss_mask_format,
+       loss_mask_reasoning=None,
+       weight_point=1.0, weight_object=1.0, weight_format=0.25, weight_reasoning=0.3,
+       compute_format_rate=False,
+       loc_token_ids: torch.Tensor | None = None,   # 추가
+       gaussian_sigma: float = 0.0,                  # 추가
+   ) -> dict[str, Any]:
+   ```
+   - `valid_union` CE 계산 후 `l_pt` 계산 부분 교체:
+     ```python
+     if loc_token_ids is not None and float(gaussian_sigma) > 0.0 and n_pt > 0:
+         pt_positions = pt_valid[valid_union]  # bool mask within valid_union
+         logits_at_pt = shift_logits[valid_union][pt_positions]   # [N_pt, V]
+         gt_ids_at_pt = shift_labels[valid_union][pt_positions]   # [N_pt]
+         l_pt = gaussian_soft_label_ce(logits_at_pt, gt_ids_at_pt, loc_token_ids, sigma=gaussian_sigma)
+     else:
+         l_pt = _cat_mean(pt_valid, n_pt)   # 기존 hard CE
+     ```
+
+3. **`compute_answer_loss()` 수정** — 파라미터 스루:
+   ```python
+   def compute_answer_loss(
+       *, logits, labels,
+       ...,  # 기존 파라미터
+       loc_token_ids: torch.Tensor | None = None,
+       gaussian_sigma: float = 0.0,
+   ) -> dict[str, Any]:
+   ```
+   - `compute_structured_loss()` 호출 시 `loc_token_ids=loc_token_ids, gaussian_sigma=gaussian_sigma` 전달
+
+#### (B) `model/trainer.py`
+
+1. **`loc_token_ids` 텐서 구성** (`token_id_map` 직후, line ~1201 근처):
+   ```python
+   # loc tokens: <loc_000> ... <loc_127> in bin order
+   _loc_token_id_list = []
+   from .utils.gaze_tokens import format_loc_token, _loc_token_width
+   _lw = _loc_token_width(coord_bins)
+   for _b in range(coord_bins):
+       _tok = format_loc_token(_b, _lw)
+       _id = int(token_id_map.get(_tok, -1))
+       if _id >= 0:
+           _loc_token_id_list.append(_id)
+   loc_token_ids_tensor: torch.Tensor | None = (
+       torch.tensor(_loc_token_id_list, dtype=torch.long)
+       if len(_loc_token_id_list) == coord_bins else None
+   )
+   ```
+
+2. **`gaussian_point_sigma` config 읽기**:
+   ```python
+   gaussian_point_sigma = float(getattr(args, "gaussian_point_sigma", 0.0))
+   ```
+
+3. **SFT 학습 루프 내 `compute_answer_loss()` 호출 수정** (line ~1881):
+   ```python
+   losses = compute_answer_loss(
+       ...
+       loc_token_ids=loc_token_ids_tensor.to(device) if loc_token_ids_tensor is not None else None,
+       gaussian_sigma=gaussian_point_sigma,
+   )
+   ```
+
+#### (C) `sft.yaml`
 
 ```yaml
 loss:
@@ -440,360 +250,101 @@ loss:
   loss_object_weight: 1.0
   loss_format_weight: 0.2
   loss_reasoning_weight: 0.05
+  gaussian_point_sigma: 7.0    # 추가. 0.0이면 기존 hard CE 사용
 ```
 
-Avoid:
-
-```yaml
-loss_reasoning_weight: 0.5
-```
-
-Reasoning CE should not compete strongly with point/object learning.
-
-## 8. Evaluation
-
-### TODO 8.1 Val/Test metrics use direct prompt only
-
-Eval generation must always expect:
-
-```text
-Object: <obj_k>
-Point: <loc_x><loc_y>
-```
-
-Requirements:
-
-- `eval_prompt_type = direct_object_point`
-- `eval_target_type = object_point`
-- No reasoning prompt for main val/test metric.
-- No reasoning output required for main val/test metric.
-
-### TODO 8.2 Reduce eval generation length
-
-Direct output is short.
-
-Recommended:
-
-```yaml
-eval:
-  generation_max_new_tokens: 16
-```
-
-Fallback:
-
-```yaml
-eval:
-  generation_max_new_tokens: 24
-```
-
-Do not keep `128` for main direct eval. Use long generation only for separate reasoning previews.
-
-### TODO 8.3 Fix stop rule for Object -> Point
-
-`Object -> Point` must not stop after object generation.
-
-Recommended:
-
-```yaml
-eval:
-  generation_stop_at_object_end: false
-```
-
-Do not require a new `generation_stop_at_point_end` in the first patch. Prefer the simpler path:
-
-```text
-generation_stop_at_object_end = false
-generation_max_new_tokens = 24
-stop on EOS or max_new_tokens
-```
-
-Implement `generation_stop_at_point_end` later only if direct generations frequently continue past the point line.
-
-## 9. Parser
-
-### TODO 9.1 Direct eval parser should be strict
-
-Main val/test valid output:
-
-```text
-Object: <obj_255>
-Point: <loc_042><loc_087>
-```
-
-Invalid in direct eval:
-
-- Missing object.
-- Missing point.
-- Reasoning text mixed into direct output.
-- Extra text after point.
-- Point before object.
-
-### TODO 9.2 Reasoning parser is for preview/debug only
-
-Keep parser support for:
-
-```text
-Reasoning: ...
-Object: <obj_255>
-Point: <loc_042><loc_087>
-```
-
-Use it for:
-
-- Debug preview.
-- Unit tests.
-- Optional small reasoning preview generation.
-
-Do not use reasoning parser for main val/test metric.
-
-## 10. Config
-
-### TODO 10.1 Add multi-view SFT config
-
-Recommended config:
-
-```yaml
-train:
-  use_multiview_sft: true
-  direct_view_ratio: 0.8
-  reasoning_view_ratio: 0.2
-
-reasoning:
-  use_reasoning: true
-  reasoning_view_enabled: true
-  force_reasoning_format_train: false
-  force_reasoning_format_eval: false
-  max_reasoning_words: 30
-  max_reasoning_chars: 220
-
-target:
-  direct_order: "object_point"
-  reasoning_order: "reasoning_object_point"
-
-prompt:
-  train_direct_prompt_type: "direct_object_point"
-  train_reasoning_prompt_type: "reasoning_object_point"
-  eval_prompt_type: "direct_object_point"
-
-loss:
-  loss_point_weight: 3.0
-  loss_object_weight: 1.0
-  loss_format_weight: 0.2
-  loss_reasoning_weight: 0.05
-
-eval:
-  generation_max_new_tokens: 24
-  generation_stop_at_object_end: false
-  preview_val_samples: 32
-```
-
-Requirements:
-
-- `use_reasoning=false` must disable reasoning views and reasoning loss.
-- `use_multiview_sft=false` should preserve a direct-only training path.
-- Config parser must correctly read nested `train`, `reasoning`, `target`, `prompt`, `loss`, and `eval` keys.
-
-## 11. Logging and Debugging
-
-### TODO 11.1 View ratio logs
-
-Log actual sampled view fractions:
-
-```text
-train/view_direct_frac
-train/view_reasoning_frac
-```
-
-Expected:
-
-```text
-direct ~= 0.8
-reasoning ~= 0.2
-```
-
-### TODO 11.2 View-specific loss logs
-
-Log direct and reasoning losses separately:
-
-```text
-train/direct/loss_total
-train/direct/loss_point
-train/direct/loss_object
-train/direct/loss_format
-
-train/reasoning/loss_total
-train/reasoning/loss_point
-train/reasoning/loss_object
-train/reasoning/loss_format
-train/reasoning/loss_reasoning
-```
-
-### TODO 11.3 Eval metric logs
-
-Always log:
-
-```text
-val/dist
-val/object_acc
-val/format_valid
-val/point_l2_valid_frac
-val/extra_text_rate
-```
-
-Interpretation:
-
-- If `val/point_l2_valid_frac` is low, `val/dist` is not trustworthy.
-- If `val/extra_text_rate` rises, direct prompt is leaking reasoning or verbose text.
-- If `val/format_valid` drops, reasoning auxiliary training may be interfering with direct decoding.
-
-### TODO 11.4 Preview files
-
-Save direct prompt generation examples at eval:
-
-```json
-{
-  "image_path": "...",
-  "prompt_type": "direct_object_point",
-  "generated_text": "Object: <obj_255>\nPoint: <loc_042><loc_087>",
-  "parsed_object": 255,
-  "parsed_point": [0.33, 0.68],
-  "gt_point": [0.31, 0.70],
-  "l2": 0.028,
-  "format_valid": true
-}
-```
-
-Also save a small reasoning preview separately, but never use it for the main metric.
-
-## 12. Training Schedule
-
-### TODO 12.1 Conservative fixed default schedule
-
-Broad ablations are not feasible, and epoch-dependent sampler curriculum adds implementation complexity. Start with one fixed conservative schedule:
-
-```text
-direct:reasoning = 8:2
-loss_reasoning_weight = 0.05
-```
-
-If direct format degrades, switch to:
-
-```text
-direct:reasoning = 9:1
-loss_reasoning_weight = 0.03~0.05
-```
-
-Move curriculum to Priority 3. Do not implement epoch-dependent sampler updates in the first patch.
-
-### TODO 12.2 No broad ablation for now
-
-The analysis suggested A/B/C/D comparisons, but current compute constraints make them impractical.
-
-Instead:
-
-- Implement the single default multi-view recipe.
-- Compare only against already-known historical direct/reasoning runs if available.
-- Use view-specific logging and previews to detect failure quickly.
-
-Success criteria:
-
-```text
-val/dist does not get worse than the current direct baseline trend
-val/format_valid remains high
-val/point_l2_valid_frac remains high
-direct generation does not include reasoning text
-reasoning view does not dominate token/loss budget
-```
-
-Failure criteria:
-
-```text
-val/dist rises
-val/format_valid drops
-val/point_l2_valid_frac drops
-direct generation includes Reasoning:
-train/n_reasoning_tokens is unexpectedly constant at batch_size
-```
-
-## 13. Implementation Priority
-
-### Priority 1: Must do first
-
-- Apply immediate config safety changes: `loss_reasoning_weight=0.05`, `generation_max_new_tokens=24`, `force_reasoning_format_train=false`.
-- Remove `<think>` as the new training target format and migrate target/mask/parser code to `Reasoning: ...\nObject: ...\nPoint: ...`.
-- Expand train dataset into direct/reasoning views.
-- Add weighted sampler or equivalent direct/reasoning sampling control.
-- Keep val/test direct-only.
-- Split direct and reasoning prompts.
-- Split direct and reasoning target builders.
-- Ensure `Object -> Point` generation does not stop after object.
-- Reduce main eval `generation_max_new_tokens` to 16-24.
-- Add view-type metadata to batches.
-- Add view ratio and view-specific loss logs.
-
-### Priority 2: Strongly recommended
-
-- Direct view full augmentation.
-- Reasoning view safe augmentation.
-- Reasoning max word/char normalization.
-- Reasoning `Object:` line consistency diagnostics.
-- Direct eval preview saving.
-- `val/point_l2_valid_frac`, `val/format_valid`, `val/extra_text_rate` logging.
-- Fix whitespace-only reasoning mask so empty reasoning does not count as one reasoning token per sample.
-
-### Priority 3: Later improvements
-
-- Curriculum for direct/reasoning ratio.
-- Optional `generation_stop_at_point_end` if max-token stopping is insufficient.
-- Bad reasoning sample filtering.
-- Object phrase canonicalization table.
-- Point soft-label CE or distance-aware auxiliary loss.
-- Full scene + head crop multi-image input.
-
-## 14. Expected Behavior
-
-Train:
-
-```text
-Most sampled views:
-Prompt: direct
-Target: Object -> Point
-
-Some sampled views:
-Prompt: reasoning
-Target: Reasoning -> Object -> Point
-```
-
-Default sampling:
-
-```text
-Direct view: 80%
-Reasoning view: 20%
-```
-
-Val/Test:
-
-```text
-Prompt: direct
-Generated:
-Object: <obj_k>
-Point: <loc_x><loc_y>
-```
-
-No reasoning is generated or required for the main val/test metric.
-
-## 15. Claude Review Checklist
-
-- Does `use_reasoning=false` produce direct-only samples with no reasoning scaffold?
-- Does multi-view training create both views for valid reasoning train records?
-- Are direct and reasoning prompts truly different?
-- Does val/test always use direct prompt and strict `Object -> Point` parsing?
-- Is the sampler actually producing the configured direct/reasoning ratio?
-- Are reasoning views protected from hflip/crop?
-- Are reasoning strings normalized and length-limited?
-- Is canonical object token always used as supervised object target?
-- Is reasoning file `Object:` used only for diagnostics?
-- Are view-specific losses logged separately?
-- Does `train/n_reasoning_tokens` reflect real reasoning text, not whitespace-only tokens?
-- Is `generation_stop_at_object_end=false` for `Object -> Point`?
-- Is main eval `generation_max_new_tokens` short enough for direct output?
+---
+
+## Task 4 — train/FormatValidRate를 view type별로 분리 로깅
+
+### 문제
+현재 `train/FormatValidRate`는 `compute_structured_loss` 내부에서 배치 전체를 대상으로 `masked_sample_exact_rate(logits, labels, loss_mask_format)`를 호출해 계산됨.
+
+**Mixed batch(direct + reasoning 혼재)에서 두 종류의 포맷 토큰이 섞임:**
+- **Direct view**: `"Object: \nPoint: "` 구조 → 포맷 토큰 ~4-6개
+- **Reasoning view**: `"Reasoning: ...\nPoint: \nObject: "` 구조 → 포맷 토큰 더 많음 (reasoning prefix + 줄바꿈 등)
+
+`masked_sample_exact_rate`는 **모든 포맷 토큰이 완벽히 맞아야** 해당 샘플을 valid로 처리하는 per-sample exact match. 따라서:
+- Direct 샘플: 토큰 수가 적으므로 구조적으로 유리 → 높은 rate
+- Reasoning 샘플: 토큰 수가 많을수록 불리 → 낮은 rate
+- **혼합 비율이 바뀌면 FormatValidRate가 의미 없이 흔들림** → 학습 진행 모니터링 불가
+
+### 수정 파일
+
+#### `model/trainer.py` — wandb 로깅 블록 수정 (line ~1927)
+
+1. **import 추가** (파일 상단 line 63):
+   ```python
+   from .utils.loss_utils import compute_answer_loss, masked_sample_exact_rate
+   ```
+
+2. **`if should_step: if wandb_run is not None:` 블록 내**, `_view_types` 사용 부분(line ~1927) 확장:
+   ```python
+   _view_types = batch.get("view_type", [])
+   _n_batch = max(len(_view_types), 1)
+   _n_direct_batch = sum(1 for v in _view_types if v == "direct")
+   _n_rsn_batch    = sum(1 for v in _view_types if v == "reasoning")
+
+   # Per-view-type FormatValidRate (only at logging steps, no gradient needed)
+   _fmt_rate_direct = 0.0
+   _fmt_rate_rsn    = 0.0
+   if _compute_fmt_rate and _view_types:
+       _logits_det = out["logits"].detach()   # graph freed after backward, tensor still alive
+       _fmt_mask   = batch.get("loss_mask_format")
+       if torch.is_tensor(_fmt_mask):
+           with torch.no_grad():
+               _d_idx = [i for i, v in enumerate(_view_types) if v == "direct"]
+               _r_idx = [i for i, v in enumerate(_view_types) if v == "reasoning"]
+               if _d_idx:
+                   _di = torch.tensor(_d_idx, device=device)
+                   _fmt_rate_direct, _ = masked_sample_exact_rate(
+                       _logits_det[_di], labels[_di], _fmt_mask[_di]
+                   )
+                   _fmt_rate_direct = float(_fmt_rate_direct.item())
+               if _r_idx:
+                   _ri = torch.tensor(_r_idx, device=device)
+                   _fmt_rate_rsn, _ = masked_sample_exact_rate(
+                       _logits_det[_ri], labels[_ri], _fmt_mask[_ri]
+                   )
+                   _fmt_rate_rsn = float(_fmt_rate_rsn.item())
+   ```
+
+3. **`wandb_run.log(...)` 딕셔너리에 항목 추가**:
+   ```python
+   "train/FormatValidRate_direct":    _fmt_rate_direct,
+   "train/FormatValidRate_reasoning": _fmt_rate_rsn,
+   ```
+   - 기존 `"train/FormatValidRate"` 키는 유지 (combined, backward compat)
+
+4. **`wandb_utils.py`** — `define_metric` 등록 추가 (line ~67 근처):
+   ```python
+   wandb.define_metric("train/FormatValidRate_direct",    summary="max")
+   wandb.define_metric("train/FormatValidRate_reasoning", summary="max")
+   ```
+
+### 주의
+- `out["logits"]`는 `loss.backward()` 이후에도 텐서 참조가 살아있어 접근 가능. 단, computation graph는 해제됨 → `torch.no_grad()` 필수
+- `_compute_fmt_rate`는 accum step + wandb 활성 시에만 True → 매 step마다 추가 연산 없음
+- Direct 샘플만 있는 배치나 reasoning 샘플만 있는 배치에선 해당 rate가 0.0으로 로깅됨 (n=0 케이스) → wandb에서 필터링 시 주의
+
+---
+
+## 수정 순서 권장
+
+1. **Task 2** (출력 순서) — 가장 단순, 효과 즉시 확인 가능
+2. **Task 3** (Gaussian CE) — loss_utils 독립 변경, 테스트 작성 용이
+3. **Task 4** (FormatValidRate 분리) — trainer 로깅 수정만, 학습 영향 없음
+4. **Task 1** (전체 dual-view) — 학습 시간 증가, 나머지 완료 후 진행
+
+## 테스트 체크리스트
+
+- [ ] `test_reasoning_format.py`: `reasoning_point_object` 포맷 생성 확인
+- [ ] `test_structured_loss.py`: `gaussian_soft_label_ce` 단위 테스트 (σ=0일 때 hard CE와 동일 결과 확인)
+- [ ] `test_reasoning_masks.py`: `build_structured_masks`가 `reasoning_point_object` 포맷에서 point/object 마스크 정상 생성 확인
+- [ ] `QWEN_DEBUG_MASKS=1` 환경변수로 학습 초반 마스크 분포 모니터링
+
+## 미결 검토 사항
+
+- `generation_stop_at_object_end: false` 유지 (현재 설정). reasoning_point_object에서 object가 마지막이므로 자연 EOS에 맡기면 충분
+- Task 1 적용 후 `epochs: 20` → 실질 학습량 2배 증가. 학습 시간 고려해 필요 시 `epochs: 10`으로 조정
+- Gaussian σ=7은 128-bin 기준으로 이웃 14개 bin(±7)에 유효한 gradient 부여 → 너무 soft해지지 않는지 초반 실험 필요 (loss_point_weight=3.0으로 이미 가중치 높음)

@@ -32,7 +32,7 @@ train:
   device: "cuda"
   dtype: "bfloat16"
   gradient_checkpointing: false
-  epochs: 20
+  epochs: 10   # dual-view: 217,910 samples/epoch (2x vs before), so halved from 20
   batch_size: 16
   grad_accum_steps: 8
   num_workers: 8
@@ -46,12 +46,13 @@ train:
   use_multiview_sft: true
 
 reasoning:
-  target_order: "reasoning_object_point"   # object_point | point_object | point_object_reasoning | reasoning_object_point
+  target_order: "reasoning_point_object"   # object_point | point_object | point_object_reasoning | reasoning_object_point | reasoning_point_object
   force_reasoning_format_train: false       # do not create empty reasoning scaffolds
   force_reasoning_format_eval: false        # do NOT force empty scaffold on val/test
   disable_spatial_aug_for_reasoning: true   # skip hflip/crop for samples with reasoning files
-  direct_view_ratio: 0.8
-  reasoning_view_ratio: 0.2
+  # direct_view_ratio / reasoning_view_ratio unused: full dual-view training enabled.
+  # direct_view_ratio: 0.8
+  # reasoning_view_ratio: 0.2
   max_reasoning_words: 30
   max_reasoning_chars: 220
 
@@ -65,7 +66,7 @@ eval:
   run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 24       # direct Object->Point eval should stay short
+  generation_max_new_tokens: 24       # direct eval (point_object): Point(6t) + Object(3t) ~= 9 tokens; 24 gives margin
   generation_num_beams: 1
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
@@ -74,25 +75,25 @@ eval:
 prompt:
   visual_prompting: true
   prompt_template: ""
-  # Used when use_reasoning=true (reasoning_object_point target order)
+  # Used when use_reasoning=true (reasoning_point_object target order)
   prompt_text: |
     The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
-    Briefly reason about where this person is looking, then output the object and gaze point.
+    Briefly reason about where this person is looking, then output the gaze point and object.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
     Return exactly:
     Reasoning: <your reasoning here>
-    Object: <obj_KKK>
     Point: <loc_NNN><loc_MMM>
-  # Used when use_reasoning=false (object_point target order, no <think> block)
+    Object: <obj_KKK>
+  # Used when use_reasoning=false (point_object target order, no <think> block)
   prompt_text_direct: |
     The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
     Predict the gaze point and the object at that point.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
     Return exactly:
-    Object: <obj_KKK>
     Point: <loc_NNN><loc_MMM>
+    Object: <obj_KKK>
 
 model:
   coord_bins: 128
@@ -109,6 +110,7 @@ loss:
   loss_object_weight: 1.0
   loss_format_weight: 0.2
   loss_reasoning_weight: 0.05
+  gaussian_point_sigma: 7.0   # Gaussian soft-label CE sigma (bins). 0.0 = hard CE.
 
 wandb:
   enabled: true

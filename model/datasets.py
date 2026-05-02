@@ -440,7 +440,7 @@ class MultiViewGazeDataset(Dataset):
                             max_chars=self.max_reasoning_chars,
                         )
             if reasoning_text:
-                target_order = "reasoning_object_point"
+                target_order = "reasoning_point_object"
                 prompt_text = self.prompt_text_reasoning
             else:
                 # Malformed or missing content → treat as direct view
@@ -452,7 +452,7 @@ class MultiViewGazeDataset(Dataset):
                 scene=scene, gaze_x=gaze_x, gaze_y=gaze_y, bbox_px=bbox_px,
             )
             reasoning_text = None
-            target_order = "object_point"
+            target_order = "point_object"
             prompt_text = self.prompt_text_direct
 
         w, h = scene.size

@@ -82,6 +82,49 @@ def masked_sample_exact_rate(
     return rate, n_valid_samples
 
 
+def gaussian_soft_label_ce(
+    logits_at_pt: torch.Tensor,
+    gt_loc_ids: torch.Tensor,
+    loc_token_ids: torch.Tensor,
+    sigma: float = 7.0,
+) -> torch.Tensor:
+    """Gaussian soft-label CE over coordinate bins.
+
+    Each loc token is treated as a bin; bins near the GT bin receive
+    partial credit proportional to a Gaussian centered at the GT bin.
+    log_softmax is computed over the full vocabulary; only the C loc
+    token positions contribute to the loss.
+
+    Args:
+        logits_at_pt:  [N, V] logits at the N point-token positions.
+        gt_loc_ids:    [N]    GT loc token vocab IDs for each position.
+        loc_token_ids: [C]    All loc vocab IDs in bin order (C = coord_bins).
+        sigma:         Gaussian width in bin units.
+    Returns:
+        Scalar loss.
+    """
+    C = int(loc_token_ids.shape[0])
+    N = int(logits_at_pt.shape[0])
+    if N <= 0 or C <= 0:
+        return torch.zeros((), device=logits_at_pt.device, dtype=logits_at_pt.dtype)
+
+    loc_ids_dev = loc_token_ids.to(device=logits_at_pt.device)
+    gt_ids_dev = gt_loc_ids.to(device=logits_at_pt.device)
+
+    # GT bin index (0..C-1) for each of the N positions
+    gt_bin = (gt_ids_dev.unsqueeze(1) == loc_ids_dev.unsqueeze(0)).long().argmax(dim=1)  # [N]
+
+    # Gaussian soft labels [N, C]
+    k = torch.arange(C, device=logits_at_pt.device, dtype=logits_at_pt.dtype)
+    diff = k.unsqueeze(0) - gt_bin.to(dtype=logits_at_pt.dtype).unsqueeze(1)  # [N, C]
+    soft = torch.exp(-0.5 * diff ** 2 / (float(sigma) ** 2))
+    soft = soft / soft.sum(dim=1, keepdim=True)  # [N, C], sums to 1
+
+    # log_softmax over full vocab, then slice to loc token positions only
+    log_p = F.log_softmax(logits_at_pt, dim=-1)[:, loc_ids_dev]  # [N, C]
+    return -(soft * log_p).sum(dim=-1).mean()
+
+
 def compute_structured_loss(
     *,
     logits: torch.Tensor | None,
@@ -95,6 +138,8 @@ def compute_structured_loss(
     weight_format: float = 0.25,
     weight_reasoning: float = 0.3,
     compute_format_rate: bool = False,
+    loc_token_ids: torch.Tensor | None = None,
+    gaussian_sigma: float = 0.0,
 ) -> dict[str, Any]:
     """Compute L_SFT = w_p*L_point + w_o*L_object + w_f*L_format + w_r*L_reasoning.
 
@@ -169,7 +214,23 @@ def compute_structured_loss(
                 return z
             return ce_valid[cat_valid[valid_union]].mean()
 
-        l_pt  = _cat_mean(pt_valid,  n_pt)
+        # Point loss: Gaussian soft-label CE when loc_token_ids and sigma are provided,
+        # otherwise fall back to standard hard CE.
+        if (
+            loc_token_ids is not None
+            and float(gaussian_sigma) > 0.0
+            and n_pt > 0
+        ):
+            pt_in_union = pt_valid[valid_union]           # [N_valid] bool
+            l_pt = gaussian_soft_label_ce(
+                shift_logits[valid_union][pt_in_union],   # [N_pt, V]
+                shift_labels[valid_union][pt_in_union],   # [N_pt]
+                loc_token_ids.to(device=device),
+                sigma=float(gaussian_sigma),
+            )
+        else:
+            l_pt = _cat_mean(pt_valid, n_pt)
+
         l_obj = _cat_mean(obj_valid, n_obj)
         l_fmt = _cat_mean(fmt_valid, n_fmt)
         l_rsn = _cat_mean(rsn_valid, n_rsn)
@@ -223,6 +284,8 @@ def compute_answer_loss(
     weight_format: float = 0.25,
     weight_reasoning: float = 0.3,
     compute_format_rate: bool = False,
+    loc_token_ids: torch.Tensor | None = None,
+    gaussian_sigma: float = 0.0,
 ) -> dict[str, Any]:
     """Compute structured SFT loss when structured masks are present,
     else fall back to full-answer CE (legacy).
@@ -256,6 +319,8 @@ def compute_answer_loss(
             weight_format=float(weight_format),
             weight_reasoning=float(weight_reasoning),
             compute_format_rate=compute_format_rate,
+            loc_token_ids=loc_token_ids,
+            gaussian_sigma=float(gaussian_sigma),
         )
         d["loss_answer"] = d["loss"]
         d["n_answer_tokens"] = (

@@ -196,6 +196,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 1.0)))
     p.add_argument("--loss_format_weight", type=float, default=float(default_value(d, "loss_format_weight", 0.25)))
     p.add_argument("--loss_reasoning_weight", type=float, default=float(default_value(d, "loss_reasoning_weight", 0.3)))
+    p.add_argument("--gaussian_point_sigma", type=float, default=float(default_value(d, "gaussian_point_sigma", 0.0)))
 
     # --- RL (disabled by default) ---
     p.add_argument("--rl_enabled", dest="rl_enabled", action="store_true")

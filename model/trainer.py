@@ -21,7 +21,7 @@ warnings.filterwarnings(
 
 
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
     AutoModelForImageTextToText,
@@ -60,7 +60,7 @@ from .utils.eval_utils import (
     run_test_metrics,
 )
 from .utils.gaze_tokens import parse_structured_output_text, register_gaze_special_tokens
-from .utils.loss_utils import compute_answer_loss
+from .utils.loss_utils import compute_answer_loss, masked_sample_exact_rate
 from .utils.processor_collate import (
     QwenRLCollator,
     QwenTestCollator,
@@ -1204,6 +1204,17 @@ def main() -> None:
         f"(added loc tokens: {coord_bins}, obj tokens: {num_classes}, fmt tokens: 0)"
     )
 
+    # Build ordered loc_token_ids tensor for Gaussian soft-label CE.
+    # Entries are the vocab IDs of <loc_000>..<loc_{coord_bins-1}> in bin order.
+    from .utils.gaze_tokens import format_loc_token, _loc_token_width
+    _lw = _loc_token_width(coord_bins)
+    _loc_id_list = [int(token_id_map.get(format_loc_token(b, _lw), -1)) for b in range(coord_bins)]
+    loc_token_ids_tensor: torch.Tensor | None = (
+        torch.tensor(_loc_id_list, dtype=torch.long)
+        if all(i >= 0 for i in _loc_id_list) else None
+    )
+    gaussian_point_sigma = float(getattr(args, "gaussian_point_sigma", 0.0))
+
     if bool(getattr(args, "test_only", False)):
         print("[INFO] test_only=True; skipping train/val loading and training.")
         start_time = time.time()
@@ -1438,7 +1449,7 @@ def main() -> None:
     # use_reasoning=False must guarantee no reasoning scaffold in any dataset.
     # target_order and force flags from config are irrelevant when reasoning is off.
     if not bool(getattr(args, "use_reasoning", False)):
-        _target_order = "object_point"
+        _target_order = "point_object"
         _force_train = False
         _force_eval = False
 
@@ -1469,8 +1480,7 @@ def main() -> None:
         n_direct, n_reasoning = train_ds.get_view_counts()
         print(
             f"[INFO] MultiViewGazeDataset: n_direct={n_direct} n_reasoning={n_reasoning} "
-            f"total_views={len(train_ds)} direct_ratio={_direct_view_ratio:.2f} "
-            f"reasoning_ratio={_reasoning_view_ratio:.2f}"
+            f"total_views={len(train_ds)} full_dual_view=True"
         )
     else:
         train_ds = GazeDataset(
@@ -1539,19 +1549,10 @@ def main() -> None:
     _persistent = _nw > 0
     _prefetch = 2 if _nw > 0 else None
 
+    # Full dual-view training: all 217,910 views shuffled each epoch.
+    # WeightedRandomSampler (ratio-based subsampling) is intentionally removed
+    # so every direct AND reasoning view is seen once per epoch.
     _train_sampler = None
-    if _use_multiview and isinstance(train_ds, MultiViewGazeDataset):
-        n_direct, n_reasoning = train_ds.get_view_counts()
-        if n_direct > 0 and n_reasoning > 0:
-            weights: list[float] = (
-                [_direct_view_ratio / float(n_direct)] * n_direct
-                + [_reasoning_view_ratio / float(n_reasoning)] * n_reasoning
-            )
-            _train_sampler = WeightedRandomSampler(
-                weights=weights,
-                num_samples=len(train_records),
-                replacement=True,
-            )
 
     train_loader = DataLoader(
         train_ds,
@@ -1890,6 +1891,11 @@ def main() -> None:
                     weight_format=loss_weights["format"],
                     weight_reasoning=loss_weights["reasoning"],
                     compute_format_rate=_compute_fmt_rate,
+                    loc_token_ids=(
+                        loc_token_ids_tensor.to(device)
+                        if loc_token_ids_tensor is not None else None
+                    ),
+                    gaussian_sigma=gaussian_point_sigma,
                 )
                 raw_loss = losses["loss"]
                 loss = raw_loss / float(max(current_accum_steps, 1))
@@ -1928,6 +1934,32 @@ def main() -> None:
                         _n_batch = max(len(_view_types), 1)
                         _n_direct_batch = sum(1 for v in _view_types if v == "direct")
                         _n_rsn_batch = sum(1 for v in _view_types if v == "reasoning")
+
+                        # Per-view-type FormatValidRate.
+                        # out["logits"] tensor is still alive after backward (graph freed,
+                        # tensor ref kept). masked_sample_exact_rate uses argmax only.
+                        _fmt_rate_direct = 0.0
+                        _fmt_rate_rsn = 0.0
+                        if _compute_fmt_rate and _view_types:
+                            _logits_det = out["logits"].detach()
+                            _fmt_mask = batch.get("loss_mask_format")
+                            if torch.is_tensor(_fmt_mask):
+                                with torch.no_grad():
+                                    _d_idx = [i for i, v in enumerate(_view_types) if v == "direct"]
+                                    _r_idx = [i for i, v in enumerate(_view_types) if v == "reasoning"]
+                                    if _d_idx:
+                                        _di = torch.tensor(_d_idx, device=device)
+                                        _r_direct, _ = masked_sample_exact_rate(
+                                            _logits_det[_di], labels[_di], _fmt_mask[_di],
+                                        )
+                                        _fmt_rate_direct = float(_r_direct.item())
+                                    if _r_idx:
+                                        _ri = torch.tensor(_r_idx, device=device)
+                                        _r_rsn, _ = masked_sample_exact_rate(
+                                            _logits_det[_ri], labels[_ri], _fmt_mask[_ri],
+                                        )
+                                        _fmt_rate_rsn = float(_r_rsn.item())
+
                         wandb_run.log(
                             {
                                 "train/loss": float(raw_loss.detach().item()),
@@ -1937,6 +1969,8 @@ def main() -> None:
                                 "train/loss_reasoning": float(losses.get("loss_reasoning", losses["loss_format"] * 0).detach().item()),
                                 "train/n_reasoning_tokens": int(losses.get("n_reasoning_tokens", 0)),
                                 "train/FormatValidRate": float(losses["format_valid_rate"].detach().item()),
+                                "train/FormatValidRate_direct": _fmt_rate_direct,
+                                "train/FormatValidRate_reasoning": _fmt_rate_rsn,
                                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "train/grad_norm": grad_norm_value,
                                 "train/epoch": epoch_progress,

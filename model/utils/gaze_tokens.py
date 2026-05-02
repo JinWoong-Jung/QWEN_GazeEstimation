@@ -41,12 +41,22 @@ _STRICT_RE_OBJ_FIRST = re.compile(
     re.DOTALL,
 )
 
-# Flat reasoning-first: "Reasoning: ...\nObject: <obj_K>\nPoint: <loc_X><loc_Y>"
+# Flat reasoning-first (object then point): "Reasoning: ...\nObject: <obj_K>\nPoint: <loc_X><loc_Y>"
 # Groups: 1=obj, 2=loc_x, 3=loc_y
 _STRICT_RE_REASONING_FIRST = re.compile(
     r"^\s*Reasoning:.*?"
     r"\s*Object:\s*(<obj_\d+>|<obj_unknown>)"
     r"\s*Point:\s*(<loc_\d+>)(<loc_\d+>)"
+    r"\s*(?:<\|im_end\|>)?\s*$",
+    re.DOTALL,
+)
+
+# Flat reasoning-first (point then object): "Reasoning: ...\nPoint: <loc_X><loc_Y>\nObject: <obj_K>"
+# Groups: 1=loc_x, 2=loc_y, 3=obj
+_STRICT_RE_REASONING_POINT_OBJ = re.compile(
+    r"^\s*Reasoning:.*?"
+    r"\s*Point:\s*(<loc_\d+>)(<loc_\d+>)"
+    r"\s*Object:\s*(<obj_\d+>|<obj_unknown>)"
     r"\s*(?:<\|im_end\|>)?\s*$",
     re.DOTALL,
 )
@@ -161,6 +171,7 @@ def build_structured_target_text(
       "point_object"           — Point → Object  (legacy)
       "point_object_reasoning" — Point → Object → Reasoning  (legacy post-hoc)
       "reasoning_object_point" — Reasoning → Object → Point  (causal reasoning)
+      "reasoning_point_object" — Reasoning → Point → Object  (point-first causal)
     """
     coord_n = int(coord_bins)
     bx = quantize_coord(float(point_x), bins=coord_n)
@@ -183,6 +194,13 @@ def build_structured_target_text(
             content_line = f"{REASONING_PREFIX} {reasoning_body}" if reasoning_body else REASONING_PREFIX
             return f"{content_line}\n{object_str}\n{point_str}"
         return f"{object_str}\n{point_str}"
+
+    if order == "reasoning_point_object":
+        reasoning_body = normalize_reasoning_text(str(reasoning_text or "").strip())
+        if reasoning_body or bool(force_reasoning_format):
+            content_line = f"{REASONING_PREFIX} {reasoning_body}" if reasoning_body else REASONING_PREFIX
+            return f"{content_line}\n{point_str}\n{object_str}"
+        return f"{point_str}\n{object_str}"
 
     if order == "point_object_reasoning":
         base = f"{point_str}\n{object_str}"
@@ -314,12 +332,13 @@ def parse_structured_output_text(
     num_classes: int,
     coord_bins: int = COORD_BINS,
 ) -> dict:
-    """Parse generated text, accepting all four target orders.
+    """Parse generated text, accepting all target orders.
 
     Tries patterns in priority order:
-      1. object_point          Object → Point
-      2. reasoning_object_point  Reasoning → Object → Point
-      3. point_object / point_object_reasoning  (legacy)
+      1. object_point              Object → Point
+      2. reasoning_point_object    Reasoning → Point → Object  (point-first causal)
+      3. reasoning_object_point    Reasoning → Object → Point
+      4. point_object / point_object_reasoning  (legacy)
     """
     s = str(text or "").strip()
     coord_n = int(coord_bins)
@@ -339,6 +358,12 @@ def parse_structured_output_text(
     m = _STRICT_RE_OBJ_FIRST.match(s)
     if m is not None:
         return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    # reasoning_point_object: "Reasoning: ...\nPoint: ...\nObject: ..."  groups x=1, y=2, obj=3
+    m = _STRICT_RE_REASONING_POINT_OBJ.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=3, x_group=1, y_group=2,
                                    num_classes=num_classes, coord_bins=coord_n)
 
     # flat reasoning_object_point: "Reasoning: ...\nObject: ...\nPoint: ..."
