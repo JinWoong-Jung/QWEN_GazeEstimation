@@ -7,8 +7,13 @@ from model.utils.gaze_tokens import (
     ANSWER_START,
     COORD_BINS,
     GAZE_OBJ_UNKNOWN,
+    GAZE_OBJECT_MARKER,
+    GAZE_POINT_MARKER,
+    GAZE_REASONING_MARKER,
+    GAZE_SCHEMA_MARKERS,
     OBJECT_PREFIX,
     POINT_PREFIX,
+    REASONING_START,
     build_gaze_special_tokens,
     build_structured_target_text,
     dequantize_coord,
@@ -29,7 +34,6 @@ class TestQuantize(unittest.TestCase):
 
     def test_midpoint(self):
         b = quantize_coord(0.5)
-        # 0.5*999 = 499.5 → rounds to 500 → 500/999 ≈ 0.5005, within 2 decimal places
         self.assertAlmostEqual(dequantize_coord(b), 0.5, places=2)
 
     def test_roundtrip_arbitrary(self):
@@ -65,18 +69,23 @@ class TestFormatTokens(unittest.TestCase):
 
     def test_obj_token_width_auto(self):
         from model.utils.gaze_tokens import _obj_token_width
-        self.assertEqual(_obj_token_width(158), 3)   # max ID 157 → 3 digits
-        self.assertEqual(_obj_token_width(1000), 3)  # max ID 999 → 3 digits
-        self.assertEqual(_obj_token_width(1001), 4)  # max ID 1000 → 4 digits
-        self.assertEqual(_obj_token_width(10001), 5) # max ID 10000 → 5 digits
+        self.assertEqual(_obj_token_width(158), 3)
+        self.assertEqual(_obj_token_width(1000), 3)
+        self.assertEqual(_obj_token_width(1001), 4)
+        self.assertEqual(_obj_token_width(10001), 5)
 
 
 class TestBuildSpecialTokens(unittest.TestCase):
     def test_token_count(self):
         num_classes = 158
         tokens = build_gaze_special_tokens(num_classes)
-        # 1000 loc + 158 obj + 1 unknown obj
-        self.assertEqual(len(tokens), 1000 + 158 + 1)
+        # 3 schema markers + 1000 loc + 158 obj + 1 unknown
+        self.assertEqual(len(tokens), 3 + 1000 + 158 + 1)
+
+    def test_schema_markers_present(self):
+        tokens = build_gaze_special_tokens(10)
+        for marker in GAZE_SCHEMA_MARKERS:
+            self.assertIn(marker, tokens, f"schema marker {marker!r} missing")
 
     def test_loc_tokens_range(self):
         tokens = build_gaze_special_tokens(10)
@@ -103,22 +112,30 @@ class TestBuildStructuredTargetText(unittest.TestCase):
         t = build_structured_target_text(0.5, 0.5, 10, 100)
         self.assertIsInstance(t, str)
 
-    def test_starts_ends_with_format_tokens(self):
+    def test_contains_gaze_point_marker(self):
         t = build_structured_target_text(0.3, 0.7, 5, 100)
-        self.assertIn(POINT_PREFIX, t)
-        self.assertIn(OBJECT_PREFIX, t)
-        # ANSWER_START is now empty; ANSWER_END (<|im_end|>) is the chat-template
-        # EOS added by the template, not part of the target text itself.
+        self.assertIn(GAZE_POINT_MARKER, t)
+
+    def test_contains_gaze_object_marker(self):
+        t = build_structured_target_text(0.3, 0.7, 5, 100)
+        self.assertIn(GAZE_OBJECT_MARKER, t)
+
+    def test_no_trailing_im_end(self):
+        t = build_structured_target_text(0.3, 0.7, 5, 100)
         self.assertFalse(t.startswith("<|im_start|>"))
         self.assertFalse(t.endswith("<|im_end|>"))
+
+    def test_no_newlines_in_direct(self):
+        t = build_structured_target_text(0.3, 0.7, 5, 100)
+        self.assertNotIn("\n", t)
 
     def test_contains_obj_token(self):
         t = build_structured_target_text(0.0, 0.0, 42, 100)
         self.assertIn("<obj_042>", t)
 
     def test_contains_two_loc_tokens_and_one_obj_token(self):
-        t = build_structured_target_text(0.5, 0.5, 0, 100)
         import re
+        t = build_structured_target_text(0.5, 0.5, 0, 100)
         tokens = re.findall(r"<[^>]+>", t)
         self.assertEqual(sum(1 for tok in tokens if tok.startswith("<loc_")), 2)
         self.assertEqual(sum(1 for tok in tokens if tok.startswith("<obj_")), 1)
@@ -130,6 +147,58 @@ class TestBuildStructuredTargetText(unittest.TestCase):
     def test_custom_coord_bins(self):
         t = build_structured_target_text(1.0, 0.0, 7, 100, coord_bins=128)
         self.assertIn("<loc_127><loc_000>", t)
+
+    def test_direct_point_object_exact_format(self):
+        """New schema: point_object produces <|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>."""
+        t = build_structured_target_text(0.5, 0.5, 10, 100, target_order="point_object")
+        bx = quantize_coord(0.5)
+        by = quantize_coord(0.5)
+        expected = f"{GAZE_POINT_MARKER}{format_loc_token(bx)}{format_loc_token(by)}{GAZE_OBJECT_MARKER}<obj_010>"
+        self.assertEqual(t, expected)
+
+    def test_direct_object_point_exact_format(self):
+        """New schema: object_point produces <|gaze_object|><obj_k><|gaze_point|><loc_x><loc_y>."""
+        t = build_structured_target_text(0.5, 0.5, 10, 100, target_order="object_point")
+        bx = quantize_coord(0.5)
+        by = quantize_coord(0.5)
+        expected = f"{GAZE_OBJECT_MARKER}<obj_010>{GAZE_POINT_MARKER}{format_loc_token(bx)}{format_loc_token(by)}"
+        self.assertEqual(t, expected)
+
+    def test_reasoning_point_object_exact_format(self):
+        """New schema: reasoning_point_object produces <|gaze_reasoning|>...<|gaze_point|>...<|gaze_object|>..."""
+        t = build_structured_target_text(
+            0.5, 0.5, 10, 100,
+            target_order="reasoning_point_object",
+            reasoning_text="Looking at the TV.",
+        )
+        self.assertTrue(t.startswith(GAZE_REASONING_MARKER))
+        self.assertIn(GAZE_POINT_MARKER, t)
+        self.assertIn(GAZE_OBJECT_MARKER, t)
+        rsn_end = t.index(GAZE_POINT_MARKER)
+        self.assertIn("Looking at the TV.", t[:rsn_end])
+        self.assertLess(t.index(GAZE_POINT_MARKER), t.index(GAZE_OBJECT_MARKER))
+        self.assertNotIn("\n", t)
+
+    def test_reasoning_object_point_exact_format(self):
+        """New schema: reasoning_object_point produces <|gaze_reasoning|>...<|gaze_object|>...<|gaze_point|>..."""
+        t = build_structured_target_text(
+            0.5, 0.5, 10, 100,
+            target_order="reasoning_object_point",
+            reasoning_text="Looking at the TV.",
+        )
+        self.assertTrue(t.startswith(GAZE_REASONING_MARKER))
+        self.assertIn(GAZE_OBJECT_MARKER, t)
+        self.assertIn(GAZE_POINT_MARKER, t)
+        self.assertLess(t.index(GAZE_OBJECT_MARKER), t.index(GAZE_POINT_MARKER))
+        self.assertNotIn("\n", t)
+
+    def test_no_space_between_markers_and_content(self):
+        """Markers must be immediately adjacent to their content (no space/newline)."""
+        t = build_structured_target_text(0.5, 0.5, 10, 100, target_order="point_object")
+        # <|gaze_point|> is followed immediately by <loc_...>
+        pt_idx = t.index(GAZE_POINT_MARKER)
+        after_pt = t[pt_idx + len(GAZE_POINT_MARKER)]
+        self.assertEqual(after_pt, "<", "No space/newline between marker and loc token")
 
 
 class TestParseStructuredOutputText(unittest.TestCase):
@@ -165,6 +234,7 @@ class TestParseStructuredOutputText(unittest.TestCase):
         self.assertEqual(p["point_xy"], (1.0, 0.0))
 
     def test_custom_coord_bins_out_of_range(self):
+        # Manually construct legacy text with loc_128 out of range for 128-bin vocab
         t = (
             f"{ANSWER_START}"
             f"{POINT_PREFIX} "
@@ -206,8 +276,6 @@ class TestParseStructuredOutputText(unittest.TestCase):
         self.assertTrue(p["has_extra_text"])
 
     def test_object_id_out_of_range(self):
-        # manually construct text with obj_id = num_classes (out of range)
-        from model.utils.gaze_tokens import format_loc_token, format_obj_token
         t = (
             f"{POINT_PREFIX} "
             f"{format_loc_token(0)}"
@@ -239,17 +307,46 @@ class TestParseStructuredOutputText(unittest.TestCase):
         self.assertAlmostEqual(px, 0.423, delta=0.002)
         self.assertAlmostEqual(py, 0.612, delta=0.002)
 
+    def test_new_direct_object_point_valid(self):
+        """ST object_point schema is parsed as valid_format=True."""
+        t = f"{GAZE_OBJECT_MARKER}<obj_007>{GAZE_POINT_MARKER}<loc_499><loc_299>"
+        p = parse_structured_output_text(t, 100)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 7)
+
+    def test_new_direct_point_object_valid(self):
+        """ST point_object schema is parsed as valid_format=True."""
+        t = f"{GAZE_POINT_MARKER}<loc_499><loc_299>{GAZE_OBJECT_MARKER}<obj_007>"
+        p = parse_structured_output_text(t, 100)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 7)
+
+    def test_new_reasoning_object_point_valid(self):
+        """ST reasoning_object_point schema is parsed as valid_format=True."""
+        t = f"{GAZE_REASONING_MARKER}Looking at TV.{GAZE_OBJECT_MARKER}<obj_007>{GAZE_POINT_MARKER}<loc_499><loc_299>"
+        p = parse_structured_output_text(t, 100)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 7)
+
+    def test_new_reasoning_point_object_valid(self):
+        """ST reasoning_point_object schema is parsed as valid_format=True."""
+        t = f"{GAZE_REASONING_MARKER}Looking at TV.{GAZE_POINT_MARKER}<loc_499><loc_299>{GAZE_OBJECT_MARKER}<obj_007>"
+        p = parse_structured_output_text(t, 100)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 7)
+
 
 class TestTargetOrders(unittest.TestCase):
-    """Verify build_structured_target_text and parser round-trip for all four orders."""
+    """Verify build_structured_target_text and parser round-trip for all orders."""
 
     def _parse(self, text: str) -> dict:
         return parse_structured_output_text(text, 100)
 
-    # --- object_point (new default) ---
+    # --- object_point (default) ---
     def test_object_point_order(self):
         t = build_structured_target_text(0.5, 0.3, 7, 100, target_order="object_point")
-        self.assertTrue(t.index(OBJECT_PREFIX) < t.index(POINT_PREFIX))
+        # New schema: <|gaze_object|> before <|gaze_point|>
+        self.assertLess(t.index(GAZE_OBJECT_MARKER), t.index(GAZE_POINT_MARKER))
         p = self._parse(t)
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["object_id"], 7)
@@ -264,17 +361,17 @@ class TestTargetOrders(unittest.TestCase):
 
     # --- reasoning_object_point ---
     def test_reasoning_object_point_order(self):
-        from model.utils.gaze_tokens import REASONING_PREFIX
         t = build_structured_target_text(
             0.5, 0.5, 10, 100,
             target_order="reasoning_object_point",
             reasoning_text="The person looks at the screen.",
         )
-        # New flat format: "Reasoning: <text>\nObject: ...\nPoint: ..."
+        # New schema: no legacy <think> tags, uses <|gaze_reasoning|> marker
         self.assertNotIn("<think>", t)
-        rsn_pos = t.index(REASONING_PREFIX)
-        obj_pos = t.index(OBJECT_PREFIX)
-        pt_pos = t.index(POINT_PREFIX)
+        self.assertNotIn("Reasoning:", t)
+        rsn_pos = t.index(GAZE_REASONING_MARKER)
+        obj_pos = t.index(GAZE_OBJECT_MARKER)
+        pt_pos  = t.index(GAZE_POINT_MARKER)
         self.assertLess(rsn_pos, obj_pos)
         self.assertLess(obj_pos, pt_pos)
         p = self._parse(t)
@@ -283,52 +380,55 @@ class TestTargetOrders(unittest.TestCase):
 
     def test_reasoning_object_point_no_reasoning_falls_back_to_object_point(self):
         t = build_structured_target_text(0.5, 0.5, 5, 100, target_order="reasoning_object_point")
-        # No reasoning text → falls back to object_point (no <think> block)
+        # No reasoning text → falls back to direct object_point (no reasoning marker)
         self.assertNotIn("<think>", t)
-        self.assertTrue(t.index(OBJECT_PREFIX) < t.index(POINT_PREFIX))
+        self.assertNotIn(GAZE_REASONING_MARKER, t)
+        self.assertLess(t.index(GAZE_OBJECT_MARKER), t.index(GAZE_POINT_MARKER))
         p = self._parse(t)
         self.assertTrue(p["valid_format"])
 
     def test_reasoning_object_point_forced_empty(self):
-        from model.utils.gaze_tokens import REASONING_PREFIX
         t = build_structured_target_text(
             0.5, 0.5, 3, 100,
             target_order="reasoning_object_point",
             force_reasoning_format=True,
         )
-        # New flat format: no <think> wrapper, just "Reasoning:\nObject: ...\nPoint: ..."
+        # force=True with empty body → reasoning marker present, no content between markers
         self.assertNotIn("<think>", t)
-        self.assertNotIn("</think>", t)
-        self.assertIn(REASONING_PREFIX, t)
+        self.assertIn(GAZE_REASONING_MARKER, t)
         p = self._parse(t)
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["object_id"], 3)
 
-    # --- point_object (legacy) ---
+    # --- point_object ---
     def test_point_object_order(self):
         t = build_structured_target_text(0.5, 0.3, 7, 100, target_order="point_object")
-        self.assertTrue(t.index(POINT_PREFIX) < t.index(OBJECT_PREFIX))
+        # New schema: <|gaze_point|> before <|gaze_object|>
+        self.assertLess(t.index(GAZE_POINT_MARKER), t.index(GAZE_OBJECT_MARKER))
         p = self._parse(t)
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["object_id"], 7)
 
-    # --- point_object_reasoning (legacy post-hoc) ---
+    # --- point_object_reasoning (legacy post-hoc, keep old text format) ---
     def test_point_object_reasoning_order(self):
-        from model.utils.gaze_tokens import REASONING_START
         t = build_structured_target_text(
             0.5, 0.5, 2, 100,
             target_order="point_object_reasoning",
             reasoning_text="Some reason.",
         )
+        # Legacy format still uses "Point:" / "Object:" text prefix + <think> block
         self.assertLess(t.index(POINT_PREFIX), t.index(OBJECT_PREFIX))
         self.assertLess(t.index(OBJECT_PREFIX), t.index(REASONING_START))
         p = self._parse(t)
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["object_id"], 2)
 
-    # --- parser: masks disjoint, all orders accepted ---
+    # --- parser: all orders accepted ---
     def test_parser_accepts_all_orders(self):
-        orders = ["object_point", "reasoning_object_point", "point_object", "point_object_reasoning"]
+        orders = [
+            "object_point", "reasoning_object_point",
+            "point_object", "point_object_reasoning", "reasoning_point_object",
+        ]
         for order in orders:
             t = build_structured_target_text(
                 0.4, 0.6, 15, 100,
@@ -347,6 +447,14 @@ class TestTargetOrders(unittest.TestCase):
         p = parse_structured_output_text("Point: <loc_500><loc_500>", 100)
         self.assertFalse(p["valid_format"])
 
+    def test_parser_rejects_new_schema_missing_point(self):
+        p = parse_structured_output_text(f"{GAZE_OBJECT_MARKER}<obj_010>", 100)
+        self.assertFalse(p["valid_format"])
+
+    def test_parser_rejects_new_schema_missing_object(self):
+        p = parse_structured_output_text(f"{GAZE_POINT_MARKER}<loc_500><loc_500>", 100)
+        self.assertFalse(p["valid_format"])
+
 
 class TestSafeAugmentation(unittest.TestCase):
     """Verify apply_safe_augmentation applies no spatial transforms."""
@@ -355,16 +463,13 @@ class TestSafeAugmentation(unittest.TestCase):
         from model.utils.data_utils import apply_safe_augmentation
         import random
         from PIL import Image
-        # Deterministic seed: safe aug uses random for color jitter probability.
         random.seed(0)
         img = Image.new("RGB", (512, 512), color=(128, 128, 128))
         gaze_x, gaze_y = 0.3, 0.7
         bbox = (100.0, 100.0, 200.0, 200.0)
         out_img, out_x, out_y, out_bbox = apply_safe_augmentation(img, gaze_x, gaze_y, bbox)
-        # Coords must be unchanged (no crop/flip)
         self.assertAlmostEqual(out_x, gaze_x, places=6)
         self.assertAlmostEqual(out_y, gaze_y, places=6)
-        # Bbox should be clamped/unchanged in safe aug
         self.assertEqual(out_img.size, (512, 512))
 
 

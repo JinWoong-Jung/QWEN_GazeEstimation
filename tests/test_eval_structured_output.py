@@ -4,10 +4,12 @@ import math
 import unittest
 
 from model.utils.gaze_tokens import (
+    GAZE_OBJECT_MARKER,
+    GAZE_POINT_MARKER,
     build_structured_target_text,
     parse_structured_output_text,
 )
-from model.utils.eval_utils import l2_stats, valid_label_ids
+from model.utils.eval_utils import decode_generated, l2_stats, valid_label_ids
 import torch
 
 
@@ -47,6 +49,36 @@ class TestParseInEvalContext(unittest.TestCase):
         p = parse_structured_output_text(pred, self.NUM_CLASSES)
         self.assertFalse(p["valid_format"])
         self.assertTrue(p["has_extra_text"])
+
+    def test_decode_generated_preserves_gaze_schema_markers_for_parse(self):
+        class _Tok:
+            id2tok = {
+                10: GAZE_POINT_MARKER,
+                11: "<loc_299>",
+                12: "<loc_699>",
+                13: GAZE_OBJECT_MARKER,
+                14: "<obj_005>",
+                15: "<|im_end|>",
+                16: "<|endoftext|>",
+            }
+
+            def decode(self, ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return "".join(self.id2tok[int(i)] for i in ids)
+
+        class _Proc:
+            tokenizer = _Tok()
+
+        input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        generated_ids = torch.tensor([[1, 2, 3, 10, 11, 12, 13, 14, 15, 16]], dtype=torch.long)
+        pred = decode_generated(_Proc(), generated_ids, input_ids, attention_mask=None)[0]
+
+        self.assertIn(GAZE_POINT_MARKER, pred)
+        self.assertIn(GAZE_OBJECT_MARKER, pred)
+        self.assertNotIn("<|endoftext|>", pred)
+        parsed = parse_structured_output_text(pred, self.NUM_CLASSES)
+        self.assertTrue(parsed["valid_format"])
+        self.assertEqual(parsed["object_id"], 5)
 
 
 class TestMetricCalculations(unittest.TestCase):

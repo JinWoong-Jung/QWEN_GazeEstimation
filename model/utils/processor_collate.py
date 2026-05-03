@@ -10,6 +10,9 @@ from .common import chat_text
 from .gaze_tokens import (
     ANSWER_END,
     GAZE_OBJ_UNKNOWN,
+    GAZE_REASONING_MARKER,
+    GAZE_POINT_MARKER,
+    GAZE_OBJECT_MARKER,
     REASONING_START,
     REASONING_END,
 )
@@ -140,10 +143,13 @@ def build_structured_masks(
     if tokenizer is None:
         return mask_pt, mask_obj, mask_fmt, mask_rsn
 
-    # Pre-compute boundary token id sequences for <think> / </think> / "Reasoning:".
+    # Pre-compute boundary token id sequences for all schema formats.
     think_start_ids: list[int] = []
     think_end_ids: list[int] = []
     reasoning_label_ids: list[int] = []
+    gaze_rsn_ids: list[int] = []
+    gaze_pt_ids: list[int] = []
+    gaze_obj_ids: list[int] = []
     if hasattr(tokenizer, "__call__"):
         def _tok_ids(s: str) -> list[int]:
             out = tokenizer(s, add_special_tokens=False, return_attention_mask=False)
@@ -152,6 +158,9 @@ def build_structured_masks(
         think_start_ids = _tok_ids(REASONING_START)
         think_end_ids   = _tok_ids(REASONING_END)
         reasoning_label_ids = _tok_ids("Reasoning:")
+        gaze_rsn_ids = _tok_ids(GAZE_REASONING_MARKER)
+        gaze_pt_ids  = _tok_ids(GAZE_POINT_MARKER)
+        gaze_obj_ids = _tok_ids(GAZE_OBJECT_MARKER)
 
     # Batch tokenize all target texts once (1 call instead of bsz calls).
     raw_out = tokenizer(
@@ -187,10 +196,30 @@ def build_structured_masks(
         # Detect reasoning block span within ans_ids (offset indices).
         rsn_content_offsets: set[int] = set()
 
+        # New special-token schema: <|gaze_reasoning|> marker
+        gaze_rsn_pos = find_subseq(ans_ids, gaze_rsn_ids, from_right=False) if gaze_rsn_ids else -1
+
         ts_pos = find_subseq(ans_ids, think_start_ids, from_right=False) if think_start_ids else -1
         rl_pos = find_subseq(ans_ids, reasoning_label_ids, from_right=False) if reasoning_label_ids else -1
 
-        if ts_pos >= 0 and think_end_ids and (rl_pos < 0 or ts_pos < rl_pos):
+        if gaze_rsn_pos >= 0:
+            # New special-token schema: content is between <|gaze_reasoning|> and
+            # the next <|gaze_point|> or <|gaze_object|> marker (whichever comes first).
+            content_start = gaze_rsn_pos + len(gaze_rsn_ids)
+            content_end = len(ans_ids)
+            for marker_ids in (gaze_pt_ids, gaze_obj_ids):
+                if not marker_ids:
+                    continue
+                m_len = len(marker_ids)
+                for ci in range(content_start, len(ans_ids) - m_len + 1):
+                    if ans_ids[ci : ci + m_len] == marker_ids:
+                        if ci < content_end:
+                            content_end = ci
+                        break
+            for off in range(content_start, content_end):
+                rsn_content_offsets.add(off)
+
+        elif ts_pos >= 0 and think_end_ids and (rl_pos < 0 or ts_pos < rl_pos):
             # Legacy <think>...</think> format.
             te_pos = find_subseq(ans_ids, think_end_ids, from_right=False)
             if te_pos > ts_pos:
@@ -215,7 +244,7 @@ def build_structured_masks(
                     rsn_content_offsets.add(off)
 
         elif rl_pos >= 0:
-            # New flat format: "Reasoning: <content>\nObject:..."
+            # Legacy flat format: "Reasoning: <content>\nObject:..."
             content_start = rl_pos + len(reasoning_label_ids)
             # Skip a space token (but not a newline) immediately after "Reasoning:"
             if content_start < len(ans_ids):

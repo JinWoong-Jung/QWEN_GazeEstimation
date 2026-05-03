@@ -8,6 +8,10 @@ import torch
 from model.utils.gaze_tokens import (
     COORD_BINS,
     FORMAT_TOKENS,
+    GAZE_OBJECT_MARKER,
+    GAZE_POINT_MARKER,
+    GAZE_REASONING_MARKER,
+    GAZE_SCHEMA_MARKERS,
     build_gaze_special_tokens,
     register_gaze_special_tokens,
 )
@@ -128,8 +132,8 @@ class TestRegisterGazeSpecialTokens(unittest.TestCase):
         before = len(tok.get_vocab())
         register_gaze_special_tokens(tok, num_classes=num_classes)
         after = len(tok.get_vocab())
-        # 1000 loc tokens + 5 obj tokens + 1 unknown obj token
-        expected_new = COORD_BINS + num_classes + 1
+        # 3 schema markers + 1000 loc tokens + 5 obj tokens + 1 unknown obj token
+        expected_new = 3 + COORD_BINS + num_classes + 1
         self.assertEqual(after - before, expected_new)
 
     def test_custom_coord_bins_vocab_size(self) -> None:
@@ -138,7 +142,7 @@ class TestRegisterGazeSpecialTokens(unittest.TestCase):
         before = len(tok.get_vocab())
         register_gaze_special_tokens(tok, num_classes=num_classes, coord_bins=128)
         after = len(tok.get_vocab())
-        self.assertEqual(after - before, 128 + num_classes + 1)
+        self.assertEqual(after - before, 3 + 128 + num_classes + 1)
         self.assertIn("<loc_127>", tok.get_vocab())
         self.assertNotIn("<loc_999>", tok.get_vocab())
 
@@ -168,6 +172,57 @@ class TestSpecialTokenPipeline(unittest.TestCase):
         self.assertIn(OBJ_SLOT, tok.get_vocab())
         added2 = add_slot_token(tok)
         self.assertEqual(added2, 0)
+
+
+class TestGazeSchemaMarkerRegistration(unittest.TestCase):
+    """New schema markers are registered and Qwen tokens are preserved."""
+
+    def _make_tokenizer_with_existing(self, existing: list[str]) -> DummyTokenizer:
+        tok = DummyTokenizer()
+        for t in existing:
+            tok.ensure(t)
+        tok.additional_special_tokens = list(existing)
+        return tok
+
+    def test_schema_markers_registered(self) -> None:
+        tok = DummyTokenizer()
+        register_gaze_special_tokens(tok, num_classes=5)
+        for marker in GAZE_SCHEMA_MARKERS:
+            self.assertIn(marker, tok.get_vocab(), f"marker {marker!r} not in vocab after registration")
+
+    def test_schema_markers_in_returned_id_map(self) -> None:
+        tok = DummyTokenizer()
+        id_map = register_gaze_special_tokens(tok, num_classes=5)
+        for marker in GAZE_SCHEMA_MARKERS:
+            self.assertIn(marker, id_map, f"marker {marker!r} missing from returned id_map")
+            self.assertGreaterEqual(id_map[marker], 0)
+
+    def test_schema_markers_have_unique_ids(self) -> None:
+        tok = DummyTokenizer()
+        id_map = register_gaze_special_tokens(tok, num_classes=5)
+        ids = [id_map[m] for m in GAZE_SCHEMA_MARKERS]
+        self.assertEqual(len(ids), len(set(ids)), "schema markers must have distinct token ids")
+
+    def test_qwen_special_tokens_preserved_after_marker_registration(self) -> None:
+        qwen_specials = ["<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>"]
+        tok = self._make_tokenizer_with_existing(qwen_specials)
+        original_ids = {t: tok.tok2id[t] for t in qwen_specials}
+        register_gaze_special_tokens(tok, num_classes=5)
+        for t, orig_id in original_ids.items():
+            self.assertIn(t, tok.get_vocab(), f"Qwen token {t!r} lost after registration")
+            self.assertEqual(tok.tok2id[t], orig_id, f"Qwen token {t!r} id changed")
+
+    def test_format_tokens_list_contains_markers(self) -> None:
+        for marker in GAZE_SCHEMA_MARKERS:
+            self.assertIn(marker, FORMAT_TOKENS, f"{marker!r} not in FORMAT_TOKENS")
+
+    def test_double_registration_idempotent_with_markers(self) -> None:
+        tok = DummyTokenizer()
+        register_gaze_special_tokens(tok, num_classes=5)
+        size1 = len(tok.get_vocab())
+        register_gaze_special_tokens(tok, num_classes=5)
+        size2 = len(tok.get_vocab())
+        self.assertEqual(size1, size2)
 
 
 if __name__ == "__main__":

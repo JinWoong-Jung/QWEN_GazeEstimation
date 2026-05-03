@@ -9,16 +9,55 @@ ANSWER_END: str = "<|im_end|>"
 POINT_PREFIX: str = "Point:"
 OBJECT_PREFIX: str = "Object:"
 GAZE_OBJ_UNKNOWN: str = "<obj_unknown>"
-FORMAT_TOKENS: list[str] = []
 
 REASONING_START: str = "<think>"
 REASONING_END: str = "</think>"
 REASONING_PREFIX: str = "Reasoning:"
 
+# New special-token schema markers
+GAZE_REASONING_MARKER: str = "<|gaze_reasoning|>"
+GAZE_POINT_MARKER: str = "<|gaze_point|>"
+GAZE_OBJECT_MARKER: str = "<|gaze_object|>"
+GAZE_SCHEMA_MARKERS: list[str] = [GAZE_REASONING_MARKER, GAZE_POINT_MARKER, GAZE_OBJECT_MARKER]
+
+FORMAT_TOKENS: list[str] = list(GAZE_SCHEMA_MARKERS)
+
 _LOC_RE = re.compile(r"^<loc_(\d+)>$")
 _OBJ_RE = re.compile(r"^<obj_(\d+)>$")
 
-# --- parsing regexes (DOTALL so .* spans newlines) ---
+# --- new special-token schema regexes ---
+
+# <|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>   (point_object)
+# Groups: 1=loc_x, 2=loc_y, 3=obj
+_ST_POINT_OBJ_RE = re.compile(
+    r"^\s*<\|gaze_point\|>(<loc_\d+>)(<loc_\d+>)<\|gaze_object\|>(<obj_\d+>|<obj_unknown>)"
+    r"\s*(?:<\|im_end\|>)?\s*$"
+)
+
+# <|gaze_object|><obj_k><|gaze_point|><loc_x><loc_y>   (object_point)
+# Groups: 1=obj, 2=loc_x, 3=loc_y
+_ST_OBJ_POINT_RE = re.compile(
+    r"^\s*<\|gaze_object\|>(<obj_\d+>|<obj_unknown>)<\|gaze_point\|>(<loc_\d+>)(<loc_\d+>)"
+    r"\s*(?:<\|im_end\|>)?\s*$"
+)
+
+# <|gaze_reasoning|>{text}<|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>  (reasoning_point_object)
+# Groups: 1=loc_x, 2=loc_y, 3=obj
+_ST_RSN_POINT_OBJ_RE = re.compile(
+    r"^\s*<\|gaze_reasoning\|>.*?<\|gaze_point\|>(<loc_\d+>)(<loc_\d+>)<\|gaze_object\|>(<obj_\d+>|<obj_unknown>)"
+    r"\s*(?:<\|im_end\|>)?\s*$",
+    re.DOTALL,
+)
+
+# <|gaze_reasoning|>{text}<|gaze_object|><obj_k><|gaze_point|><loc_x><loc_y>  (reasoning_object_point)
+# Groups: 1=obj, 2=loc_x, 3=loc_y
+_ST_RSN_OBJ_POINT_RE = re.compile(
+    r"^\s*<\|gaze_reasoning\|>.*?<\|gaze_object\|>(<obj_\d+>|<obj_unknown>)<\|gaze_point\|>(<loc_\d+>)(<loc_\d+>)"
+    r"\s*(?:<\|im_end\|>)?\s*$",
+    re.DOTALL,
+)
+
+# --- legacy parsing regexes (DOTALL so .* spans newlines) ---
 
 # Legacy point-first: "Point: <loc_X><loc_Y>\nObject: <obj_K>  [<think>...</think>]"
 # Groups: 1=loc_x, 2=loc_y, 3=obj
@@ -73,8 +112,14 @@ _STRICT_RE_THINK_FIRST = re.compile(
 
 
 def normalize_reasoning_text(text: str, max_words: int = 30, max_chars: int = 220) -> str:
-    """Collapse whitespace, truncate, and ensure trailing period."""
-    text = " ".join(str(text or "").split())
+    """Collapse whitespace, truncate, and ensure trailing period.
+
+    Also strips any schema marker strings so they cannot leak into reasoning content.
+    """
+    text = str(text or "")
+    for marker in GAZE_SCHEMA_MARKERS:
+        text = text.replace(marker, "")
+    text = " ".join(text.split())
     if not text:
         return text
     words = text.split()
@@ -117,7 +162,7 @@ def format_obj_token(obj_id: int, width: int) -> str:
 
 
 def build_gaze_special_tokens(num_classes: int, coord_bins: int = COORD_BINS) -> list[str]:
-    tokens: list[str] = []
+    tokens: list[str] = list(GAZE_SCHEMA_MARKERS)  # 3 schema marker tokens
     coord_n = int(coord_bins)
     if coord_n <= 0:
         raise ValueError(f"coord_bins must be positive, got: {coord_bins!r}")
@@ -183,26 +228,28 @@ def build_structured_target_text(
         w = _obj_token_width(num_classes)
         resolved_obj_tok = format_obj_token(int(obj_id), w) if obj_id is not None else GAZE_OBJ_UNKNOWN
 
-    point_str = f"{POINT_PREFIX} {format_loc_token(bx, loc_w)}{format_loc_token(by, loc_w)}"
-    object_str = f"{OBJECT_PREFIX} {resolved_obj_tok}"
-
+    loc_x = format_loc_token(bx, loc_w)
+    loc_y = format_loc_token(by, loc_w)
     order = str(target_order or "object_point").strip()
 
     if order == "reasoning_object_point":
         reasoning_body = normalize_reasoning_text(str(reasoning_text or "").strip())
         if reasoning_body or bool(force_reasoning_format):
-            content_line = f"{REASONING_PREFIX} {reasoning_body}" if reasoning_body else REASONING_PREFIX
-            return f"{content_line}\n{object_str}\n{point_str}"
-        return f"{object_str}\n{point_str}"
+            rsn_part = f"{GAZE_REASONING_MARKER}{reasoning_body}"
+            return f"{rsn_part}{GAZE_OBJECT_MARKER}{resolved_obj_tok}{GAZE_POINT_MARKER}{loc_x}{loc_y}"
+        return f"{GAZE_OBJECT_MARKER}{resolved_obj_tok}{GAZE_POINT_MARKER}{loc_x}{loc_y}"
 
     if order == "reasoning_point_object":
         reasoning_body = normalize_reasoning_text(str(reasoning_text or "").strip())
         if reasoning_body or bool(force_reasoning_format):
-            content_line = f"{REASONING_PREFIX} {reasoning_body}" if reasoning_body else REASONING_PREFIX
-            return f"{content_line}\n{point_str}\n{object_str}"
-        return f"{point_str}\n{object_str}"
+            rsn_part = f"{GAZE_REASONING_MARKER}{reasoning_body}"
+            return f"{rsn_part}{GAZE_POINT_MARKER}{loc_x}{loc_y}{GAZE_OBJECT_MARKER}{resolved_obj_tok}"
+        return f"{GAZE_POINT_MARKER}{loc_x}{loc_y}{GAZE_OBJECT_MARKER}{resolved_obj_tok}"
 
     if order == "point_object_reasoning":
+        # Legacy post-hoc format: "Point: ...\nObject: ...\n<think>...</think>"
+        point_str = f"{POINT_PREFIX} {loc_x}{loc_y}"
+        object_str = f"{OBJECT_PREFIX} {resolved_obj_tok}"
         base = f"{point_str}\n{object_str}"
         reasoning_body = str(reasoning_text or "").strip()
         if reasoning_body or bool(force_reasoning_format):
@@ -212,10 +259,10 @@ def build_structured_target_text(
         return base
 
     if order == "point_object":
-        return f"{point_str}\n{object_str}"
+        return f"{GAZE_POINT_MARKER}{loc_x}{loc_y}{GAZE_OBJECT_MARKER}{resolved_obj_tok}"
 
     # default: "object_point"
-    return f"{object_str}\n{point_str}"
+    return f"{GAZE_OBJECT_MARKER}{resolved_obj_tok}{GAZE_POINT_MARKER}{loc_x}{loc_y}"
 
 
 def build_structured_target_text_with_reasoning(
@@ -334,11 +381,16 @@ def parse_structured_output_text(
 ) -> dict:
     """Parse generated text, accepting all target orders.
 
-    Tries patterns in priority order:
-      1. object_point              Object → Point
-      2. reasoning_point_object    Reasoning → Point → Object  (point-first causal)
-      3. reasoning_object_point    Reasoning → Object → Point
-      4. point_object / point_object_reasoning  (legacy)
+    Tries patterns in priority order (new schema first, then legacy):
+      1. ST object_point    <|gaze_object|><obj_k><|gaze_point|><loc_x><loc_y>
+      2. ST point_object    <|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>
+      3. ST reasoning+obj_pt  <|gaze_reasoning|>...<|gaze_object|>...<|gaze_point|>...
+      4. ST reasoning+pt_obj  <|gaze_reasoning|>...<|gaze_point|>...<|gaze_object|>...
+      5. legacy object_point  "Object: ...\nPoint: ..."
+      6. legacy reasoning_point_object  "Reasoning: ...\nPoint: ...\nObject: ..."
+      7. legacy reasoning_object_point  "Reasoning: ...\nObject: ...\nPoint: ..."
+      8. legacy think-first  "<think>...</think>\nObject: ...\nPoint: ..."
+      9. legacy point_object / point_object_reasoning  "Point: ...\nObject: ..."
     """
     s = str(text or "").strip()
     coord_n = int(coord_bins)
@@ -354,25 +406,53 @@ def parse_structured_output_text(
         "object_unknown": False,
     }
 
-    # object_point: groups obj=1, x=2, y=3
+    # --- new special-token schema ---
+
+    # ST object_point: groups obj=1, x=2, y=3
+    m = _ST_OBJ_POINT_RE.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    # ST point_object: groups x=1, y=2, obj=3
+    m = _ST_POINT_OBJ_RE.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=3, x_group=1, y_group=2,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    # ST reasoning_object_point: groups obj=1, x=2, y=3
+    m = _ST_RSN_OBJ_POINT_RE.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    # ST reasoning_point_object: groups x=1, y=2, obj=3
+    m = _ST_RSN_POINT_OBJ_RE.match(s)
+    if m is not None:
+        return _extract_from_match(m, obj_group=3, x_group=1, y_group=2,
+                                   num_classes=num_classes, coord_bins=coord_n)
+
+    # --- legacy text-based schema ---
+
+    # legacy object_point: groups obj=1, x=2, y=3
     m = _STRICT_RE_OBJ_FIRST.match(s)
     if m is not None:
         return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
                                    num_classes=num_classes, coord_bins=coord_n)
 
-    # reasoning_point_object: "Reasoning: ...\nPoint: ...\nObject: ..."  groups x=1, y=2, obj=3
+    # legacy reasoning_point_object: groups x=1, y=2, obj=3
     m = _STRICT_RE_REASONING_POINT_OBJ.match(s)
     if m is not None:
         return _extract_from_match(m, obj_group=3, x_group=1, y_group=2,
                                    num_classes=num_classes, coord_bins=coord_n)
 
-    # flat reasoning_object_point: "Reasoning: ...\nObject: ...\nPoint: ..."
+    # legacy reasoning_object_point: groups obj=1, x=2, y=3
     m = _STRICT_RE_REASONING_FIRST.match(s)
     if m is not None:
         return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,
                                    num_classes=num_classes, coord_bins=coord_n)
 
-    # legacy think-first: "<think>...</think>\nObject: ...\nPoint: ..."
+    # legacy think-first: groups obj=1, x=2, y=3
     m = _STRICT_RE_THINK_FIRST.match(s)
     if m is not None:
         return _extract_from_match(m, obj_group=1, x_group=2, y_group=3,

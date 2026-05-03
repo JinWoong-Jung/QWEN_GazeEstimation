@@ -54,7 +54,7 @@ eval:
   preview_val_samples: 20
   checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 16       # <|im_start|> Point: <loc><loc>\nObject: <obj><|im_end|> ≈ 12 tokens + buffer
+  generation_max_new_tokens: 16       # direct gaze schema + EOS fits comfortably
   generation_num_beams: 1
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
@@ -68,10 +68,8 @@ prompt:
     Predict the gaze point that this person is looking at, and the object located at that gaze point.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Return exactly the two-line format below, with no extra text before or after it.
-    Return exactly:
-    Point: <loc_NNN><loc_MMM>
-    Object: <obj_KKK>
+    Return exactly this token schema, with no spaces, newlines, or extra text around the markers:
+    <|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>
 
 model:
   coord_bins: 128

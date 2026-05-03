@@ -21,7 +21,7 @@ warnings.filterwarnings(
 
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 from transformers import (
     AutoModelForImageTextToText,
@@ -60,7 +60,7 @@ from .utils.eval_utils import (
     run_test_metrics,
 )
 from .utils.gaze_tokens import parse_structured_output_text, register_gaze_special_tokens
-from .utils.loss_utils import compute_answer_loss, masked_sample_exact_rate
+from .utils.loss_utils import compute_answer_loss
 from .utils.processor_collate import (
     QwenRLCollator,
     QwenTestCollator,
@@ -78,7 +78,7 @@ from .utils.rl_utils import (
     compute_total_reward,
     group_normalize_advantages,
 )
-from .utils.wandb_utils import finish_wandb, init_wandb, train_progress_bucket
+from .utils.wandb_utils import finish_wandb, init_wandb
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1201,7 +1201,7 @@ def main() -> None:
     gaze_token_ids = sorted({int(v) for v in token_id_map.values() if int(v) >= 0})
     print(
         f"[INFO] tokenizer extended: vocab_size={new_vocab_size} "
-        f"(added loc tokens: {coord_bins}, obj tokens: {num_classes}, fmt tokens: 0)"
+        f"(added loc tokens: {coord_bins}, obj tokens: {num_classes}, fmt tokens: 3)"
     )
 
     # Build ordered loc_token_ids tensor for Gaussian soft-label CE.
@@ -1296,12 +1296,8 @@ def main() -> None:
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
-                force_reasoning_format=bool(getattr(args, "force_reasoning_format_eval", False)),
-                target_order=(
-                    "object_point"
-                    if not bool(getattr(args, "use_reasoning", False))
-                    else str(getattr(args, "target_order", "object_point"))
-                ),
+                force_reasoning_format=False,
+                target_order="point_object",
             )
             log_target_example("test_only", test_ds)
             _tnw = int(args.num_workers)
@@ -1429,8 +1425,7 @@ def main() -> None:
 
     reasoning_index = None
     if getattr(args, "use_reasoning", False):
-        from pathlib import Path as _Path
-        reasoning_dir = _Path(str(getattr(args, "train_reasoning_dir", ""))).resolve()
+        reasoning_dir = resolve_path(str(getattr(args, "train_reasoning_dir", "")))
         if reasoning_dir.exists():
             reasoning_index = build_reasoning_index(reasoning_dir)
             print(
@@ -1444,7 +1439,10 @@ def main() -> None:
     _disable_spatial_aug = bool(getattr(args, "disable_spatial_aug_for_reasoning", True))
     _force_train = bool(getattr(args, "force_reasoning_format_train",
                                 getattr(args, "use_reasoning", False)))
-    _force_eval = bool(getattr(args, "force_reasoning_format_eval", False))
+    # Val/test do not have reasoning annotations, so keep their target schema
+    # explicitly direct regardless of the training target_order.
+    _force_eval = False
+    _eval_target_order = "point_object"
 
     # use_reasoning=False must guarantee no reasoning scaffold in any dataset.
     # target_order and force flags from config are irrelevant when reasoning is off.
@@ -1459,6 +1457,7 @@ def main() -> None:
     _max_reasoning_words = int(getattr(args, "max_reasoning_words", 30))
     _max_reasoning_chars = int(getattr(args, "max_reasoning_chars", 220))
 
+    train_sampler: WeightedRandomSampler | None = None
     if _use_multiview and reasoning_index is not None:
         train_ds: GazeDataset | MultiViewGazeDataset = MultiViewGazeDataset(
             records=train_records,
@@ -1480,7 +1479,31 @@ def main() -> None:
         n_direct, n_reasoning = train_ds.get_view_counts()
         print(
             f"[INFO] MultiViewGazeDataset: n_direct={n_direct} n_reasoning={n_reasoning} "
-            f"total_views={len(train_ds)} full_dual_view=True"
+            f"total_views={len(train_ds)}"
+        )
+        n_epoch_samples = len(train_ds.records)
+        d_ratio = max(0.0, float(_direct_view_ratio))
+        r_ratio = max(0.0, float(_reasoning_view_ratio))
+        ratio_sum = d_ratio + r_ratio
+        if ratio_sum <= 0.0:
+            d_ratio, r_ratio, ratio_sum = 0.8, 0.2, 1.0
+        d_ratio /= ratio_sum
+        r_ratio /= ratio_sum
+        weights = torch.zeros((len(train_ds),), dtype=torch.double)
+        if n_direct > 0 and d_ratio > 0.0:
+            weights[:n_direct] = float(d_ratio) / float(n_direct)
+        if n_reasoning > 0 and r_ratio > 0.0:
+            weights[n_direct:n_direct + n_reasoning] = float(r_ratio) / float(n_reasoning)
+        if float(weights.sum().item()) <= 0.0:
+            weights.fill_(1.0)
+        train_sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=int(n_epoch_samples),
+            replacement=True,
+        )
+        print(
+            f"[INFO] MultiView sampler: num_samples_per_epoch={n_epoch_samples} "
+            f"direct_ratio={d_ratio:.3f} reasoning_ratio={r_ratio:.3f}"
         )
     else:
         train_ds = GazeDataset(
@@ -1515,7 +1538,7 @@ def main() -> None:
         filter_invalid_object_samples=filter_invalid,
         coord_bins=coord_bins,
         force_reasoning_format=_force_eval,
-        target_order=_target_order,
+        target_order=_eval_target_order,
     )
 
     # Count filtered samples
@@ -1549,16 +1572,11 @@ def main() -> None:
     _persistent = _nw > 0
     _prefetch = 2 if _nw > 0 else None
 
-    # Full dual-view training: all 217,910 views shuffled each epoch.
-    # WeightedRandomSampler (ratio-based subsampling) is intentionally removed
-    # so every direct AND reasoning view is seen once per epoch.
-    _train_sampler = None
-
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=(_train_sampler is None),
-        sampler=_train_sampler,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=_nw,
         pin_memory=(device.type == "cuda"),
         collate_fn=train_collator,
@@ -1731,7 +1749,7 @@ def main() -> None:
                     image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                     coord_bins=coord_bins,
                     force_reasoning_format=_force_eval,
-                    target_order=_target_order,
+                    target_order=_eval_target_order,
                 )
                 test_loader = DataLoader(
                     test_ds,
@@ -1834,7 +1852,7 @@ def main() -> None:
         sample_count = 0
         step_count = 0
         updates_done_in_epoch = 0
-        last_logged_train_bucket = 0
+        train_log_every = max(1, int(getattr(args, "wandb_log_every_steps", 20)))
         skipped_all_ignore = 0
         _t_fwd_sum = 0.0
         _t_bwd_sum = 0.0
@@ -1869,8 +1887,6 @@ def main() -> None:
                 if (int(remainder_steps) > 0 and step >= int(last_window_start))
                 else int(accum_steps)
             )
-            _is_accum_step = ((step % accum_steps) == 0) or is_last_batch
-            _compute_fmt_rate = _is_accum_step and (wandb_run is not None)
 
             _t_fwd0 = time.perf_counter()
             with torch.autocast(
@@ -1890,7 +1906,7 @@ def main() -> None:
                     weight_object=loss_weights["object"],
                     weight_format=loss_weights["format"],
                     weight_reasoning=loss_weights["reasoning"],
-                    compute_format_rate=_compute_fmt_rate,
+                    compute_format_rate=False,
                     loc_token_ids=(
                         loc_token_ids_tensor.to(device)
                         if loc_token_ids_tensor is not None else None
@@ -1915,13 +1931,8 @@ def main() -> None:
                 updates_done_in_epoch += 1
 
                 if wandb_run is not None:
-                    current_train_bucket = train_progress_bucket(
-                        updates_done_in_epoch,
-                        updates_per_epoch,
-                    )
-                    should_log_train = current_train_bucket > last_logged_train_bucket
+                    should_log_train = (global_step % train_log_every) == 0 or is_last_batch
                     if should_log_train:
-                        last_logged_train_bucket = current_train_bucket
                         grad_norm_value = (
                             float(grad_norm.detach().item())
                             if torch.is_tensor(grad_norm)
@@ -1932,49 +1943,14 @@ def main() -> None:
                         )
                         _view_types = batch.get("view_type", [])
                         _n_batch = max(len(_view_types), 1)
-                        _n_direct_batch = sum(1 for v in _view_types if v == "direct")
                         _n_rsn_batch = sum(1 for v in _view_types if v == "reasoning")
-
-                        # Per-view-type FormatValidRate.
-                        # out["logits"] tensor is still alive after backward (graph freed,
-                        # tensor ref kept). masked_sample_exact_rate uses argmax only.
-                        _fmt_rate_direct = 0.0
-                        _fmt_rate_rsn = 0.0
-                        if _compute_fmt_rate and _view_types:
-                            _logits_det = out["logits"].detach()
-                            _fmt_mask = batch.get("loss_mask_format")
-                            if torch.is_tensor(_fmt_mask):
-                                with torch.no_grad():
-                                    _d_idx = [i for i, v in enumerate(_view_types) if v == "direct"]
-                                    _r_idx = [i for i, v in enumerate(_view_types) if v == "reasoning"]
-                                    if _d_idx:
-                                        _di = torch.tensor(_d_idx, device=device)
-                                        _r_direct, _ = masked_sample_exact_rate(
-                                            _logits_det[_di], labels[_di], _fmt_mask[_di],
-                                        )
-                                        _fmt_rate_direct = float(_r_direct.item())
-                                    if _r_idx:
-                                        _ri = torch.tensor(_r_idx, device=device)
-                                        _r_rsn, _ = masked_sample_exact_rate(
-                                            _logits_det[_ri], labels[_ri], _fmt_mask[_ri],
-                                        )
-                                        _fmt_rate_rsn = float(_r_rsn.item())
 
                         wandb_run.log(
                             {
                                 "train/loss": float(raw_loss.detach().item()),
-                                "train/loss_point": float(losses["loss_point"].detach().item()),
-                                "train/loss_object": float(losses["loss_object"].detach().item()),
-                                "train/loss_format": float(losses["loss_format"].detach().item()),
-                                "train/loss_reasoning": float(losses.get("loss_reasoning", losses["loss_format"] * 0).detach().item()),
-                                "train/n_reasoning_tokens": int(losses.get("n_reasoning_tokens", 0)),
-                                "train/FormatValidRate": float(losses["format_valid_rate"].detach().item()),
-                                "train/FormatValidRate_direct": _fmt_rate_direct,
-                                "train/FormatValidRate_reasoning": _fmt_rate_rsn,
                                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "train/grad_norm": grad_norm_value,
                                 "train/epoch": epoch_progress,
-                                "train/view_direct_frac": float(_n_direct_batch) / float(_n_batch),
                                 "train/view_reasoning_frac": float(_n_rsn_batch) / float(_n_batch),
                             },
                             step=global_step,
@@ -2205,7 +2181,7 @@ def main() -> None:
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
                 force_reasoning_format=_force_eval,
-                target_order=_target_order,
+                target_order=_eval_target_order,
             )
             log_target_example("test", test_ds)
             test_loader = DataLoader(

@@ -314,10 +314,9 @@ class GazeDataset(Dataset):
 class MultiViewGazeDataset(Dataset):
     """Two-view dataset: one direct view and one reasoning view per record.
 
-    Direct views use full augmentation and object_point target order.
-    Reasoning views use safe augmentation and reasoning_object_point target order.
-    Both views are stored in self._views so a WeightedRandomSampler can be applied
-    by the caller using get_view_counts().
+    Direct views use full augmentation and point_object target order.
+    Reasoning views use safe augmentation and reasoning_point_object target order.
+    Both views are stored in self._views for full dual-view training.
     """
 
     def __init__(
@@ -444,7 +443,7 @@ class MultiViewGazeDataset(Dataset):
                 prompt_text = self.prompt_text_reasoning
             else:
                 # Malformed or missing content → treat as direct view
-                target_order = "object_point"
+                target_order = "point_object"
                 prompt_text = self.prompt_text_direct
         else:
             # Direct view: full augmentation

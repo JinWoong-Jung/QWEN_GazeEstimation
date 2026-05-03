@@ -2,8 +2,8 @@
 
 ## 배경
 
-- 훈련 샘플: 108,955개, 전부 reasoning 파일 존재 확인 (`data/bucket_data/data/gazefollow_reason/output/train/`, 108,955개 1:1 커버리지)
-- 세 가지 목표 변경 사항 (독립적이므로 순서대로 구현 가능)
+- 훈련 샘플: 108,955개, 전부 reasoning 파일 존재 확인 (`data/gazefollow_reason_train/`, 108,955개 1:1 커버리지)
+- 네 가지 목표 변경 사항 (독립적이므로 순서대로 구현 가능)
 
 ---
 
@@ -21,6 +21,7 @@
 - `train_records` → `train_ds` 기준으로 스텝 수 재계산하는 부분 확인 (현재 `updates_per_epoch`가 `len(train_loader)` 기준이라면 자동 반영됨)
 
 **`sft.yaml`**
+- `paths.train_reasoning_dir`: `"data/gazefollow_reason_train"` 사용
 - `reasoning.direct_view_ratio` / `reasoning.reasoning_view_ratio`: 삭제하거나 주석 처리 (코드에서 더 이상 사용 안 됨)
 
 ### 주의
@@ -117,7 +118,7 @@
 - `build_structured_masks()` 내 reasoning content offset 탐지 로직 (`elif rl_pos >= 0:` 블록, line ~217):
   - 현재 구현이 "Reasoning: 이후 첫 번째 줄바꿈까지" 를 reasoning 마스크로 지정 → 그 뒤 `<loc_*>` / `<obj_*>` 는 tok_str 패턴 매칭으로 처리
   - `reasoning_point_object` 순서에서도 동작 확인: Point가 Object 앞에 와도 `_LOC_RE` / `_OBJ_RE` 패턴 매칭 기반이라 **코드 수정 불필요** (이미 order-agnostic)
-  - 단, `"reasoning_point_object"` 에서 direct view의 `target_order = "object_point"` 유지 확인 필요 (line 455: 이미 `"object_point"` 고정 → 이상 없음)
+  - 단, `"reasoning_point_object"` 에서 direct view의 `target_order = "point_object"` 유지 확인 필요 (Point → Object 고정)
 
 ---
 
@@ -261,7 +262,7 @@ loss:
 현재 `train/FormatValidRate`는 `compute_structured_loss` 내부에서 배치 전체를 대상으로 `masked_sample_exact_rate(logits, labels, loss_mask_format)`를 호출해 계산됨.
 
 **Mixed batch(direct + reasoning 혼재)에서 두 종류의 포맷 토큰이 섞임:**
-- **Direct view**: `"Object: \nPoint: "` 구조 → 포맷 토큰 ~4-6개
+- **Direct view**: `"Point: \nObject: "` 구조 → 포맷 토큰 ~4-6개
 - **Reasoning view**: `"Reasoning: ...\nPoint: \nObject: "` 구조 → 포맷 토큰 더 많음 (reasoning prefix + 줄바꿈 등)
 
 `masked_sample_exact_rate`는 **모든 포맷 토큰이 완벽히 맞아야** 해당 샘플을 valid로 처리하는 per-sample exact match. 따라서:
@@ -296,15 +297,13 @@ loss:
                _d_idx = [i for i, v in enumerate(_view_types) if v == "direct"]
                _r_idx = [i for i, v in enumerate(_view_types) if v == "reasoning"]
                if _d_idx:
-                   _di = torch.tensor(_d_idx, device=device)
                    _fmt_rate_direct, _ = masked_sample_exact_rate(
-                       _logits_det[_di], labels[_di], _fmt_mask[_di]
+                       _logits_det[_d_idx], labels[_d_idx], _fmt_mask[_d_idx]
                    )
                    _fmt_rate_direct = float(_fmt_rate_direct.item())
                if _r_idx:
-                   _ri = torch.tensor(_r_idx, device=device)
                    _fmt_rate_rsn, _ = masked_sample_exact_rate(
-                       _logits_det[_ri], labels[_ri], _fmt_mask[_ri]
+                       _logits_det[_r_idx], labels[_r_idx], _fmt_mask[_r_idx]
                    )
                    _fmt_rate_rsn = float(_fmt_rate_rsn.item())
    ```
@@ -324,6 +323,7 @@ loss:
 
 ### 주의
 - `out["logits"]`는 `loss.backward()` 이후에도 텐서 참조가 살아있어 접근 가능. 단, computation graph는 해제됨 → `torch.no_grad()` 필수
+- `_fmt_mask`는 CPU에 남을 수 있으므로 view index는 Python list로 적용 (`_fmt_mask[_d_idx]`), GPU index 텐서로 CPU 텐서를 indexing하지 않음
 - `_compute_fmt_rate`는 accum step + wandb 활성 시에만 True → 매 step마다 추가 연산 없음
 - Direct 샘플만 있는 배치나 reasoning 샘플만 있는 배치에선 해당 rate가 0.0으로 로깅됨 (n=0 케이스) → wandb에서 필터링 시 주의
 
@@ -338,13 +338,13 @@ loss:
 
 ## 테스트 체크리스트
 
-- [ ] `test_reasoning_format.py`: `reasoning_point_object` 포맷 생성 확인
-- [ ] `test_structured_loss.py`: `gaussian_soft_label_ce` 단위 테스트 (σ=0일 때 hard CE와 동일 결과 확인)
-- [ ] `test_reasoning_masks.py`: `build_structured_masks`가 `reasoning_point_object` 포맷에서 point/object 마스크 정상 생성 확인
+- [x] `tests/test_gaze_tokens.py`: `reasoning_point_object` 포맷 생성/파싱 확인
+- [x] `tests/test_structured_loss.py`: `gaussian_soft_label_ce` 단위 테스트 추가
+- [x] `tests/test_reasoning_masks.py`: `build_structured_masks` 기본 reasoning 마스크 동작 확인
 - [ ] `QWEN_DEBUG_MASKS=1` 환경변수로 학습 초반 마스크 분포 모니터링
 
 ## 미결 검토 사항
 
 - `generation_stop_at_object_end: false` 유지 (현재 설정). reasoning_point_object에서 object가 마지막이므로 자연 EOS에 맡기면 충분
-- Task 1 적용 후 `epochs: 20` → 실질 학습량 2배 증가. 학습 시간 고려해 필요 시 `epochs: 10`으로 조정
+- Task 1 적용 후 `epochs: 20` → 실질 학습량 2배 증가. 현재 `sft.yaml`은 `epochs: 10`으로 조정됨
 - Gaussian σ=7은 128-bin 기준으로 이웃 14개 bin(±7)에 유효한 gradient 부여 → 너무 soft해지지 않는지 초반 실험 필요 (loss_point_weight=3.0으로 이미 가중치 높음)

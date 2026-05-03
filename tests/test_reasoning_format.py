@@ -6,6 +6,9 @@ from pathlib import Path
 
 from model.utils.data_utils import load_reasoning_text
 from model.utils.gaze_tokens import (
+    GAZE_OBJECT_MARKER,
+    GAZE_POINT_MARKER,
+    GAZE_REASONING_MARKER,
     REASONING_END,
     REASONING_START,
     build_structured_target_text,
@@ -32,52 +35,54 @@ class TestBuildWithReasoning(unittest.TestCase):
 
     def test_force_reasoning_format_with_empty_reasoning(self):
         result = build_structured_target_text_with_reasoning(
-            0.5,
-            0.5,
-            10,
-            100,
-            "",
+            0.5, 0.5, 10, 100, "",
             force_reasoning_format=True,
         )
-        # New flat format: no <think> wrapper
+        # New special-token schema: <|gaze_reasoning|> marker, no legacy <think> wrapper
         self.assertNotIn(REASONING_START, result)
         self.assertNotIn(REASONING_END, result)
-        self.assertIn("Reasoning:", result)
-        self.assertIn("Point:", result)
-        self.assertIn("Object:", result)
+        self.assertNotIn("Reasoning:", result)
+        self.assertIn(GAZE_REASONING_MARKER, result)
+        self.assertIn(GAZE_POINT_MARKER, result)
+        self.assertIn(GAZE_OBJECT_MARKER, result)
 
-    def test_with_reasoning_has_think_tags(self):
+    def test_with_reasoning_uses_gaze_reasoning_marker(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "Looking at the TV.")
-        # New flat format: "Reasoning:" prefix, no <think> wrapper
+        # New schema: <|gaze_reasoning|> marker, no legacy <think> or "Reasoning:" prefix
         self.assertNotIn(REASONING_START, result)
         self.assertNotIn(REASONING_END, result)
-        self.assertIn("Reasoning:", result)
+        self.assertNotIn("Reasoning:", result)
+        self.assertIn(GAZE_REASONING_MARKER, result)
         self.assertIn("Looking at the TV.", result)
 
-    def test_reasoning_label_present(self):
+    def test_reasoning_marker_before_point_and_object(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "test reason")
-        self.assertIn("Reasoning: test reason", result)
+        rsn_pos = result.index(GAZE_REASONING_MARKER)
+        pt_pos  = result.index(GAZE_POINT_MARKER)
+        obj_pos = result.index(GAZE_OBJECT_MARKER)
+        self.assertLess(rsn_pos, pt_pos)
+        self.assertLess(rsn_pos, obj_pos)
 
-    def test_reasoning_before_point(self):
-        result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "some reasoning")
-        rsn_pos = result.index("Reasoning:")
-        point_pos = result.index("Point:")
-        self.assertLess(rsn_pos, point_pos)
-
-    def test_think_block_wraps_reasoning(self):
+    def test_reasoning_content_embedded_in_marker(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "abc")
-        # New flat format: reasoning inline before Object/Point, no <think> block
-        self.assertIn("Reasoning: abc", result)
+        # Content immediately after <|gaze_reasoning|>, no newline/space gap
+        self.assertIn(GAZE_REASONING_MARKER + "abc", result)
         self.assertNotIn(REASONING_START, result)
 
     def test_base_content_preserved(self):
+        # When using reasoning, the tail of the result matches the direct object_point format
         base = build_structured_target_text(0.3, 0.7, 5, 100)
         result = build_structured_target_text_with_reasoning(0.3, 0.7, 5, 100, "reason")
         self.assertTrue(result.endswith(base))
 
     def test_reasoning_stripped(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "  padded  ")
-        self.assertIn("Reasoning: padded", result)
+        # Normalized reasoning text directly after the marker
+        self.assertIn(GAZE_REASONING_MARKER + "padded", result)
+
+    def test_no_newlines_in_new_schema(self):
+        result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "some text")
+        self.assertNotIn("\n", result)
 
 
 class TestStrictReWithReasoning(unittest.TestCase):
@@ -89,11 +94,7 @@ class TestStrictReWithReasoning(unittest.TestCase):
 
     def test_parse_with_empty_reasoning_scaffold(self):
         text = build_structured_target_text_with_reasoning(
-            0.5,
-            0.3,
-            10,
-            100,
-            "",
+            0.5, 0.3, 10, 100, "",
             force_reasoning_format=True,
         )
         p = parse_structured_output_text(text, 100)
@@ -106,7 +107,8 @@ class TestStrictReWithReasoning(unittest.TestCase):
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["object_id"], 10)
 
-    def test_parse_multiline_reasoning(self):
+    def test_parse_multiline_reasoning_normalized(self):
+        # Multiline input gets normalized (collapsed) by normalize_reasoning_text
         text = build_structured_target_text_with_reasoning(0.1, 0.9, 5, 100, "The person looks\nto the right.")
         p = parse_structured_output_text(text, 100)
         self.assertTrue(p["valid_format"])
@@ -133,6 +135,21 @@ class TestStrictReWithReasoning(unittest.TestCase):
         p = parse_structured_output_text(text, 10, coord_bins=128)
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["point_bins"], (127, 0))
+
+    def test_new_schema_reasoning_markers_stripped_from_reasoning(self):
+        """Schema markers injected into reasoning text must be removed by normalize."""
+        bad_text = f"Look {GAZE_POINT_MARKER} at screen"
+        text = build_structured_target_text_with_reasoning(0.5, 0.5, 7, 100, bad_text)
+        # The marker must not appear inside the reasoning body (between gaze_rsn and next marker)
+        rsn_start = text.index(GAZE_REASONING_MARKER) + len(GAZE_REASONING_MARKER)
+        next_marker = min(
+            text.index(GAZE_OBJECT_MARKER),
+            text.index(GAZE_POINT_MARKER, rsn_start),
+        )
+        reasoning_body = text[rsn_start:next_marker]
+        self.assertNotIn(GAZE_POINT_MARKER, reasoning_body)
+        p = parse_structured_output_text(text, 100)
+        self.assertTrue(p["valid_format"])
 
 
 class TestLoadReasoningText(unittest.TestCase):

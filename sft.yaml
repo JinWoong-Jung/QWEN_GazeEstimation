@@ -12,7 +12,7 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
-  train_reasoning_dir: "data/bucket_data/data/gazefollow_reason/output/train"
+  train_reasoning_dir: "data/gazefollow_reason_train"
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
@@ -32,7 +32,7 @@ train:
   device: "cuda"
   dtype: "bfloat16"
   gradient_checkpointing: false
-  epochs: 10   # dual-view: 217,910 samples/epoch (2x vs before), so halved from 20
+  epochs: 20
   batch_size: 16
   grad_accum_steps: 8
   num_workers: 8
@@ -50,9 +50,8 @@ reasoning:
   force_reasoning_format_train: false       # do not create empty reasoning scaffolds
   force_reasoning_format_eval: false        # do NOT force empty scaffold on val/test
   disable_spatial_aug_for_reasoning: true   # skip hflip/crop for samples with reasoning files
-  # direct_view_ratio / reasoning_view_ratio unused: full dual-view training enabled.
-  # direct_view_ratio: 0.8
-  # reasoning_view_ratio: 0.2
+  direct_view_ratio: 0.8
+  reasoning_view_ratio: 0.2
   max_reasoning_words: 30
   max_reasoning_chars: 220
 
@@ -66,11 +65,11 @@ eval:
   run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 24       # direct eval (point_object): Point(6t) + Object(3t) ~= 9 tokens; 24 gives margin
+  generation_max_new_tokens: 80       # reasoning body + gaze schema markers + point/object tokens; 80 gives margin
   generation_num_beams: 1
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
-  generation_stop_at_object_end: false  # stop at natural EOS; reasoning_object_point needs full output
+  generation_stop_at_object_end: false  # stop at natural EOS; reasoning_point_object needs full output
 
 prompt:
   visual_prompting: true
@@ -81,19 +80,16 @@ prompt:
     Briefly reason about where this person is looking, then output the gaze point and object.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Return exactly:
-    Reasoning: <your reasoning here>
-    Point: <loc_NNN><loc_MMM>
-    Object: <obj_KKK>
+    Return exactly this token schema, with no spaces, newlines, or extra text around the markers:
+    <|gaze_reasoning|><your reasoning here><|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>
   # Used when use_reasoning=false (point_object target order, no <think> block)
   prompt_text_direct: |
     The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
     Predict the gaze point and the object at that point.
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Return exactly:
-    Point: <loc_NNN><loc_MMM>
-    Object: <obj_KKK>
+    Return exactly this token schema, with no spaces, newlines, or extra text around the markers:
+    <|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>
 
 model:
   coord_bins: 128

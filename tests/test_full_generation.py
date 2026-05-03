@@ -82,6 +82,24 @@ class TestBuildPrompt(unittest.TestCase):
         )
         self.assertEqual(prompt, "bbox=[0.10, 0.20, 0.30, 0.40] decimals=2")
 
+    def test_config_prompts_describe_token_schema(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = "\n".join(
+            (root / name).read_text(encoding="utf-8")
+            for name in ("sft.yaml", "config_rl.yaml")
+        )
+        self.assertIn("<|gaze_reasoning|><your reasoning here><|gaze_point|>", cfg)
+        self.assertIn("<|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>", cfg)
+        self.assertNotIn("Reasoning: <your reasoning here>", cfg)
+        self.assertNotIn("Point: <loc_NNN><loc_MMM>", cfg)
+        self.assertNotIn("Object: <obj_KKK>", cfg)
+
+    def test_sft_uses_ratio_based_multiview_sampling(self) -> None:
+        cfg = (Path(__file__).resolve().parents[1] / "sft.yaml").read_text(encoding="utf-8")
+        self.assertIn("direct_view_ratio: 0.8", cfg)
+        self.assertIn("reasoning_view_ratio: 0.2", cfg)
+        self.assertNotIn("full_dual_view=True", cfg)
+
 
 # ---------------------------------------------------------------------------
 # Split bank construction

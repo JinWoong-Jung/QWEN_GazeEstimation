@@ -7,6 +7,7 @@ import torch
 from model.utils.loss_utils import (
     compute_answer_loss,
     compute_structured_loss,
+    gaussian_soft_label_ce,
     masked_sample_exact_rate,
     masked_token_ce,
 )
@@ -120,6 +121,79 @@ class TestComputeStructuredLoss(unittest.TestCase):
         )
         self.assertIn("format_valid_rate", d)
         self.assertIn("n_format_samples", d)
+
+
+class TestGaussianSoftLabelCE(unittest.TestCase):
+    def _make_inputs(self, N: int = 4, C: int = 10, V: int = 20):
+        # loc_token_ids: C consecutive vocab IDs starting at 5
+        loc_token_ids = torch.arange(5, 5 + C, dtype=torch.long)
+        # GT loc ids: one per position, all pointing to bin index 3 (vocab id 8)
+        gt_loc_ids = torch.full((N,), 5 + 3, dtype=torch.long)
+        logits_at_pt = torch.randn(N, V)
+        return logits_at_pt, gt_loc_ids, loc_token_ids
+
+    def test_returns_scalar(self):
+        logits, gt_ids, loc_ids = self._make_inputs()
+        loss = gaussian_soft_label_ce(logits, gt_ids, loc_ids)
+        self.assertTrue(torch.is_tensor(loss))
+        self.assertEqual(loss.dim(), 0)
+
+    def test_no_nan(self):
+        logits, gt_ids, loc_ids = self._make_inputs()
+        loss = gaussian_soft_label_ce(logits, gt_ids, loc_ids)
+        self.assertFalse(torch.isnan(loss).item())
+
+    def test_nonnegative(self):
+        logits, gt_ids, loc_ids = self._make_inputs()
+        loss = gaussian_soft_label_ce(logits, gt_ids, loc_ids)
+        self.assertGreaterEqual(float(loss.item()), 0.0)
+
+    def test_matched_distribution_lowers_loss(self):
+        # Logits whose loc-token distribution matches the Gaussian soft label
+        # should produce lower loss than uniform logits.
+        N, C, V = 4, 10, 20
+        loc_token_ids = torch.arange(0, C, dtype=torch.long)
+        gt_bin = 3
+        gt_loc_ids = torch.full((N,), gt_bin, dtype=torch.long)
+        sigma = 2.0
+        k = torch.arange(C, dtype=torch.float32)
+        soft = torch.exp(-0.5 * (k - gt_bin) ** 2 / sigma ** 2)
+        soft = soft / soft.sum()
+        # Build logits where only loc positions get mass (proportional to soft label).
+        # Non-loc logits are suppressed so log_softmax over loc ≈ log(soft).
+        logits_matched = torch.full((N, V), -100.0)
+        logits_matched[:, loc_token_ids] = torch.log(soft).unsqueeze(0).expand(N, -1)
+        logits_uniform = torch.zeros(N, V)
+        loss_matched = gaussian_soft_label_ce(logits_matched, gt_loc_ids, loc_token_ids, sigma=sigma)
+        loss_uniform = gaussian_soft_label_ce(logits_uniform, gt_loc_ids, loc_token_ids, sigma=sigma)
+        self.assertLess(float(loss_matched.item()), float(loss_uniform.item()))
+
+    def test_wider_sigma_smooths_loss(self):
+        # Larger sigma should give lower loss when GT bin gets some probability mass.
+        N, C, V = 4, 20, 30
+        loc_token_ids = torch.arange(0, C, dtype=torch.long)
+        gt_loc_ids = torch.full((N,), 10, dtype=torch.long)
+        logits = torch.randn(N, V)
+        loss_narrow = gaussian_soft_label_ce(logits, gt_loc_ids, loc_token_ids, sigma=1.0)
+        loss_wide = gaussian_soft_label_ce(logits, gt_loc_ids, loc_token_ids, sigma=15.0)
+        # Wide sigma distributes credit across many bins; hard to assert direction
+        # strictly, but both should be finite and non-negative.
+        self.assertFalse(torch.isnan(loss_narrow).item())
+        self.assertFalse(torch.isnan(loss_wide).item())
+
+    def test_empty_N_returns_zero(self):
+        loc_token_ids = torch.arange(0, 10, dtype=torch.long)
+        gt_loc_ids = torch.zeros(0, dtype=torch.long)
+        logits = torch.zeros(0, 20)
+        loss = gaussian_soft_label_ce(logits, gt_loc_ids, loc_token_ids)
+        self.assertAlmostEqual(float(loss.item()), 0.0)
+
+    def test_empty_C_returns_zero(self):
+        loc_token_ids = torch.zeros(0, dtype=torch.long)
+        gt_loc_ids = torch.tensor([3, 5], dtype=torch.long)
+        logits = torch.randn(2, 20)
+        loss = gaussian_soft_label_ce(logits, gt_loc_ids, loc_token_ids)
+        self.assertAlmostEqual(float(loss.item()), 0.0)
 
 
 class TestComputeAnswerLoss(unittest.TestCase):

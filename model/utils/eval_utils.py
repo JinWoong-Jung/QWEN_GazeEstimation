@@ -85,9 +85,10 @@ def decode_generated(
             if tok is not None
             else str(new_tokens.tolist())
         )
-        # Keep <|im_end|> intact — the parser accepts it as an optional trailing EOS.
-        # Strip other Qwen chat markers (e.g. <|endoftext|>) but not im_start/im_end.
-        txt = re.sub(r"<\|(?!im_start\||im_end\|)[^>]+?\|>", "", str(txt)).strip()
+        # Keep parser-visible schema markers intact. The parser accepts <|im_end|>
+        # as an optional trailing EOS, and gaze markers are part of the output schema.
+        # Strip other Qwen chat markers (e.g. <|endoftext|>).
+        txt = re.sub(r"<\|(?!im_start\||im_end\||gaze_)[^>]+?\|>", "", str(txt)).strip()
         out.append(str(txt))
     return out
 

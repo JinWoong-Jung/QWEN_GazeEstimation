@@ -64,9 +64,7 @@ def init_wandb(args: Any, root: Path):
         run = wandb.init(**wb_kwargs)
         print(f"[INFO] wandb enabled (project={args.wandb_project}, run={run.name}).")
         try:
-            wandb.define_metric("train/FormatValidRate", summary="max")
-            wandb.define_metric("train/FormatValidRate_direct", summary="max")
-            wandb.define_metric("train/FormatValidRate_reasoning", summary="max")
+            wandb.define_metric("train/loss", summary="min")
             wandb.define_metric("val/loss", summary="min")
             wandb.define_metric("val/dist", summary="min")
             wandb.define_metric("val/object_acc", summary="max")
