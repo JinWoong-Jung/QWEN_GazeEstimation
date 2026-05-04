@@ -373,6 +373,9 @@ def main() -> None:
         no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
         stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
         max_samples=len(dataset),
+        constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+        constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+        constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
     )
 
     if len(samples) != len(groups):

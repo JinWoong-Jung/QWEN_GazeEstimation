@@ -29,6 +29,17 @@ class TestRunNameConfig(unittest.TestCase):
         args = build_parser().parse_args(["--test-only", "--no-test-only"])
         self.assertFalse(args.test_only)
 
+    def test_parser_accepts_point_expectation_loss_options(self) -> None:
+        parser = build_parser(
+            defaults={
+                "point_expectation_weight": 0.15,
+                "point_expectation_loss": "l2",
+            }
+        )
+        args = parser.parse_args([])
+        self.assertAlmostEqual(args.point_expectation_weight, 0.15)
+        self.assertEqual(args.point_expectation_loss, "l2")
+
     def test_output_dir_replaces_existing_leaf_with_run_name(self) -> None:
         self.assertEqual(
             output_dir_from_run_name("checkpoints/qwen_ge", "exp_beta"),

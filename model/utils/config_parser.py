@@ -150,6 +150,13 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--generation_stop_at_object_end", dest="generation_stop_at_object_end", action="store_true")
     p.add_argument("--no_generation_stop_at_object_end", dest="generation_stop_at_object_end", action="store_false")
     p.set_defaults(generation_stop_at_object_end=bool(default_value(d, "generation_stop_at_object_end", True)))
+    p.add_argument("--constrained_decoding", dest="constrained_decoding", action="store_true")
+    p.add_argument("--no_constrained_decoding", dest="constrained_decoding", action="store_false")
+    p.set_defaults(constrained_decoding=bool(default_value(d, "constrained_decoding", False)))
+    p.add_argument("--constrained_target_order", type=str,
+                   default=str(default_value(d, "constrained_target_order", "point_object")))
+    p.add_argument("--constrained_temperature", type=float,
+                   default=float(default_value(d, "constrained_temperature", 1.0)))
 
     # --- prompt ---
     p.add_argument("--prompt_template", type=str, default=str(default_value(d, "prompt_template", "")))
@@ -197,6 +204,8 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--loss_format_weight", type=float, default=float(default_value(d, "loss_format_weight", 0.25)))
     p.add_argument("--loss_reasoning_weight", type=float, default=float(default_value(d, "loss_reasoning_weight", 0.3)))
     p.add_argument("--gaussian_point_sigma", type=float, default=float(default_value(d, "gaussian_point_sigma", 0.0)))
+    p.add_argument("--point_expectation_weight", type=float, default=float(default_value(d, "point_expectation_weight", 0.0)))
+    p.add_argument("--point_expectation_loss", type=str, default=str(default_value(d, "point_expectation_loss", "l1")))
 
     # --- RL (disabled by default) ---
     p.add_argument("--rl_enabled", dest="rl_enabled", action="store_true")

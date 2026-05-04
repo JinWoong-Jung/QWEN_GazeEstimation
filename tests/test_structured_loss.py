@@ -8,6 +8,7 @@ from model.utils.loss_utils import (
     compute_answer_loss,
     compute_structured_loss,
     gaussian_soft_label_ce,
+    loc_expectation_loss,
     masked_sample_exact_rate,
     masked_token_ce,
 )
@@ -194,6 +195,57 @@ class TestGaussianSoftLabelCE(unittest.TestCase):
         logits = torch.randn(2, 20)
         loss = gaussian_soft_label_ce(logits, gt_loc_ids, loc_token_ids)
         self.assertAlmostEqual(float(loss.item()), 0.0)
+
+
+class TestLocExpectationLoss(unittest.TestCase):
+    def test_matched_expected_bin_lowers_loss(self):
+        C, V = 8, 12
+        loc_token_ids = torch.arange(0, C, dtype=torch.long)
+        gt_loc_ids = torch.tensor([3], dtype=torch.long)
+
+        logits_matched = torch.full((1, V), -20.0)
+        logits_matched[0, 3] = 20.0
+        logits_far = torch.full((1, V), -20.0)
+        logits_far[0, 7] = 20.0
+
+        matched = loc_expectation_loss(logits_matched, gt_loc_ids, loc_token_ids, loss_type="l1")
+        far = loc_expectation_loss(logits_far, gt_loc_ids, loc_token_ids, loss_type="l1")
+        self.assertLess(float(matched.item()), float(far.item()))
+
+    def test_compute_structured_loss_adds_expectation_term(self):
+        bsz, seqlen, vocab = 1, 5, 8
+        logits = torch.zeros(bsz, seqlen, vocab)
+        labels = torch.full((bsz, seqlen), -100, dtype=torch.long)
+        labels[0, 2] = 3
+        mask_pt = torch.zeros(bsz, seqlen, dtype=torch.bool)
+        mask_pt[0, 2] = True
+        z = torch.zeros(bsz, seqlen, dtype=torch.bool)
+        loc_token_ids = torch.arange(0, 5, dtype=torch.long)
+
+        d0 = compute_structured_loss(
+            logits=logits,
+            labels=labels,
+            loss_mask_point=mask_pt,
+            loss_mask_object=z,
+            loss_mask_format=z,
+            weight_point=0.0,
+            weight_point_expectation=0.0,
+            loc_token_ids=loc_token_ids,
+        )
+        d1 = compute_structured_loss(
+            logits=logits,
+            labels=labels,
+            loss_mask_point=mask_pt,
+            loss_mask_object=z,
+            loss_mask_format=z,
+            weight_point=0.0,
+            weight_point_expectation=1.0,
+            loc_token_ids=loc_token_ids,
+            point_expectation_loss="l1",
+        )
+        self.assertAlmostEqual(float(d0["loss"].item()), 0.0)
+        self.assertGreater(float(d1["loss"].item()), 0.0)
+        self.assertIn("loss_point_expectation", d1)
 
 
 class TestComputeAnswerLoss(unittest.TestCase):

@@ -70,6 +70,9 @@ eval:
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
   generation_stop_at_object_end: false  # stop at natural EOS; reasoning_point_object needs full output
+  constrained_decoding: true           # true로 바꾸면 slot-level constrained eval 활성화
+  constrained_target_order: point_object  # _eval_target_order와 일치 (trainer.py L1445); training target_order와 다를 수 있음
+  constrained_temperature: 1.0
 
 prompt:
   visual_prompting: true
@@ -107,6 +110,8 @@ loss:
   loss_format_weight: 0.2
   loss_reasoning_weight: 0.05
   gaussian_point_sigma: 7.0   # Gaussian soft-label CE sigma (bins). 0.0 = hard CE.
+  point_expectation_weight: 0.1  # Optional expected-bin auxiliary loss. 0.0 = disabled.
+  point_expectation_loss: "l2"   # l1 | l2
 
 wandb:
   enabled: true

@@ -402,6 +402,9 @@ def maybe_save_generation_preview(
         no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
         max_samples=preview_n,
         stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+        constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+        constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+        constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
     )
     preview_path = out_dir / filename
     preview_path.write_text(
@@ -1017,6 +1020,9 @@ def _run_rl_training(
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+                constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
             )
             maybe_save_generation_preview(
                 args=args,
@@ -1159,7 +1165,9 @@ def main() -> None:
         "object": float(getattr(args, "loss_object_weight", 1.0)),
         "format": float(getattr(args, "loss_format_weight", 0.25)),
         "reasoning": float(getattr(args, "loss_reasoning_weight", 0.3)),
+        "point_expectation": float(getattr(args, "point_expectation_weight", 0.0)),
     }
+    point_expectation_loss = str(getattr(args, "point_expectation_loss", "l1") or "l1")
     coord_bins = int(getattr(args, "coord_bins", 1000))
     if coord_bins <= 0:
         raise ValueError(f"coord_bins must be positive, got: {coord_bins}")
@@ -1326,6 +1334,9 @@ def main() -> None:
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+                constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
@@ -1776,6 +1787,9 @@ def main() -> None:
                     repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                     no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                     stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+                    constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+                    constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                    constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
                 )
                 print_test_metrics_table(test_metrics)
                 if wandb_run is not None:
@@ -1828,7 +1842,9 @@ def main() -> None:
     print(
         f"[INFO] structured SFT loss: point_w={loss_weights['point']:.2f} "
         f"object_w={loss_weights['object']:.2f} format_w={loss_weights['format']:.2f} "
-        f"reasoning_w={loss_weights['reasoning']:.2f}"
+        f"reasoning_w={loss_weights['reasoning']:.2f} "
+        f"point_expectation_w={loss_weights['point_expectation']:.2f} "
+        f"point_expectation_loss={point_expectation_loss}"
     )
     checkpoint_monitor = str(getattr(args, "checkpoint_monitor", "val_dist")).strip() or "val_dist"
     checkpoint_monitor_mode = infer_checkpoint_monitor_mode(
@@ -1906,6 +1922,8 @@ def main() -> None:
                     weight_object=loss_weights["object"],
                     weight_format=loss_weights["format"],
                     weight_reasoning=loss_weights["reasoning"],
+                    weight_point_expectation=loss_weights["point_expectation"],
+                    point_expectation_loss=point_expectation_loss,
                     compute_format_rate=False,
                     loc_token_ids=(
                         loc_token_ids_tensor.to(device)
@@ -1980,6 +1998,8 @@ def main() -> None:
                 device,
                 amp_dtype,
                 loss_weights=loss_weights,
+                loc_token_ids=loc_token_ids_tensor,
+                point_expectation_loss=point_expectation_loss,
                 show_tqdm=bool(args.show_tqdm),
                 desc=f"Eval {epoch}/{args.epochs}",
             )
@@ -2013,6 +2033,9 @@ def main() -> None:
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+                constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
             )
             maybe_save_generation_preview(
                 args=args,
@@ -2048,6 +2071,7 @@ def main() -> None:
             payload: dict[str, float] = {
                 "val/loss": float(val_loss),
                 "val/loss_point": float(val_metrics.get("loss_point", 0.0)),
+                "val/loss_point_expectation": float(val_metrics.get("loss_point_expectation", 0.0)),
                 "val/loss_object": float(val_metrics.get("loss_object", 0.0)),
                 "val/loss_format": float(val_metrics.get("loss_format", 0.0)),
             }
@@ -2109,6 +2133,8 @@ def main() -> None:
             device,
             amp_dtype,
             loss_weights=loss_weights,
+            loc_token_ids=loc_token_ids_tensor,
+            point_expectation_loss=point_expectation_loss,
             show_tqdm=bool(args.show_tqdm),
             desc="Eval (checkpoint)",
         )
@@ -2130,6 +2156,9 @@ def main() -> None:
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+                constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
             )
         print(f"[EVAL] val_loss={best_val_loss:.6f}")
         if wandb_run is not None:
@@ -2209,6 +2238,9 @@ def main() -> None:
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+                constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:

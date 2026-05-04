@@ -12,6 +12,10 @@ from transformers import StoppingCriteria, StoppingCriteriaList
 from .common import to_device
 from .gaze_tokens import (
     ANSWER_END,
+    GAZE_OBJECT_MARKER,
+    GAZE_POINT_MARKER,
+    format_loc_token,
+    format_obj_token,
     parse_structured_output_text,
 )
 from .loss_utils import compute_answer_loss
@@ -63,6 +67,157 @@ def make_gaze_obj_end_stopping_criteria(
 # ---------------------------------------------------------------------------
 # Decode helpers
 # ---------------------------------------------------------------------------
+
+def _single_token_id(tokenizer: Any, token: str) -> int:
+    ids = tokenizer.encode(str(token), add_special_tokens=False)
+    if len(ids) != 1:
+        raise ValueError(
+            f"Expected single-token special token, got {token!r} -> {ids}"
+        )
+    return int(ids[0])
+
+
+def _loc_token_ids(tokenizer: Any, coord_bins: int) -> list[int]:
+    width = max(3, len(str(max(0, int(coord_bins) - 1))))
+    return [
+        _single_token_id(tokenizer, format_loc_token(i, width))
+        for i in range(int(coord_bins))
+    ]
+
+
+def _obj_token_ids(tokenizer: Any, num_classes: int) -> list[int]:
+    width = max(3, len(str(max(0, int(num_classes) - 1))))
+    return [
+        _single_token_id(tokenizer, format_obj_token(i, width))
+        for i in range(int(num_classes))
+    ]
+
+
+def _marker_id(tokenizer: Any, marker: str) -> int:
+    return _single_token_id(tokenizer, marker)
+
+
+def _append_token_to_joint(
+    joint: dict[str, Any], token_ids: torch.LongTensor
+) -> dict[str, Any]:
+    out = dict(joint)
+    token_ids = token_ids.to(device=joint["input_ids"].device, dtype=torch.long)
+    if token_ids.dim() == 1:
+        token_ids = token_ids[:, None]
+    out["input_ids"] = torch.cat([joint["input_ids"], token_ids], dim=1)
+    if "attention_mask" in joint and torch.is_tensor(joint["attention_mask"]):
+        new_mask = torch.ones_like(token_ids, dtype=joint["attention_mask"].dtype)
+        out["attention_mask"] = torch.cat([joint["attention_mask"], new_mask], dim=1)
+    return out
+
+
+def _select_next_from_allowed(
+    model: torch.nn.Module,
+    joint: dict[str, Any],
+    allowed_token_ids: list[int],
+    amp_dtype: torch.dtype,
+    temperature: float = 1.0,
+) -> tuple[torch.LongTensor, torch.Tensor]:
+    device = joint["input_ids"].device
+    allowed = torch.tensor(allowed_token_ids, device=device, dtype=torch.long)
+    with torch.autocast(
+        device_type=device.type,
+        dtype=amp_dtype,
+        enabled=(device.type == "cuda"),
+    ):
+        out = model(joint_inputs=joint, use_cache=False)
+        logits = out["logits"][:, -1, :]  # [B, vocab]
+    allowed_logits = logits.index_select(dim=-1, index=allowed)  # [B, K]
+    temp = max(float(temperature), 1e-6)
+    allowed_probs = torch.softmax(allowed_logits / temp, dim=-1)
+    selected_idx = torch.argmax(allowed_probs, dim=-1)  # [B]
+    selected_token_ids = allowed.index_select(dim=0, index=selected_idx)  # [B]
+    return selected_token_ids, allowed_probs
+
+
+def constrained_generate_structured(
+    model: torch.nn.Module,
+    joint: dict[str, Any],
+    processor: Any,
+    num_classes: int,
+    coord_bins: int,
+    amp_dtype: torch.dtype,
+    target_order: str = "point_object",
+    temperature: float = 1.0,
+) -> list[str]:
+    """Slot-level constrained decoding using Qwen LM logits directly.
+
+    Supported target_order values: "point_object", "object_point".
+    Reasoning-prefixed orders are not supported and raise ValueError —
+    val/test uses _eval_target_order="point_object" (trainer.py).
+    """
+    order = str(target_order or "point_object").strip()
+    if order not in {"point_object", "object_point"}:
+        raise ValueError(
+            f"constrained_generate_structured: unsupported target_order={order!r}. "
+            "Supported: 'point_object', 'object_point'. "
+            "Reasoning-prefixed orders are out of scope for constrained eval."
+        )
+
+    tokenizer = getattr(processor, "tokenizer", None) or processor
+    device = joint["input_ids"].device
+    bsz = int(joint["input_ids"].shape[0])
+
+    loc_ids = _loc_token_ids(tokenizer, coord_bins=int(coord_bins))
+    obj_ids = _obj_token_ids(tokenizer, num_classes=int(num_classes))
+
+    point_marker_id = _marker_id(tokenizer, GAZE_POINT_MARKER)
+    object_marker_id = _marker_id(tokenizer, GAZE_OBJECT_MARKER)
+
+    point_marker = torch.full((bsz,), point_marker_id, device=device, dtype=torch.long)
+    object_marker = torch.full((bsz,), object_marker_id, device=device, dtype=torch.long)
+
+    cur = dict(joint)
+    generated_steps: list[torch.LongTensor] = []
+
+    if order == "point_object":
+        # <|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>
+        cur = _append_token_to_joint(cur, point_marker)
+        generated_steps.append(point_marker)
+
+        x_tok, _ = _select_next_from_allowed(model, cur, loc_ids, amp_dtype=amp_dtype, temperature=temperature)
+        cur = _append_token_to_joint(cur, x_tok)
+        generated_steps.append(x_tok)
+
+        y_tok, _ = _select_next_from_allowed(model, cur, loc_ids, amp_dtype=amp_dtype, temperature=temperature)
+        cur = _append_token_to_joint(cur, y_tok)
+        generated_steps.append(y_tok)
+
+        cur = _append_token_to_joint(cur, object_marker)
+        generated_steps.append(object_marker)
+
+        obj_tok, _ = _select_next_from_allowed(model, cur, obj_ids, amp_dtype=amp_dtype, temperature=temperature)
+        generated_steps.append(obj_tok)
+
+    else:
+        # order == "object_point"
+        # <|gaze_object|><obj_k><|gaze_point|><loc_x><loc_y>
+        cur = _append_token_to_joint(cur, object_marker)
+        generated_steps.append(object_marker)
+
+        obj_tok, _ = _select_next_from_allowed(model, cur, obj_ids, amp_dtype=amp_dtype, temperature=temperature)
+        cur = _append_token_to_joint(cur, obj_tok)
+        generated_steps.append(obj_tok)
+
+        cur = _append_token_to_joint(cur, point_marker)
+        generated_steps.append(point_marker)
+
+        x_tok, _ = _select_next_from_allowed(model, cur, loc_ids, amp_dtype=amp_dtype, temperature=temperature)
+        cur = _append_token_to_joint(cur, x_tok)
+        generated_steps.append(x_tok)
+
+        y_tok, _ = _select_next_from_allowed(model, cur, loc_ids, amp_dtype=amp_dtype, temperature=temperature)
+        generated_steps.append(y_tok)
+
+    gen_ids = torch.stack(generated_steps, dim=1)  # [B, T]
+    texts = tokenizer.batch_decode(gen_ids.detach().cpu(), skip_special_tokens=False)
+    return [str(t).strip() for t in texts]
+
 
 def decode_generated(
     processor: Any,
@@ -134,6 +289,9 @@ def run_eval(
     device: torch.device,
     amp_dtype: torch.dtype,
     loss_weights: dict[str, float] | None = None,
+    loc_token_ids: torch.Tensor | None = None,
+    gaussian_point_sigma: float = 0.0,
+    point_expectation_loss: str = "l1",
     show_tqdm: bool = True,
     desc: str = "Eval",
 ) -> dict[str, float]:
@@ -143,6 +301,7 @@ def run_eval(
 
     loss_sum = 0.0
     pt_sum = 0.0
+    pt_exp_sum = 0.0
     obj_sum = 0.0
     fmt_sum = 0.0
     count = 0
@@ -170,9 +329,20 @@ def run_eval(
                 weight_point=float(loss_weights.get("point", 1.0)),
                 weight_object=float(loss_weights.get("object", 1.0)),
                 weight_format=float(loss_weights.get("format", 0.25)),
+                weight_reasoning=float(loss_weights.get("reasoning", 0.3)),
+                weight_point_expectation=float(loss_weights.get("point_expectation", 0.0)),
+                point_expectation_loss=str(point_expectation_loss or "l1"),
+                loc_token_ids=loc_token_ids.to(device) if loc_token_ids is not None else None,
+                gaussian_sigma=float(gaussian_point_sigma),
             )
             loss_sum += float(losses["loss"].detach().item()) * float(bsz)
             pt_sum += float(losses["loss_point"].detach().item()) * float(bsz)
+            l_pt_exp = losses.get("loss_point_expectation", 0.0)
+            pt_exp_sum += (
+                float(l_pt_exp.detach().item())
+                if torch.is_tensor(l_pt_exp)
+                else float(l_pt_exp)
+            ) * float(bsz)
             obj_sum += float(losses["loss_object"].detach().item()) * float(bsz)
             fmt_sum += float(losses["loss_format"].detach().item()) * float(bsz)
             count += bsz
@@ -180,11 +350,18 @@ def run_eval(
                 it.set_postfix(loss=f"{(loss_sum / max(count, 1)):.4f}")
 
     if count <= 0:
-        return {"loss": 0.0, "loss_point": 0.0, "loss_object": 0.0, "loss_format": 0.0}
+        return {
+            "loss": 0.0,
+            "loss_point": 0.0,
+            "loss_point_expectation": 0.0,
+            "loss_object": 0.0,
+            "loss_format": 0.0,
+        }
     d = float(count)
     return {
         "loss": float(loss_sum / d),
         "loss_point": float(pt_sum / d),
+        "loss_point_expectation": float(pt_exp_sum / d),
         "loss_object": float(obj_sum / d),
         "loss_format": float(fmt_sum / d),
     }
@@ -205,6 +382,9 @@ def run_test_metrics(
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 0,
     stop_at_object_end: bool = True,
+    constrained_decoding: bool = False,
+    constrained_target_order: str = "point_object",
+    constrained_temperature: float = 1.0,
 ) -> dict[str, float]:
     model.eval()
 
@@ -251,38 +431,51 @@ def run_test_metrics(
             target_object_valid = target_object_valid.to(dtype=torch.float32)
             target_format_valid = target_format_valid.to(dtype=torch.float32)
 
-            prompt_len = int(joint["input_ids"].shape[1])
-            stopping = make_gaze_obj_end_stopping_criteria(
-                processor, prompt_len, stop_at_object_end=bool(stop_at_object_end)
-            )
-
-            with torch.autocast(
-                device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
-            ):
-                generate_kwargs: dict[str, Any] = dict(
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    num_beams=beam_k,
-                    repetition_penalty=max(float(repetition_penalty), 1.0),
-                    no_repeat_ngram_size=max(0, int(no_repeat_ngram_size)),
+            if bool(constrained_decoding):
+                with torch.no_grad():
+                    preds = constrained_generate_structured(
+                        model=model,
+                        joint=joint,
+                        processor=processor,
+                        num_classes=int(num_classes),
+                        coord_bins=int(coord_bins),
+                        amp_dtype=amp_dtype,
+                        target_order=str(constrained_target_order),
+                        temperature=float(constrained_temperature),
+                    )
+            else:
+                prompt_len = int(joint["input_ids"].shape[1])
+                stopping = make_gaze_obj_end_stopping_criteria(
+                    processor, prompt_len, stop_at_object_end=bool(stop_at_object_end)
                 )
-                if stopping is not None:
-                    generate_kwargs["stopping_criteria"] = stopping
-                generated_ids = model.generate(joint_inputs=joint, **generate_kwargs)
 
-            generated_ids_cpu = generated_ids.detach().cpu()
-            input_ids_cpu = joint["input_ids"].detach().cpu()
-            attn_cpu = joint.get("attention_mask", None)
-            if torch.is_tensor(attn_cpu):
-                attn_cpu = attn_cpu.detach().cpu()
+                with torch.autocast(
+                    device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
+                ):
+                    generate_kwargs: dict[str, Any] = dict(
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        num_beams=beam_k,
+                        repetition_penalty=max(float(repetition_penalty), 1.0),
+                        no_repeat_ngram_size=max(0, int(no_repeat_ngram_size)),
+                    )
+                    if stopping is not None:
+                        generate_kwargs["stopping_criteria"] = stopping
+                    generated_ids = model.generate(joint_inputs=joint, **generate_kwargs)
 
-            preds = decode_generated(
-                processor=processor,
-                generated_ids=generated_ids_cpu,
-                input_ids=input_ids_cpu,
-                attention_mask=attn_cpu,
-                num_return_sequences=1,
-            )
+                generated_ids_cpu = generated_ids.detach().cpu()
+                input_ids_cpu = joint["input_ids"].detach().cpu()
+                attn_cpu = joint.get("attention_mask", None)
+                if torch.is_tensor(attn_cpu):
+                    attn_cpu = attn_cpu.detach().cpu()
+
+                preds = decode_generated(
+                    processor=processor,
+                    generated_ids=generated_ids_cpu,
+                    input_ids=input_ids_cpu,
+                    attention_mask=attn_cpu,
+                    num_return_sequences=1,
+                )
             bsz = len(target_texts)
             preds = preds[:bsz]
 
@@ -416,6 +609,9 @@ def collect_generation_samples(
     no_repeat_ngram_size: int = 0,
     max_samples: int = 8,
     stop_at_object_end: bool = True,
+    constrained_decoding: bool = False,
+    constrained_target_order: str = "point_object",
+    constrained_temperature: float = 1.0,
 ) -> list[dict[str, Any]]:
     limit = max(0, int(max_samples))
     if limit <= 0:
@@ -442,37 +638,49 @@ def collect_generation_samples(
                 target_valid = torch.ones((len(target_texts),), dtype=torch.float32)
             target_valid = target_valid.to(dtype=torch.float32)
 
-            prompt_len = int(joint["input_ids"].shape[1])
-            stopping = make_gaze_obj_end_stopping_criteria(
-                processor, prompt_len, stop_at_object_end=bool(stop_at_object_end)
-            )
-            with torch.autocast(
-                device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
-            ):
-                generate_kwargs: dict[str, Any] = dict(
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    num_beams=beam_k,
-                    repetition_penalty=max(float(repetition_penalty), 1.0),
-                    no_repeat_ngram_size=max(0, int(no_repeat_ngram_size)),
+            if bool(constrained_decoding):
+                preds = constrained_generate_structured(
+                    model=model,
+                    joint=joint,
+                    processor=processor,
+                    num_classes=int(num_classes),
+                    coord_bins=int(coord_bins),
+                    amp_dtype=amp_dtype,
+                    target_order=str(constrained_target_order),
+                    temperature=float(constrained_temperature),
                 )
-                if stopping is not None:
-                    generate_kwargs["stopping_criteria"] = stopping
-                generated_ids = model.generate(joint_inputs=joint, **generate_kwargs)
+            else:
+                prompt_len = int(joint["input_ids"].shape[1])
+                stopping = make_gaze_obj_end_stopping_criteria(
+                    processor, prompt_len, stop_at_object_end=bool(stop_at_object_end)
+                )
+                with torch.autocast(
+                    device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
+                ):
+                    generate_kwargs: dict[str, Any] = dict(
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        num_beams=beam_k,
+                        repetition_penalty=max(float(repetition_penalty), 1.0),
+                        no_repeat_ngram_size=max(0, int(no_repeat_ngram_size)),
+                    )
+                    if stopping is not None:
+                        generate_kwargs["stopping_criteria"] = stopping
+                    generated_ids = model.generate(joint_inputs=joint, **generate_kwargs)
 
-            generated_ids_cpu = generated_ids.detach().cpu()
-            input_ids_cpu = joint["input_ids"].detach().cpu()
-            attn_cpu = joint.get("attention_mask", None)
-            if torch.is_tensor(attn_cpu):
-                attn_cpu = attn_cpu.detach().cpu()
+                generated_ids_cpu = generated_ids.detach().cpu()
+                input_ids_cpu = joint["input_ids"].detach().cpu()
+                attn_cpu = joint.get("attention_mask", None)
+                if torch.is_tensor(attn_cpu):
+                    attn_cpu = attn_cpu.detach().cpu()
 
-            preds = decode_generated(
-                processor=processor,
-                generated_ids=generated_ids_cpu,
-                input_ids=input_ids_cpu,
-                attention_mask=attn_cpu,
-                num_return_sequences=1,
-            )
+                preds = decode_generated(
+                    processor=processor,
+                    generated_ids=generated_ids_cpu,
+                    input_ids=input_ids_cpu,
+                    attention_mask=attn_cpu,
+                    num_return_sequences=1,
+                )
             bsz = len(target_texts)
             preds = preds[:bsz]
 
