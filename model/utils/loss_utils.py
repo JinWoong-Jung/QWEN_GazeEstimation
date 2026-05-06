@@ -125,38 +125,6 @@ def gaussian_soft_label_ce(
     return -(soft * log_p).sum(dim=-1).mean()
 
 
-def loc_expectation_loss(
-    logits_at_pt: torch.Tensor,
-    gt_loc_ids: torch.Tensor,
-    loc_token_ids: torch.Tensor,
-    loss_type: str = "l1",
-) -> torch.Tensor:
-    """Loss on the expected coordinate bin from the loc-token distribution."""
-    C = int(loc_token_ids.shape[0])
-    N = int(logits_at_pt.shape[0])
-    if N <= 0 or C <= 0:
-        return torch.zeros((), device=logits_at_pt.device, dtype=logits_at_pt.dtype)
-
-    loc_ids_dev = loc_token_ids.to(device=logits_at_pt.device)
-    gt_ids_dev = gt_loc_ids.to(device=logits_at_pt.device)
-    gt_match = gt_ids_dev.unsqueeze(1) == loc_ids_dev.unsqueeze(0)
-    valid = gt_match.any(dim=1)
-    if not bool(valid.any().item()):
-        return torch.zeros((), device=logits_at_pt.device, dtype=logits_at_pt.dtype)
-
-    loc_logits = logits_at_pt[valid].index_select(dim=-1, index=loc_ids_dev)
-    probs = torch.softmax(loc_logits, dim=-1)
-    bins = torch.arange(C, device=logits_at_pt.device, dtype=logits_at_pt.dtype)
-    pred_bin = (probs * bins.unsqueeze(0)).sum(dim=-1)
-    gt_bin = gt_match[valid].to(dtype=logits_at_pt.dtype).argmax(dim=1).to(dtype=logits_at_pt.dtype)
-
-    denom = float(max(C - 1, 1))
-    diff = (pred_bin - gt_bin) / denom
-    if str(loss_type or "l1").strip().lower() in {"l2", "mse"}:
-        return diff.pow(2).mean()
-    return diff.abs().mean()
-
-
 def compute_structured_loss(
     *,
     logits: torch.Tensor | None,
@@ -169,20 +137,18 @@ def compute_structured_loss(
     weight_object: float = 1.0,
     weight_format: float = 0.25,
     weight_reasoning: float = 0.3,
-    weight_point_expectation: float = 0.0,
-    point_expectation_loss: str = "l1",
     compute_format_rate: bool = False,
     loc_token_ids: torch.Tensor | None = None,
     gaussian_sigma: float = 0.0,
 ) -> dict[str, Any]:
-    """Compute structured SFT loss with optional point expectation auxiliary loss.
+    """Compute structured SFT loss.
 
     CE is computed once on the union of valid mask positions, then split by
     category. compute_format_rate gates the expensive argmax-based format
     exact-match rate — pass True only at wandb logging steps.
 
     Returns dict with keys:
-        loss, loss_point, loss_point_expectation, loss_object, loss_format, loss_reasoning,
+        loss, loss_point, loss_object, loss_format, loss_reasoning,
         n_point_tokens, n_object_tokens, n_format_tokens, n_reasoning_tokens,
         format_valid_rate, n_format_samples
     """
@@ -197,7 +163,6 @@ def compute_structured_loss(
         return {
             "loss": z,
             "loss_point": z,
-            "loss_point_expectation": z,
             "loss_object": z,
             "loss_format": z,
             "loss_reasoning": z,
@@ -275,21 +240,8 @@ def compute_structured_loss(
         l_obj = _cat_mean(obj_valid, n_obj)
         l_fmt = _cat_mean(fmt_valid, n_fmt)
         l_rsn = _cat_mean(rsn_valid, n_rsn)
-        if (
-            loc_token_ids is not None
-            and float(weight_point_expectation) > 0.0
-            and n_pt > 0
-        ):
-            l_pt_exp = loc_expectation_loss(
-                pt_logits,
-                pt_labels,
-                loc_token_ids.to(device=device),
-                loss_type=str(point_expectation_loss or "l1"),
-            )
-        else:
-            l_pt_exp = z
     else:
-        l_pt = l_pt_exp = l_obj = l_fmt = l_rsn = z
+        l_pt = l_obj = l_fmt = l_rsn = z
 
     fmt_valid_rate, n_fmt_samples = (
         masked_sample_exact_rate(logits, labels, loss_mask_format)
@@ -298,12 +250,9 @@ def compute_structured_loss(
     )
 
     wp, wo, wf, wr = float(weight_point), float(weight_object), float(weight_format), float(weight_reasoning)
-    wpe = float(weight_point_expectation)
     total = z
     if n_pt > 0:
         total = total + wp * l_pt
-    if n_pt > 0 and wpe > 0.0:
-        total = total + wpe * l_pt_exp
     if n_obj > 0:
         total = total + wo * l_obj
     if n_fmt > 0:
@@ -314,7 +263,6 @@ def compute_structured_loss(
     return {
         "loss": total,
         "loss_point": l_pt,
-        "loss_point_expectation": l_pt_exp,
         "loss_object": l_obj,
         "loss_format": l_fmt,
         "loss_reasoning": l_rsn,
@@ -341,8 +289,6 @@ def compute_answer_loss(
     weight_object: float = 1.0,
     weight_format: float = 0.25,
     weight_reasoning: float = 0.3,
-    weight_point_expectation: float = 0.0,
-    point_expectation_loss: str = "l1",
     compute_format_rate: bool = False,
     loc_token_ids: torch.Tensor | None = None,
     gaussian_sigma: float = 0.0,
@@ -378,8 +324,6 @@ def compute_answer_loss(
             weight_object=float(weight_object),
             weight_format=float(weight_format),
             weight_reasoning=float(weight_reasoning),
-            weight_point_expectation=float(weight_point_expectation),
-            point_expectation_loss=str(point_expectation_loss or "l1"),
             compute_format_rate=compute_format_rate,
             loc_token_ids=loc_token_ids,
             gaussian_sigma=float(gaussian_sigma),
@@ -407,7 +351,6 @@ def compute_answer_loss(
         "loss_object": z,
         "loss_format": z,
         "loss_reasoning": z,
-        "loss_point_expectation": z,
         "n_answer_tokens": int(n_answer),
         "n_point_tokens": 0,
         "n_object_tokens": 0,

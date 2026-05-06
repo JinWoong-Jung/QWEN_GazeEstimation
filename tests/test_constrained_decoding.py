@@ -222,6 +222,7 @@ class TestConstrainedGenerateStructured(unittest.TestCase):
 
     def test_unsupported_order_raises_value_error(self) -> None:
         joint = _make_joint(bsz=1, seq_len=3)
+        # "reasoning_only" is a training-only target order; constrained eval must reject it.
         with self.assertRaises(ValueError):
             constrained_generate_structured(
                 model=self.model,
@@ -230,7 +231,7 @@ class TestConstrainedGenerateStructured(unittest.TestCase):
                 num_classes=self.num_classes,
                 coord_bins=self.coord_bins,
                 amp_dtype=torch.float32,
-                target_order="reasoning_point_object",
+                target_order="reasoning_only",
             )
 
     def test_batch_size_2(self) -> None:

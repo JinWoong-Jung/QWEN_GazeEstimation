@@ -3,29 +3,38 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# ---------------------------------------------------------------------------
+# Active schema — special-token markers used in all current train/eval paths
+# ---------------------------------------------------------------------------
+
 COORD_BINS: int = 1000
-ANSWER_START: str = ""
 ANSWER_END: str = "<|im_end|>"
-POINT_PREFIX: str = "Point:"
-OBJECT_PREFIX: str = "Object:"
 GAZE_OBJ_UNKNOWN: str = "<obj_unknown>"
 
-REASONING_START: str = "<think>"
-REASONING_END: str = "</think>"
-REASONING_PREFIX: str = "Reasoning:"
-
-# New special-token schema markers
 GAZE_REASONING_MARKER: str = "<|gaze_reasoning|>"
 GAZE_POINT_MARKER: str = "<|gaze_point|>"
 GAZE_OBJECT_MARKER: str = "<|gaze_object|>"
 GAZE_SCHEMA_MARKERS: list[str] = [GAZE_REASONING_MARKER, GAZE_POINT_MARKER, GAZE_OBJECT_MARKER]
-
 FORMAT_TOKENS: list[str] = list(GAZE_SCHEMA_MARKERS)
+
+# ---------------------------------------------------------------------------
+# Legacy constants — kept for backward-compat parsing and legacy target orders
+# ---------------------------------------------------------------------------
+
+ANSWER_START: str = ""          # unused; kept for import compat
+POINT_PREFIX: str = "Point:"    # used in point_object_reasoning legacy order
+OBJECT_PREFIX: str = "Object:"  # used in point_object_reasoning legacy order
+REASONING_PREFIX: str = "Reasoning:"  # used in legacy flat-text parsing
+
+REASONING_START: str = "<think>"   # used by processor_collate legacy mask branch
+REASONING_END: str = "</think>"    # used by processor_collate legacy mask branch
+
+# ---------------------------------------------------------------------------
 
 _LOC_RE = re.compile(r"^<loc_(\d+)>$")
 _OBJ_RE = re.compile(r"^<obj_(\d+)>$")
 
-# --- new special-token schema regexes ---
+# --- active special-token schema regexes ---
 
 # <|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>   (point_object)
 # Groups: 1=loc_x, 2=loc_y, 3=obj
@@ -111,27 +120,42 @@ _STRICT_RE_THINK_FIRST = re.compile(
 )
 
 
-def normalize_reasoning_text(text: str, max_words: int = 30, max_chars: int = 220) -> str:
-    """Collapse whitespace, truncate, and ensure trailing period.
-
-    Also strips any schema marker strings so they cannot leak into reasoning content.
-    """
+def _clean_reasoning_text(text: str) -> str:
+    """Strip schema markers and collapse whitespace in reasoning content."""
     text = str(text or "")
     for marker in GAZE_SCHEMA_MARKERS:
         text = text.replace(marker, "")
-    text = " ".join(text.split())
+    return " ".join(text.split())
+
+
+def _ensure_trailing_period(text: str) -> str:
+    if text and not text.endswith("."):
+        return text + "."
+    return text
+
+
+def normalize_reasoning_text(text: str, max_words: int = 60, max_chars: int = 500) -> str:
+    """Collapse whitespace, truncate, and ensure trailing period.
+
+    Also strips any schema marker strings so they cannot leak into reasoning content.
+    Non-positive max_words/max_chars disables that specific cap.
+    """
+    text = _clean_reasoning_text(text)
     if not text:
         return text
     words = text.split()
-    if len(words) > max_words:
+    if int(max_words) > 0 and len(words) > int(max_words):
         text = " ".join(words[:max_words])
-    if len(text) > max_chars:
-        truncated = text[:max_chars]
+    if int(max_chars) > 0 and len(text) > int(max_chars):
+        truncated = text[:int(max_chars)]
         last_space = truncated.rfind(" ")
         text = truncated[:last_space] if last_space > 0 else truncated
-    if text and not text.endswith("."):
-        text = text + "."
-    return text
+    return _ensure_trailing_period(text)
+
+
+def sanitize_reasoning_text(text: str) -> str:
+    """Normalize reasoning formatting without applying length caps."""
+    return _ensure_trailing_period(_clean_reasoning_text(text))
 
 
 def _obj_token_width(num_classes: int) -> int:
@@ -211,12 +235,15 @@ def build_structured_target_text(
 ) -> str:
     """Build structured target text.
 
-    target_order values:
-      "object_point"           — Object → Point  (direct baseline default)
-      "point_object"           — Point → Object  (legacy)
-      "point_object_reasoning" — Point → Object → Reasoning  (legacy post-hoc)
-      "reasoning_object_point" — Reasoning → Object → Point  (causal reasoning)
-      "reasoning_point_object" — Reasoning → Point → Object  (point-first causal)
+    Active target_order values (used in current train/eval paths):
+      "point_object"           — Point → Object  (direct training & eval)
+      "reasoning_only"         — Reasoning text only  (reasoning_only training views)
+      "object_point"           — Object → Point  (eval alternative)
+
+    Legacy target_order values (kept for backward-compat; not used in new paths):
+      "reasoning_point_object" — Reasoning → Point → Object
+      "reasoning_object_point" — Reasoning → Object → Point
+      "point_object_reasoning" — Point → Object → Reasoning  (post-hoc, text schema)
     """
     coord_n = int(coord_bins)
     bx = quantize_coord(float(point_x), bins=coord_n)
@@ -233,14 +260,14 @@ def build_structured_target_text(
     order = str(target_order or "object_point").strip()
 
     if order == "reasoning_object_point":
-        reasoning_body = normalize_reasoning_text(str(reasoning_text or "").strip())
+        reasoning_body = sanitize_reasoning_text(str(reasoning_text or "").strip())
         if reasoning_body or bool(force_reasoning_format):
             rsn_part = f"{GAZE_REASONING_MARKER}{reasoning_body}"
             return f"{rsn_part}{GAZE_OBJECT_MARKER}{resolved_obj_tok}{GAZE_POINT_MARKER}{loc_x}{loc_y}"
         return f"{GAZE_OBJECT_MARKER}{resolved_obj_tok}{GAZE_POINT_MARKER}{loc_x}{loc_y}"
 
     if order == "reasoning_point_object":
-        reasoning_body = normalize_reasoning_text(str(reasoning_text or "").strip())
+        reasoning_body = sanitize_reasoning_text(str(reasoning_text or "").strip())
         if reasoning_body or bool(force_reasoning_format):
             rsn_part = f"{GAZE_REASONING_MARKER}{reasoning_body}"
             return f"{rsn_part}{GAZE_POINT_MARKER}{loc_x}{loc_y}{GAZE_OBJECT_MARKER}{resolved_obj_tok}"
@@ -260,6 +287,10 @@ def build_structured_target_text(
 
     if order == "point_object":
         return f"{GAZE_POINT_MARKER}{loc_x}{loc_y}{GAZE_OBJECT_MARKER}{resolved_obj_tok}"
+
+    if order == "reasoning_only":
+        reasoning_body = sanitize_reasoning_text(str(reasoning_text or "").strip())
+        return f"{GAZE_REASONING_MARKER}{reasoning_body}"
 
     # default: "object_point"
     return f"{GAZE_OBJECT_MARKER}{resolved_obj_tok}{GAZE_POINT_MARKER}{loc_x}{loc_y}"

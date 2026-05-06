@@ -88,17 +88,23 @@ class TestBuildPrompt(unittest.TestCase):
             (root / name).read_text(encoding="utf-8")
             for name in ("sft.yaml", "config_rl.yaml")
         )
-        self.assertIn("<|gaze_reasoning|><your reasoning here><|gaze_point|>", cfg)
+        # point_object schema (sft.yaml: prompt_text_direct; config_rl.yaml: prompt_text)
         self.assertIn("<|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>", cfg)
+        # reasoning_only schema (sft.yaml: prompt_text_reasoning)
+        self.assertIn("<|gaze_reasoning|><your reasoning here>", cfg)
         self.assertNotIn("Reasoning: <your reasoning here>", cfg)
         self.assertNotIn("Point: <loc_NNN><loc_MMM>", cfg)
         self.assertNotIn("Object: <obj_KKK>", cfg)
 
-    def test_sft_uses_ratio_based_multiview_sampling(self) -> None:
+    def test_sft_uses_split_prompt_multiview_sampling(self) -> None:
         cfg = (Path(__file__).resolve().parents[1] / "sft.yaml").read_text(encoding="utf-8")
-        self.assertIn("direct_view_ratio: 0.8", cfg)
-        self.assertIn("reasoning_view_ratio: 0.2", cfg)
-        self.assertNotIn("full_dual_view=True", cfg)
+        # New design: separate prompts for point_object and reasoning_only views
+        self.assertIn("prompt_text_direct", cfg)
+        self.assertIn("prompt_text_reasoning", cfg)
+        self.assertIn("reasoning_view_ratio", cfg)
+        self.assertIn("constrained_decoding: true", cfg)
+        self.assertIn("constrained_target_order: \"point_object\"", cfg)
+        self.assertNotIn("direct_view_ratio", cfg)
 
 
 # ---------------------------------------------------------------------------

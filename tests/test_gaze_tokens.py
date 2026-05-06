@@ -179,6 +179,19 @@ class TestBuildStructuredTargetText(unittest.TestCase):
         self.assertLess(t.index(GAZE_POINT_MARKER), t.index(GAZE_OBJECT_MARKER))
         self.assertNotIn("\n", t)
 
+    def test_reasoning_builder_does_not_apply_default_length_cap(self):
+        """Dataset owns reasoning truncation; target builder should only sanitize formatting."""
+        reasoning = " ".join(f"word{i:03d}" for i in range(70))
+        t = build_structured_target_text(
+            0.5, 0.5, 10, 100,
+            target_order="reasoning_point_object",
+            reasoning_text=reasoning,
+        )
+        rsn_end = t.index(GAZE_POINT_MARKER)
+        reasoning_span = t[:rsn_end]
+        self.assertIn("word059", reasoning_span)
+        self.assertIn("word069.", reasoning_span)
+
     def test_reasoning_object_point_exact_format(self):
         """New schema: reasoning_object_point produces <|gaze_reasoning|>...<|gaze_object|>...<|gaze_point|>..."""
         t = build_structured_target_text(

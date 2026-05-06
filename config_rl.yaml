@@ -51,8 +51,8 @@ eval:
   run_test: true
   run_val_metrics: true
   run_val_metrics_every_n_epochs: 1
-  preview_val_samples: 20
-  checkpoint_monitor: "val_dist"      # val_loss | val_dist | val_object_acc | val_joint_exact | val_format_valid
+  preview_val_samples: 0
+  checkpoint_monitor: "val_dist"      # val_dist | val_object_acc | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
   generation_max_new_tokens: 16       # direct gaze schema + EOS fits comfortably
   generation_num_beams: 1

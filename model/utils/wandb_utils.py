@@ -65,10 +65,11 @@ def init_wandb(args: Any, root: Path):
         print(f"[INFO] wandb enabled (project={args.wandb_project}, run={run.name}).")
         try:
             wandb.define_metric("train/loss", summary="min")
-            wandb.define_metric("val/loss", summary="min")
+            wandb.define_metric("train/loss_point", summary="min")
+            wandb.define_metric("train/loss_object", summary="min")
+            wandb.define_metric("train/loss_format", summary="min")
             wandb.define_metric("val/dist", summary="min")
             wandb.define_metric("val/object_acc", summary="max")
-            wandb.define_metric("val/joint_exact", summary="max")
             wandb.define_metric("val/format_valid", summary="max")
             wandb.define_metric("val/point_l2_valid_frac", summary="max")
             # RL metrics

@@ -25,13 +25,24 @@ def get_embedding_layers(model: Any) -> tuple[Any, Any | None]:
     return input_emb, output_emb
 
 
+def get_effective_embedding_weight(embedding: Any) -> torch.Tensor:
+    """Return adapter-effective weights when PEFT trainable-token rows are active."""
+    if hasattr(embedding, "get_merged_weights"):
+        active_adapters = getattr(embedding, "active_adapters", None)
+        if active_adapters:
+            if isinstance(active_adapters, str):
+                active_adapters = [active_adapters]
+            return embedding.get_merged_weights(list(active_adapters))
+    return embedding.weight
+
+
 def save_added_token_rows(
     ckpt_dir: Path,
     model: Any,
     base_vocab_size: int,
 ) -> None:
     input_emb, output_emb = get_embedding_layers(model)
-    input_w = input_emb.weight.detach().cpu()
+    input_w = get_effective_embedding_weight(input_emb).detach().cpu()
     total_vocab = int(input_w.shape[0])
     base_vocab = int(base_vocab_size)
 
@@ -47,7 +58,7 @@ def save_added_token_rows(
     }
 
     if output_emb is not None and hasattr(output_emb, "weight"):
-        output_w = output_emb.weight.detach().cpu()
+        output_w = get_effective_embedding_weight(output_emb).detach().cpu()
         same_shape = tuple(output_w.shape) == tuple(input_w.shape)
         tied = same_shape and torch.equal(output_w, input_w)
         if not tied:
@@ -68,7 +79,7 @@ def save_token_rows(
     in Qwen reserved rows, which the slice-based approach misses.
     """
     input_emb, output_emb = get_embedding_layers(model)
-    input_w = input_emb.weight.detach().cpu()
+    input_w = get_effective_embedding_weight(input_emb).detach().cpu()
     n_rows = int(input_w.shape[0])
 
     ids = sorted({int(i) for i in token_ids if 0 <= int(i) < n_rows})
@@ -85,7 +96,7 @@ def save_token_rows(
     }
 
     if output_emb is not None and hasattr(output_emb, "weight"):
-        output_w = output_emb.weight.detach().cpu()
+        output_w = get_effective_embedding_weight(output_emb).detach().cpu()
         tied = (
             output_emb.weight is input_emb.weight
             or output_emb.weight.data_ptr() == input_emb.weight.data_ptr()

@@ -21,7 +21,7 @@ warnings.filterwarnings(
 
 
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
     AutoModelForImageTextToText,
@@ -56,7 +56,6 @@ from .utils.eval_utils import (
     decode_generated,
     print_generation_samples,
     print_test_metrics_table,
-    run_eval,
     run_test_metrics,
 )
 from .utils.gaze_tokens import parse_structured_output_text, register_gaze_special_tokens
@@ -342,6 +341,18 @@ def enable_token_id_gradients(peft_model: Any, token_ids: list[int]) -> None:
     )
 
 
+def peft_config_has_trainable_tokens(peft_model: Any) -> bool:
+    cfgs = getattr(peft_model, "peft_config", {}) or {}
+    for cfg in cfgs.values():
+        indices = getattr(cfg, "trainable_token_indices", None)
+        if isinstance(indices, dict):
+            if any(len(v) > 0 for v in indices.values()):
+                return True
+        elif indices:
+            return True
+    return False
+
+
 
 def test_log_payload(test_metrics: dict[str, float]) -> dict[str, float]:
     return {
@@ -357,9 +368,8 @@ def test_log_payload(test_metrics: dict[str, float]) -> dict[str, float]:
 
 def val_metric_log_payload(val_metrics: dict[str, float]) -> dict[str, float]:
     return {
-        "val/dist": float(val_metrics.get("Avg L2", 0.0)),
+        "val/dist": float(val_metrics.get("Dist", 0.0)),
         "val/object_acc": float(val_metrics.get("ObjectAcc", 0.0)),
-        "val/joint_exact": float(val_metrics.get("JointExact", 0.0)),
         "val/format_valid": float(val_metrics.get("FormatValid", 0.0)),
         "val/extra_text_rate": float(val_metrics.get("ExtraTextRate", 0.0)),
         "val/point_l2_valid_frac": float(val_metrics.get("PointL2ValidFrac", 0.0)),
@@ -405,6 +415,7 @@ def maybe_save_generation_preview(
         constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
         constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
         constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+        max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
     )
     preview_path = out_dir / filename
     preview_path.write_text(
@@ -431,27 +442,16 @@ def infer_checkpoint_monitor_mode(monitor: str, mode: str) -> str:
 def checkpoint_monitor_value(
     monitor: str,
     *,
-    val_loss: float,
     val_gen_metrics: dict[str, float] | None,
 ) -> float | None:
-    monitor_norm = str(monitor or "val_loss").strip().lower().replace("/", "_").replace("-", "_")
-    if monitor_norm in {"val_loss", "loss"}:
-        return float(val_loss)
+    monitor_norm = str(monitor or "val_dist").strip().lower().replace("/", "_").replace("-", "_")
     if val_gen_metrics is None:
         return None
     key_map: dict[str, str] = {
-        "val_dist": "Avg L2",
-        "dist": "Avg L2",
-        "val_avg_l2": "Avg L2",
-        "avg_l2": "Avg L2",
-        "val_point_l2": "Avg L2",
-        "point_l2": "Avg L2",
-        "val_min_l2": "Min L2",
-        "min_l2": "Min L2",
+        "val_dist": "Dist",
+        "dist": "Dist",
         "val_object_acc": "ObjectAcc",
         "object_acc": "ObjectAcc",
-        "val_joint_exact": "JointExact",
-        "joint_exact": "JointExact",
         "val_format_valid": "FormatValid",
         "format_valid": "FormatValid",
         "val_extra_text_rate": "ExtraTextRate",
@@ -461,7 +461,7 @@ def checkpoint_monitor_value(
     if metric_key is None:
         raise ValueError(
             "Unsupported checkpoint_monitor. Use one of: "
-            "val_loss, val_dist, val_object_acc, val_joint_exact, val_format_valid."
+            "val_dist, val_object_acc, val_format_valid."
         )
     return float(val_gen_metrics.get(metric_key, 0.0))
 
@@ -553,7 +553,6 @@ def _run_rl_training(
     policy_model: torch.nn.Module,
     processor: Any,
     train_ds: Any,
-    val_loader: DataLoader,
     val_metric_loader: DataLoader | None,
     device: torch.device,
     amp_dtype: torch.dtype,
@@ -564,7 +563,6 @@ def _run_rl_training(
     model_path: str,
     model_kwargs: dict[str, Any],
     checkpoint_dir: Path | None,
-    loss_weights: dict[str, float],
     wandb_run: Any,
     scene_size: tuple[int, int] | None,
     coord_bins: int = 1000,
@@ -576,7 +574,7 @@ def _run_rl_training(
     LoRA + new token embeddings.  A frozen copy of the same checkpoint is loaded
     as the reference model for the KL penalty term.
 
-    Returns (global_step, best_val_loss).
+    Returns (global_step, best_monitor_value).
     """
     # ------------------------------------------------------------------
     # RL hyperparameters (Rex-Omni / verl style)
@@ -701,7 +699,6 @@ def _run_rl_training(
     )
 
     global_step = 0
-    best_val_loss = float("inf")
     start_time = time.time()
 
     for epoch in range(1, rl_epochs + 1):
@@ -977,7 +974,7 @@ def _run_rl_training(
         # -------------------------------------------------------
         # End of RL epoch: validation
         # -------------------------------------------------------
-        # Restore train() mode before validation (run_eval uses train/eval internally).
+        # Restore train() mode before generation-based validation.
         policy_model.train()
         n_roll = max(rollout_count, 1)
         n_upd = max(update_count, 1)
@@ -986,18 +983,6 @@ def _run_rl_training(
             f"fmt_invalid={sum_invalid_fmt / n_roll:.3f} "
             f"kl={sum_kl / n_upd:.4f} pg_loss={sum_pg_loss / n_upd:.4f}"
         )
-
-        val_metrics = (
-            run_eval(
-                policy_model, val_loader, device, amp_dtype,
-                loss_weights=loss_weights,
-                show_tqdm=bool(getattr(args, "show_tqdm", True)),
-                desc=f"RL Val {epoch}",
-            )
-            if len(val_loader) > 0
-            else {"loss": 0.0}
-        )
-        val_loss = float(val_metrics.get("loss", 0.0))
 
         val_gen_metrics: dict[str, float] | None = None
         _run_val = (
@@ -1023,6 +1008,8 @@ def _run_rl_training(
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
+                include_l2_breakdown=False,
             )
             maybe_save_generation_preview(
                 args=args,
@@ -1040,7 +1027,7 @@ def _run_rl_training(
                 log_prefix="VAL",
             )
             epoch_msg += (
-                f" val_dist={float(val_gen_metrics.get('Avg L2', 0.0)):.6f}"
+                f" val_dist={float(val_gen_metrics.get('Dist', 0.0)):.6f}"
                 f" val_fmt={float(val_gen_metrics.get('FormatValid', 0.0)):.4f}"
                 f" val_obj={float(val_gen_metrics.get('ObjectAcc', 0.0)):.4f}"
             )
@@ -1048,7 +1035,6 @@ def _run_rl_training(
 
         if wandb_run is not None:
             _wlog: dict[str, float] = {
-                "val/loss": float(val_loss),
                 "rl/epoch_reward_mean": sum_reward / n_roll,
                 "rl/epoch_invalid_fmt": sum_invalid_fmt / n_roll,
             }
@@ -1059,7 +1045,6 @@ def _run_rl_training(
         # Monitor-based checkpoint save
         monitor_value = checkpoint_monitor_value(
             checkpoint_monitor,
-            val_loss=val_loss,
             val_gen_metrics=val_gen_metrics,
         )
         monitor_improved = (
@@ -1071,7 +1056,6 @@ def _run_rl_training(
         )
         if monitor_value is not None and monitor_improved:
             best_monitor_value = float(monitor_value)
-            best_val_loss = val_loss
             save_checkpoint(
                 out_dir / "best", epoch, policy_model, processor,
                 optimizer, scheduler, clear_dir=True,
@@ -1089,10 +1073,10 @@ def _run_rl_training(
 
     elapsed = time.time() - start_time
     print(
-        f"[RL DONE] global_step={global_step} best_val_loss={best_val_loss:.6f} "
+        f"[RL DONE] global_step={global_step} best_{checkpoint_monitor}={best_monitor_value:.6f} "
         f"elapsed_sec={elapsed:.1f}"
     )
-    return global_step, best_val_loss
+    return global_step, best_monitor_value
 
 
 def main() -> None:
@@ -1147,27 +1131,23 @@ def main() -> None:
     if train_stage not in {"sft", "rl"}:
         raise ValueError(f"train_stage must be 'sft' or 'rl', got: {train_stage!r}")
 
-    _use_reasoning = bool(getattr(args, "use_reasoning", False))
-    _prompt_text_reasoning = str(getattr(args, "prompt_text", "") or "")
-    _prompt_text_direct = str(getattr(args, "prompt_text_direct", "") or "")
-    # Select the prompt that matches the target format so there's no prompt/target mismatch.
-    # Fall back gracefully: if the direct prompt isn't set, use the reasoning prompt for both.
-    if not _use_reasoning and _prompt_text_direct:
-        prompt_text_for_run = _prompt_text_direct
-    else:
-        prompt_text_for_run = _prompt_text_reasoning
-    # Val/test always use direct-only target → must use the direct prompt.
-    # Fall back to reasoning prompt only when no direct prompt is configured.
-    _prompt_text_eval = _prompt_text_direct if _prompt_text_direct else prompt_text_for_run
+    # prompt_text_direct: used for point_object views and eval
+    # prompt_text_reasoning: used for reasoning_only views
+    # Falls back to prompt_text if the dedicated keys are absent
+    _prompt_fallback = str(getattr(args, "prompt_text", "") or "")
+    _prompt_text_direct = str(getattr(args, "prompt_text_direct", "") or "") or _prompt_fallback
+    _prompt_text_reasoning_view = str(getattr(args, "prompt_text_reasoning", "") or "") or _prompt_fallback
+    prompt_text_for_run = _prompt_text_direct
+    _prompt_text_eval = _prompt_text_direct
+    _eval_target_order = "point_object"
+    _force_eval = False
     filter_invalid = bool(getattr(args, "filter_invalid_object_samples", True))
     loss_weights = {
         "point": float(getattr(args, "loss_point_weight", 1.0)),
         "object": float(getattr(args, "loss_object_weight", 1.0)),
         "format": float(getattr(args, "loss_format_weight", 0.25)),
         "reasoning": float(getattr(args, "loss_reasoning_weight", 0.3)),
-        "point_expectation": float(getattr(args, "point_expectation_weight", 0.0)),
     }
-    point_expectation_loss = str(getattr(args, "point_expectation_loss", "l1") or "l1")
     coord_bins = int(getattr(args, "coord_bins", 1000))
     if coord_bins <= 0:
         raise ValueError(f"coord_bins must be positive, got: {coord_bins}")
@@ -1220,6 +1200,10 @@ def main() -> None:
     loc_token_ids_tensor: torch.Tensor | None = (
         torch.tensor(_loc_id_list, dtype=torch.long)
         if all(i >= 0 for i in _loc_id_list) else None
+    )
+    loc_token_ids_for_loss: torch.Tensor | None = (
+        loc_token_ids_tensor.to(device=device)
+        if loc_token_ids_tensor is not None else None
     )
     gaussian_point_sigma = float(getattr(args, "gaussian_point_sigma", 0.0))
 
@@ -1304,8 +1288,8 @@ def main() -> None:
                 visual_prompting=bool(args.visual_prompting),
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
-                force_reasoning_format=False,
-                target_order="point_object",
+                force_reasoning_format=_force_eval,
+                target_order=_eval_target_order,
             )
             log_target_example("test_only", test_ds)
             _tnw = int(args.num_workers)
@@ -1337,6 +1321,7 @@ def main() -> None:
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
@@ -1446,35 +1431,16 @@ def main() -> None:
         else:
             print(f"[WARN] train_reasoning_dir not found: {reasoning_dir}")
 
-    _target_order = str(getattr(args, "target_order", "reasoning_object_point"))
-    _disable_spatial_aug = bool(getattr(args, "disable_spatial_aug_for_reasoning", True))
-    _force_train = bool(getattr(args, "force_reasoning_format_train",
-                                getattr(args, "use_reasoning", False)))
-    # Val/test do not have reasoning annotations, so keep their target schema
-    # explicitly direct regardless of the training target_order.
-    _force_eval = False
-    _eval_target_order = "point_object"
-
-    # use_reasoning=False must guarantee no reasoning scaffold in any dataset.
-    # target_order and force flags from config are irrelevant when reasoning is off.
-    if not bool(getattr(args, "use_reasoning", False)):
-        _target_order = "point_object"
-        _force_train = False
-        _force_eval = False
-
-    _use_multiview = bool(getattr(args, "use_multiview_sft", False)) and bool(getattr(args, "use_reasoning", False))
-    _direct_view_ratio = float(getattr(args, "direct_view_ratio", 0.8))
+    _max_reasoning_words = int(getattr(args, "max_reasoning_words", 60))
+    _max_reasoning_chars = int(getattr(args, "max_reasoning_chars", 500))
     _reasoning_view_ratio = float(getattr(args, "reasoning_view_ratio", 0.2))
-    _max_reasoning_words = int(getattr(args, "max_reasoning_words", 30))
-    _max_reasoning_chars = int(getattr(args, "max_reasoning_chars", 220))
 
-    train_sampler: WeightedRandomSampler | None = None
-    if _use_multiview and reasoning_index is not None:
+    if reasoning_index is not None:
         train_ds: GazeDataset | MultiViewGazeDataset = MultiViewGazeDataset(
             records=train_records,
             prompt_template=args.prompt_template,
-            prompt_text_direct=_prompt_text_direct or prompt_text_for_run,
-            prompt_text_reasoning=_prompt_text_reasoning,
+            prompt_text_direct=_prompt_text_direct,
+            prompt_text_reasoning=_prompt_text_reasoning_view,
             id2label=id2label,
             vocab2id=vocab2id,
             vocab2id_lower=vocab2id_lower,
@@ -1486,35 +1452,8 @@ def main() -> None:
             reasoning_index=reasoning_index,
             max_reasoning_words=_max_reasoning_words,
             max_reasoning_chars=_max_reasoning_chars,
-        )
-        n_direct, n_reasoning = train_ds.get_view_counts()
-        print(
-            f"[INFO] MultiViewGazeDataset: n_direct={n_direct} n_reasoning={n_reasoning} "
-            f"total_views={len(train_ds)}"
-        )
-        n_epoch_samples = len(train_ds.records)
-        d_ratio = max(0.0, float(_direct_view_ratio))
-        r_ratio = max(0.0, float(_reasoning_view_ratio))
-        ratio_sum = d_ratio + r_ratio
-        if ratio_sum <= 0.0:
-            d_ratio, r_ratio, ratio_sum = 0.8, 0.2, 1.0
-        d_ratio /= ratio_sum
-        r_ratio /= ratio_sum
-        weights = torch.zeros((len(train_ds),), dtype=torch.double)
-        if n_direct > 0 and d_ratio > 0.0:
-            weights[:n_direct] = float(d_ratio) / float(n_direct)
-        if n_reasoning > 0 and r_ratio > 0.0:
-            weights[n_direct:n_direct + n_reasoning] = float(r_ratio) / float(n_reasoning)
-        if float(weights.sum().item()) <= 0.0:
-            weights.fill_(1.0)
-        train_sampler = WeightedRandomSampler(
-            weights=weights,
-            num_samples=int(n_epoch_samples),
-            replacement=True,
-        )
-        print(
-            f"[INFO] MultiView sampler: num_samples_per_epoch={n_epoch_samples} "
-            f"direct_ratio={d_ratio:.3f} reasoning_ratio={r_ratio:.3f}"
+            reasoning_ratio=_reasoning_view_ratio,
+            seed=int(getattr(args, "seed", 42)),
         )
     else:
         train_ds = GazeDataset(
@@ -1530,10 +1469,7 @@ def main() -> None:
             image_cache_size=image_cache_size,
             filter_invalid_object_samples=filter_invalid,
             coord_bins=coord_bins,
-            reasoning_index=reasoning_index,
-            force_reasoning_format=_force_train,
-            target_order=_target_order,
-            disable_spatial_aug_for_reasoning=_disable_spatial_aug,
+            target_order="point_object",
         )
     val_ds = GazeDataset(
         records=val_records,
@@ -1568,11 +1504,6 @@ def main() -> None:
         max_text_length=int(args.max_text_length),
         scene_size=_scene_size,
     )
-    val_collator = QwenTrainCollator(
-        processor=processor,
-        max_text_length=int(args.max_text_length),
-        scene_size=_scene_size,
-    )
     test_collator = QwenTestCollator(
         processor=processor,
         max_text_length=int(args.max_text_length),
@@ -1586,22 +1517,11 @@ def main() -> None:
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=_nw,
         pin_memory=(device.type == "cuda"),
         collate_fn=train_collator,
-        persistent_workers=_persistent,
-        prefetch_factor=_prefetch,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=_nw,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=val_collator,
-        persistent_workers=_persistent,
+        persistent_workers=False,
         prefetch_factor=_prefetch,
     )
     val_metric_loader = None
@@ -1663,24 +1583,30 @@ def main() -> None:
             bias=str(args.lora_bias),
             task_type=TaskType.CAUSAL_LM,
             target_modules=target_modules,
+            trainable_token_indices=gaze_token_ids,
         )
         qwen_lora = get_peft_model(base_qwen, lora_cfg)
         qwen_lora.print_trainable_parameters()
 
-    # Unfreeze exactly the gaze special token embedding rows.
-    # get_peft_model freezes all base-model params; without this the gaze special
-    # token embeddings (<loc_XXX>, <obj_XXX>, etc.) would remain at their
-    # random-initialisation values throughout training and never be updated.
-    # Uses token-ID-based hook rather than [base_vocab_size:] range, because
-    # Qwen reserved rows below base_vocab_size may host some of our new tokens.
-    if not bool(getattr(args, "eval_only", False)):
+    # New runs use PEFT's trainable_token_indices, which avoids making the full
+    # embedding matrix trainable. Older checkpoints may not have that adapter
+    # metadata, so keep the row-mask hook as a compatibility fallback.
+    if (
+        not bool(getattr(args, "eval_only", False))
+        and not peft_config_has_trainable_tokens(qwen_lora)
+    ):
         enable_token_id_gradients(qwen_lora, gaze_token_ids)
         below_base = sum(1 for i in gaze_token_ids if i < base_vocab_size)
         above_base = sum(1 for i in gaze_token_ids if i >= base_vocab_size)
         print(
-            f"[INFO] enabled gradient for gaze token rows: "
+            f"[INFO] enabled fallback gradient hook for gaze token rows: "
             f"total={len(gaze_token_ids)} below_base={below_base} above_base={above_base} "
             f"base_vocab_size={base_vocab_size} new_vocab_size={new_vocab_size}"
+        )
+    elif not bool(getattr(args, "eval_only", False)):
+        print(
+            f"[INFO] using PEFT trainable_token_indices for gaze token rows: "
+            f"total={len(gaze_token_ids)}"
         )
 
     model = QwenTextGenerationModel(qwen_model=qwen_lora).to(device)
@@ -1698,12 +1624,11 @@ def main() -> None:
                 "LoRA is not supported."
             )
         _rl_start = time.time()
-        rl_global_step, rl_best_val_loss = _run_rl_training(
+        rl_global_step, rl_best_monitor_value = _run_rl_training(
             args=args,
             policy_model=model,
             processor=processor,
             train_ds=train_ds,
-            val_loader=val_loader,
             val_metric_loader=val_metric_loader,
             device=device,
             amp_dtype=amp_dtype,
@@ -1714,7 +1639,6 @@ def main() -> None:
             model_path=model_path,
             model_kwargs=model_kwargs,
             checkpoint_dir=checkpoint_dir,
-            loss_weights=loss_weights,
             wandb_run=wandb_run,
             scene_size=_scene_size,
             coord_bins=coord_bins,
@@ -1790,6 +1714,7 @@ def main() -> None:
                     constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                     constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                     constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                    max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
                 )
                 print_test_metrics_table(test_metrics)
                 if wandb_run is not None:
@@ -1813,7 +1738,8 @@ def main() -> None:
         finish_wandb(wandb_run)
         print(
             f"[DONE] RL stage global_step={rl_global_step} "
-            f"best_val_loss={rl_best_val_loss:.6f} "
+            f"best_{str(getattr(args, 'checkpoint_monitor', 'val_dist')).strip() or 'val_dist'}="
+            f"{rl_best_monitor_value:.6f} "
             f"elapsed_sec={time.time() - _rl_start:.1f}"
         )
         return  # ← always return; SFT loop never runs for RL stage
@@ -1842,9 +1768,7 @@ def main() -> None:
     print(
         f"[INFO] structured SFT loss: point_w={loss_weights['point']:.2f} "
         f"object_w={loss_weights['object']:.2f} format_w={loss_weights['format']:.2f} "
-        f"reasoning_w={loss_weights['reasoning']:.2f} "
-        f"point_expectation_w={loss_weights['point_expectation']:.2f} "
-        f"point_expectation_loss={point_expectation_loss}"
+        f"reasoning_w={loss_weights['reasoning']:.2f}"
     )
     checkpoint_monitor = str(getattr(args, "checkpoint_monitor", "val_dist")).strip() or "val_dist"
     checkpoint_monitor_mode = infer_checkpoint_monitor_mode(
@@ -1852,7 +1776,6 @@ def main() -> None:
         str(getattr(args, "checkpoint_monitor_mode", "auto")),
     )
     best_monitor_value = float("inf") if checkpoint_monitor_mode == "min" else -float("inf")
-    best_val_loss = float("inf")
     print(f"[INFO] checkpoint monitor: {checkpoint_monitor} ({checkpoint_monitor_mode})")
     run_val_metrics_every_n = max(1, int(getattr(args, "run_val_metrics_every_n_epochs", 5)))
     global_step = 0
@@ -1863,6 +1786,8 @@ def main() -> None:
         print("[INFO] eval_only=True; skipping training loop.")
 
     for epoch in range(1, effective_epochs + 1):
+        if hasattr(train_ds, "resample_reasoning_views"):
+            train_ds.resample_reasoning_views()
         model.train()
         sum_loss = 0.0
         sample_count = 0
@@ -1872,6 +1797,8 @@ def main() -> None:
         skipped_all_ignore = 0
         _t_fwd_sum = 0.0
         _t_bwd_sum = 0.0
+        _t_data_sum = 0.0
+        _t_step_sum = 0.0
 
         optimizer.zero_grad(set_to_none=True)
         train_iter = tqdm(
@@ -1889,10 +1816,14 @@ def main() -> None:
             else (num_train_batches + 1)
         )
 
+        _t_data0 = time.perf_counter()
         for step, batch in enumerate(train_iter, start=1):
+            _t_step0 = time.perf_counter()
+            _t_data_sum += _t_step0 - _t_data0
             labels = batch["labels"].to(device)
             if torch.all(labels.eq(-100)):
                 skipped_all_ignore += 1
+                _t_data0 = time.perf_counter()
                 continue
 
             joint_inputs = to_device(batch["joint_inputs"], device=device)
@@ -1922,13 +1853,8 @@ def main() -> None:
                     weight_object=loss_weights["object"],
                     weight_format=loss_weights["format"],
                     weight_reasoning=loss_weights["reasoning"],
-                    weight_point_expectation=loss_weights["point_expectation"],
-                    point_expectation_loss=point_expectation_loss,
                     compute_format_rate=False,
-                    loc_token_ids=(
-                        loc_token_ids_tensor.to(device)
-                        if loc_token_ids_tensor is not None else None
-                    ),
+                    loc_token_ids=loc_token_ids_for_loss,
                     gaussian_sigma=gaussian_point_sigma,
                 )
                 raw_loss = losses["loss"]
@@ -1959,17 +1885,16 @@ def main() -> None:
                         epoch_progress = (float(epoch) - 1.0) + (
                             float(updates_done_in_epoch) / max(float(updates_per_epoch), 1.0)
                         )
-                        _view_types = batch.get("view_type", [])
-                        _n_batch = max(len(_view_types), 1)
-                        _n_rsn_batch = sum(1 for v in _view_types if v == "reasoning")
 
                         wandb_run.log(
                             {
                                 "train/loss": float(raw_loss.detach().item()),
+                                "train/loss_point": float(losses["loss_point"].detach().item()),
+                                "train/loss_object": float(losses["loss_object"].detach().item()),
+                                "train/loss_format": float(losses["loss_format"].detach().item()),
                                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "train/grad_norm": grad_norm_value,
                                 "train/epoch": epoch_progress,
-                                "train/view_reasoning_frac": float(_n_rsn_batch) / float(_n_batch),
                             },
                             step=global_step,
                         )
@@ -1977,6 +1902,8 @@ def main() -> None:
             sum_loss += float(raw_loss.detach().item()) * float(bsz)
             sample_count += bsz
             step_count += 1
+            _t_step_sum += time.perf_counter() - _t_step0
+            _t_data0 = time.perf_counter()
             if args.show_tqdm:
                 train_iter.set_postfix(loss=f"{(sum_loss / max(sample_count, 1)):.4f}")
 
@@ -1989,25 +1916,15 @@ def main() -> None:
         train_loss = float(sum_loss / float(sample_count))
         if skipped_all_ignore > 0:
             print(f"[INFO] skipped all-ignore batches in train epoch: {skipped_all_ignore}")
-
-        _t_val0 = time.perf_counter()
-        val_metrics = (
-            run_eval(
-                model,
-                val_loader,
-                device,
-                amp_dtype,
-                loss_weights=loss_weights,
-                loc_token_ids=loc_token_ids_tensor,
-                point_expectation_loss=point_expectation_loss,
-                show_tqdm=bool(args.show_tqdm),
-                desc=f"Eval {epoch}/{args.epochs}",
-            )
-            if len(val_ds) > 0
-            else {"loss": train_loss}
+        _t_other = max(0.0, _t_step_sum - _t_fwd_sum - _t_bwd_sum)
+        print(
+            f"[TIME train {epoch}] "
+            f"data_wait={_t_data_sum:.1f}s "
+            f"fwd_loss={_t_fwd_sum:.1f}s "
+            f"backward={_t_bwd_sum:.1f}s "
+            f"other_step={_t_other:.1f}s "
+            f"steps={step_count}"
         )
-        _t_val_loss = time.perf_counter() - _t_val0
-        val_loss = float(val_metrics.get("loss", train_loss))
 
         val_gen_metrics = None
         _run_val_gen = (
@@ -2015,9 +1932,7 @@ def main() -> None:
             and len(val_ds) > 0
             and (epoch % run_val_metrics_every_n == 0 or epoch == effective_epochs)
         )
-        _t_val_gen = 0.0
         if _run_val_gen:
-            _t_vg0 = time.perf_counter()
             val_gen_metrics = run_test_metrics(
                 model=model,
                 loader=val_metric_loader,
@@ -2036,6 +1951,8 @@ def main() -> None:
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
+                include_l2_breakdown=False,
             )
             maybe_save_generation_preview(
                 args=args,
@@ -2052,14 +1969,11 @@ def main() -> None:
                 desc=f"Val preview {epoch}/{args.epochs}",
                 log_prefix="VAL",
             )
-            _t_val_gen = time.perf_counter() - _t_vg0
 
-        epoch_msg = (
-            f"[EPOCH {epoch}] train_loss={train_loss:.6f} val_loss={val_loss:.6f}"
-        )
+        epoch_msg = f"[EPOCH {epoch}] train_loss={train_loss:.6f}"
         if isinstance(val_gen_metrics, dict):
             epoch_msg += (
-                f" val_dist={float(val_gen_metrics.get('Avg L2', 0.0)):.6f}"
+                f" val_dist={float(val_gen_metrics.get('Dist', 0.0)):.6f}"
                 f" val_object_acc={float(val_gen_metrics.get('ObjectAcc', 0.0)):.6f}"
                 f" val_format_valid={float(val_gen_metrics.get('FormatValid', 0.0)):.6f}"
                 f" val_l2_cov={float(val_gen_metrics.get('PointL2ValidFrac', 0.0)):.3f}"
@@ -2067,21 +1981,14 @@ def main() -> None:
         print(epoch_msg)
 
         if wandb_run is not None:
-            n_steps = max(step_count, 1)
-            payload: dict[str, float] = {
-                "val/loss": float(val_loss),
-                "val/loss_point": float(val_metrics.get("loss_point", 0.0)),
-                "val/loss_point_expectation": float(val_metrics.get("loss_point_expectation", 0.0)),
-                "val/loss_object": float(val_metrics.get("loss_object", 0.0)),
-                "val/loss_format": float(val_metrics.get("loss_format", 0.0)),
-            }
+            payload: dict[str, float] = {}
             if isinstance(val_gen_metrics, dict):
                 payload.update(val_metric_log_payload(val_gen_metrics))
-            wandb_run.log(payload, step=global_step)
+            if payload:
+                wandb_run.log(payload, step=global_step)
 
         monitor_value = checkpoint_monitor_value(
             checkpoint_monitor,
-            val_loss=val_loss,
             val_gen_metrics=val_gen_metrics,
         )
         monitor_improved = (
@@ -2091,17 +1998,12 @@ def main() -> None:
                 or (checkpoint_monitor_mode == "max" and monitor_value > best_monitor_value)
             )
         )
-        _t_ckpt0 = time.perf_counter()
         if monitor_value is None:
             print(f"[WARN] checkpoint monitor {checkpoint_monitor!r} is unavailable this epoch; skipping save.")
         elif monitor_improved:
             best_monitor_value = float(monitor_value)
-            best_val_loss = val_loss
             best_dir = out_dir / "best"
-            print(
-                f"[INFO] new best checkpoint: {checkpoint_monitor}={best_monitor_value:.6f} "
-                f"val_loss={val_loss:.6f}"
-            )
+            print(f"[INFO] new best checkpoint: {checkpoint_monitor}={best_monitor_value:.6f}")
             save_checkpoint(
                 best_dir,
                 epoch,
@@ -2127,18 +2029,6 @@ def main() -> None:
         )
 
     if bool(args.eval_only) and len(val_ds) > 0:
-        val_metrics = run_eval(
-            model,
-            val_loader,
-            device,
-            amp_dtype,
-            loss_weights=loss_weights,
-            loc_token_ids=loc_token_ids_tensor,
-            point_expectation_loss=point_expectation_loss,
-            show_tqdm=bool(args.show_tqdm),
-            desc="Eval (checkpoint)",
-        )
-        best_val_loss = float(val_metrics.get("loss", best_val_loss))
         val_gen_metrics = None
         if val_metric_loader is not None:
             val_gen_metrics = run_test_metrics(
@@ -2159,13 +2049,23 @@ def main() -> None:
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
+                include_l2_breakdown=False,
             )
-        print(f"[EVAL] val_loss={best_val_loss:.6f}")
+        if isinstance(val_gen_metrics, dict):
+            print(
+                f"[EVAL] val_dist={float(val_gen_metrics.get('Dist', 0.0)):.6f} "
+                f"val_object_acc={float(val_gen_metrics.get('ObjectAcc', 0.0)):.6f} "
+                f"val_format_valid={float(val_gen_metrics.get('FormatValid', 0.0)):.6f}"
+            )
+        else:
+            print("[EVAL] no validation generation metrics were produced.")
         if wandb_run is not None:
-            payload = {"val/loss": float(best_val_loss)}
+            payload: dict[str, float] = {}
             if isinstance(val_gen_metrics, dict):
                 payload.update(val_metric_log_payload(val_gen_metrics))
-            wandb_run.log(payload, step=global_step)
+            if payload:
+                wandb_run.log(payload, step=global_step)
 
     elapsed = time.time() - start_time
 
@@ -2241,6 +2141,7 @@ def main() -> None:
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
             )
             print_test_metrics_table(test_metrics)
             if wandb_run is not None:
@@ -2263,7 +2164,7 @@ def main() -> None:
 
     finish_wandb(wandb_run)
     print(
-        f"[DONE] global_step={global_step} best_val_loss={best_val_loss:.6f} "
+        f"[DONE] global_step={global_step} "
         f"best_{checkpoint_monitor}={best_monitor_value:.6f} elapsed_sec={elapsed:.1f}"
     )
 

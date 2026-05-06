@@ -7,13 +7,14 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import LogitsProcessor, LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
 
 from .common import to_device
 from .gaze_tokens import (
     ANSWER_END,
     GAZE_OBJECT_MARKER,
     GAZE_POINT_MARKER,
+    GAZE_REASONING_MARKER,
     format_loc_token,
     format_obj_token,
     parse_structured_output_text,
@@ -40,6 +41,126 @@ class _GazeObjEndStoppingCriteria(StoppingCriteria):
     ) -> bool:
         generated = input_ids[:, self.prompt_len :]
         return bool((generated == self.obj_end_id).any(dim=1).all().item())
+
+
+class HybridConstrainedLogitsProcessor(LogitsProcessor):
+    """Per-sequence state machine for hybrid constrained decoding.
+
+    Phase 1: forces <|gaze_reasoning|>, then allows free generation until the
+    model naturally emits the transition marker or max_reasoning_tokens is
+    reached (at which point the marker is forced).
+    Phase 2: restricts each structured slot to its allowed token set.
+
+    Designed for use with model.generate() so that KV-cache and batched GPU
+    kernels are used — avoids the O(B * T^2) cost of the previous serial
+    per-sample approach.
+    """
+
+    def __init__(
+        self,
+        prompt_len: int,
+        reasoning_marker_id: int,
+        point_marker_id: int,
+        object_marker_id: int,
+        loc_ids: list[int],
+        obj_ids: list[int],
+        target_order: str,
+        max_reasoning_tokens: int,
+    ) -> None:
+        self.prompt_len = int(prompt_len)
+        self.reasoning_marker_id = int(reasoning_marker_id)
+        self.point_marker_id = int(point_marker_id)
+        self.object_marker_id = int(object_marker_id)
+        self.loc_ids_list = [int(x) for x in loc_ids]
+        self.loc_ids_set = set(self.loc_ids_list)
+        self.obj_ids_list = [int(x) for x in obj_ids]
+        self.obj_ids_set = set(self.obj_ids_list)
+        self.target_order = str(target_order)
+        self.max_reasoning_tokens = int(max_reasoning_tokens)
+        self.transition_id = (
+            self.point_marker_id
+            if self.target_order == "reasoning_point_object"
+            else self.object_marker_id
+        )
+
+    def _get_state(self, gen: list[int]) -> str:
+        """Derive decoding state purely from already-generated token ids."""
+        if not gen or gen[0] != self.reasoning_marker_id:
+            return "FORCE_REASONING"
+
+        trans_idx = -1
+        for k, t in enumerate(gen):
+            if t == self.transition_id:
+                trans_idx = k
+                break
+
+        if trans_idx == -1:
+            n_reasoning = len(gen) - 1  # subtract <|gaze_reasoning|> itself
+            if n_reasoning >= self.max_reasoning_tokens:
+                return "FORCE_TRANSITION"
+            return "REASONING"
+
+        post = gen[trans_idx + 1 :]
+        if self.target_order == "reasoning_point_object":
+            n_loc = sum(1 for t in post if t in self.loc_ids_set)
+            n_obj_m = sum(1 for t in post if t == self.object_marker_id)
+            n_obj = sum(1 for t in post if t in self.obj_ids_set)
+            if n_loc == 0:
+                return "POINT_X"
+            if n_loc == 1:
+                return "POINT_Y"
+            if n_obj_m == 0:
+                return "FORCE_OBJECT"
+            if n_obj == 0:
+                return "OBJECT"
+            return "DONE"
+        else:  # reasoning_object_point
+            n_obj = sum(1 for t in post if t in self.obj_ids_set)
+            n_pt_m = sum(1 for t in post if t == self.point_marker_id)
+            n_loc = sum(1 for t in post if t in self.loc_ids_set)
+            if n_obj == 0:
+                return "OBJECT"
+            if n_pt_m == 0:
+                return "FORCE_POINT"
+            if n_loc == 0:
+                return "POINT_X"
+            if n_loc == 1:
+                return "POINT_Y"
+            return "DONE"
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        NEG_INF = float("-inf")
+        _FORCE_MAP = {
+            "FORCE_REASONING": self.reasoning_marker_id,
+            "FORCE_TRANSITION": self.transition_id,
+            "FORCE_OBJECT": self.object_marker_id,
+            "FORCE_POINT": self.point_marker_id,
+        }
+        for i in range(int(input_ids.shape[0])):
+            gen = input_ids[i, self.prompt_len :].tolist()
+            state = self._get_state(gen)
+
+            if state in _FORCE_MAP:
+                row = torch.full_like(scores[i], NEG_INF)
+                row[_FORCE_MAP[state]] = 0.0
+                scores[i] = row
+            elif state in ("POINT_X", "POINT_Y"):
+                row = torch.full_like(scores[i], NEG_INF)
+                for lid in self.loc_ids_list:
+                    row[lid] = scores[i, lid]
+                scores[i] = row
+            elif state == "OBJECT":
+                row = torch.full_like(scores[i], NEG_INF)
+                for oid in self.obj_ids_list:
+                    row[oid] = scores[i, oid]
+                scores[i] = row
+            # REASONING, DONE: leave scores unchanged
+
+        return scores
 
 
 def make_gaze_obj_end_stopping_criteria(
@@ -97,6 +218,78 @@ def _marker_id(tokenizer: Any, marker: str) -> int:
     return _single_token_id(tokenizer, marker)
 
 
+
+
+def constrained_generate_hybrid(
+    model: torch.nn.Module,
+    joint: dict[str, Any],
+    processor: Any,
+    num_classes: int,
+    coord_bins: int,
+    amp_dtype: torch.dtype,
+    target_order: str = "reasoning_point_object",
+    temperature: float = 1.0,
+    max_reasoning_tokens: int = 80,
+) -> list[str]:
+    """Batched hybrid constrained decoding via HybridConstrainedLogitsProcessor.
+
+    All samples are decoded in a single model.generate() call; per-sample
+    state is tracked inside HybridConstrainedLogitsProcessor.  KV-cache and
+    batched GPU kernels are used automatically, avoiding the O(B*T^2) cost of
+    the previous serial per-sample approach.
+    """
+    order = str(target_order or "reasoning_point_object").strip()
+    if order not in {"reasoning_point_object", "reasoning_object_point"}:
+        raise ValueError(
+            f"constrained_generate_hybrid: unsupported target_order={order!r}. "
+            "Supported: 'reasoning_point_object', 'reasoning_object_point'."
+        )
+
+    tokenizer = getattr(processor, "tokenizer", None) or processor
+    prompt_len = int(joint["input_ids"].shape[1])
+    device = joint["input_ids"].device
+
+    loc_ids = _loc_token_ids(tokenizer, coord_bins=int(coord_bins))
+    obj_ids = _obj_token_ids(tokenizer, num_classes=int(num_classes))
+    reasoning_marker_id = _marker_id(tokenizer, GAZE_REASONING_MARKER)
+    point_marker_id = _marker_id(tokenizer, GAZE_POINT_MARKER)
+    object_marker_id = _marker_id(tokenizer, GAZE_OBJECT_MARKER)
+
+    lp = HybridConstrainedLogitsProcessor(
+        prompt_len=prompt_len,
+        reasoning_marker_id=reasoning_marker_id,
+        point_marker_id=point_marker_id,
+        object_marker_id=object_marker_id,
+        loc_ids=loc_ids,
+        obj_ids=obj_ids,
+        target_order=order,
+        max_reasoning_tokens=int(max_reasoning_tokens),
+    )
+
+    # Budget: 1 (<|gaze_reasoning|>) + max_reasoning_tokens (free reasoning)
+    #       + 1 (transition marker) + 2 (loc_x, loc_y)
+    #       + 1 (<|gaze_object|>) + 1 (obj) = max_reasoning_tokens + 6
+    max_new = int(max_reasoning_tokens) + 6
+
+    with torch.autocast(
+        device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
+    ):
+        generated_ids = model.generate(
+            joint_inputs=joint,
+            max_new_tokens=max_new,
+            do_sample=False,
+            logits_processor=LogitsProcessorList([lp]),
+        )
+
+    return decode_generated(
+        processor=processor,
+        generated_ids=generated_ids.detach().cpu(),
+        input_ids=joint["input_ids"].detach().cpu(),
+        attention_mask=joint.get("attention_mask", None),
+        num_return_sequences=1,
+    )
+
+
 def _append_token_to_joint(
     joint: dict[str, Any], token_ids: torch.LongTensor
 ) -> dict[str, Any]:
@@ -144,19 +337,33 @@ def constrained_generate_structured(
     amp_dtype: torch.dtype,
     target_order: str = "point_object",
     temperature: float = 1.0,
+    max_reasoning_tokens: int = 80,
 ) -> list[str]:
     """Slot-level constrained decoding using Qwen LM logits directly.
 
-    Supported target_order values: "point_object", "object_point".
-    Reasoning-prefixed orders are not supported and raise ValueError —
-    val/test uses _eval_target_order="point_object" (trainer.py).
+    Supported target_order values:
+      "point_object", "object_point"          — direct constrained decoding
+      "reasoning_point_object",               — hybrid: free reasoning +
+      "reasoning_object_point"                  constrained point/object slots
     """
     order = str(target_order or "point_object").strip()
+    if order in {"reasoning_point_object", "reasoning_object_point"}:
+        return constrained_generate_hybrid(
+            model=model,
+            joint=joint,
+            processor=processor,
+            num_classes=int(num_classes),
+            coord_bins=int(coord_bins),
+            amp_dtype=amp_dtype,
+            target_order=order,
+            temperature=float(temperature),
+            max_reasoning_tokens=int(max_reasoning_tokens),
+        )
     if order not in {"point_object", "object_point"}:
         raise ValueError(
             f"constrained_generate_structured: unsupported target_order={order!r}. "
-            "Supported: 'point_object', 'object_point'. "
-            "Reasoning-prefixed orders are out of scope for constrained eval."
+            "Supported: 'point_object', 'object_point', "
+            "'reasoning_point_object', 'reasoning_object_point'."
         )
 
     tokenizer = getattr(processor, "tokenizer", None) or processor
@@ -291,7 +498,6 @@ def run_eval(
     loss_weights: dict[str, float] | None = None,
     loc_token_ids: torch.Tensor | None = None,
     gaussian_point_sigma: float = 0.0,
-    point_expectation_loss: str = "l1",
     show_tqdm: bool = True,
     desc: str = "Eval",
 ) -> dict[str, float]:
@@ -301,7 +507,6 @@ def run_eval(
 
     loss_sum = 0.0
     pt_sum = 0.0
-    pt_exp_sum = 0.0
     obj_sum = 0.0
     fmt_sum = 0.0
     count = 0
@@ -326,23 +531,16 @@ def run_eval(
                 loss_mask_point=batch.get("loss_mask_point", None),
                 loss_mask_object=batch.get("loss_mask_object", None),
                 loss_mask_format=batch.get("loss_mask_format", None),
+                loss_mask_reasoning=batch.get("loss_mask_reasoning", None),
                 weight_point=float(loss_weights.get("point", 1.0)),
                 weight_object=float(loss_weights.get("object", 1.0)),
                 weight_format=float(loss_weights.get("format", 0.25)),
                 weight_reasoning=float(loss_weights.get("reasoning", 0.3)),
-                weight_point_expectation=float(loss_weights.get("point_expectation", 0.0)),
-                point_expectation_loss=str(point_expectation_loss or "l1"),
                 loc_token_ids=loc_token_ids.to(device) if loc_token_ids is not None else None,
                 gaussian_sigma=float(gaussian_point_sigma),
             )
             loss_sum += float(losses["loss"].detach().item()) * float(bsz)
             pt_sum += float(losses["loss_point"].detach().item()) * float(bsz)
-            l_pt_exp = losses.get("loss_point_expectation", 0.0)
-            pt_exp_sum += (
-                float(l_pt_exp.detach().item())
-                if torch.is_tensor(l_pt_exp)
-                else float(l_pt_exp)
-            ) * float(bsz)
             obj_sum += float(losses["loss_object"].detach().item()) * float(bsz)
             fmt_sum += float(losses["loss_format"].detach().item()) * float(bsz)
             count += bsz
@@ -353,7 +551,6 @@ def run_eval(
         return {
             "loss": 0.0,
             "loss_point": 0.0,
-            "loss_point_expectation": 0.0,
             "loss_object": 0.0,
             "loss_format": 0.0,
         }
@@ -361,7 +558,6 @@ def run_eval(
     return {
         "loss": float(loss_sum / d),
         "loss_point": float(pt_sum / d),
-        "loss_point_expectation": float(pt_exp_sum / d),
         "loss_object": float(obj_sum / d),
         "loss_format": float(fmt_sum / d),
     }
@@ -385,6 +581,8 @@ def run_test_metrics(
     constrained_decoding: bool = False,
     constrained_target_order: str = "point_object",
     constrained_temperature: float = 1.0,
+    max_reasoning_tokens: int = 80,
+    include_l2_breakdown: bool = True,
 ) -> dict[str, float]:
     model.eval()
 
@@ -400,7 +598,6 @@ def run_test_metrics(
     point_bin_exact = 0
     object_acc = 0
     multi_acc_at_1 = 0
-    joint_exact = 0
     obj_den = 0
     multi_obj_den = 0
     beam_k = max(1, int(num_beams))
@@ -442,6 +639,7 @@ def run_test_metrics(
                         amp_dtype=amp_dtype,
                         target_order=str(constrained_target_order),
                         temperature=float(constrained_temperature),
+                        max_reasoning_tokens=int(max_reasoning_tokens),
                     )
             else:
                 prompt_len = int(joint["input_ids"].shape[1])
@@ -537,25 +735,6 @@ def run_test_metrics(
                         if parsed["object_id"] is not None and int(parsed["object_id"]) in gt_obj_ids:
                             multi_acc_at_1 += 1
 
-                # joint exact: valid-GT samples only
-                if (
-                    is_point_valid
-                    and is_object_valid
-                    and parsed["valid_format"]
-                    and parsed["point_bins"] is not None
-                    and parsed["object_id"] is not None
-                    and torch.is_tensor(target_point_bin)
-                    and torch.is_tensor(target_object_id)
-                    and i < int(target_point_bin.shape[0])
-                    and i < int(target_object_id.shape[0])
-                ):
-                    gt_bx = int(target_point_bin[i, 0].item())
-                    gt_by = int(target_point_bin[i, 1].item())
-                    gt_obj = int(target_object_id[i].item())
-                    px, py = parsed["point_bins"]
-                    if int(px) == gt_bx and int(py) == gt_by and int(parsed["object_id"]) == gt_obj:
-                        joint_exact += 1
-
             if show_tqdm and l2_den > 0:
                 it.set_postfix(
                     l2=f"{(avg_l2_sum / max(l2_den, 1)):.4f}",
@@ -564,33 +743,39 @@ def run_test_metrics(
 
     _L2_SENTINEL = math.sqrt(2.0)  # max possible L2 for normalized coords (0,0)→(1,1)
     if total <= 0:
-        return {
+        out = {
             "FormatValid": 0.0,
-            "Avg L2": _L2_SENTINEL,
-            "Min L2": _L2_SENTINEL,
+            "Dist": _L2_SENTINEL,
             "PointBinExact": 0.0,
             "ObjectAcc": 0.0,
             "MultiAcc@1": 0.0,
-            "JointExact": 0.0,
             "ExtraTextRate": 0.0,
             "PointL2ValidFrac": 0.0,
             "num_samples": 0.0,
             "num_valid_samples": 0.0,
         }
+        if bool(include_l2_breakdown):
+            out["Avg L2"] = _L2_SENTINEL
+            out["Min L2"] = _L2_SENTINEL
+        return out
 
-    return {
+    dist = float(avg_l2_sum / l2_den) if l2_den > 0 else _L2_SENTINEL
+    min_l2 = float(min_l2_sum / l2_den) if l2_den > 0 else _L2_SENTINEL
+    out = {
         "FormatValid": float(format_valid_count / max(format_valid_total, 1)),
-        "Avg L2": float(avg_l2_sum / l2_den) if l2_den > 0 else _L2_SENTINEL,
-        "Min L2": float(min_l2_sum / l2_den) if l2_den > 0 else _L2_SENTINEL,
+        "Dist": dist,
         "PointBinExact": float(point_bin_exact / max(point_bin_den, 1)),
         "ObjectAcc": float(object_acc / max(obj_den, 1)),
         "MultiAcc@1": float(multi_acc_at_1 / max(multi_obj_den, 1)),
-        "JointExact": float(joint_exact / max(obj_den, 1)),
         "ExtraTextRate": float(extra_text_count / max(format_valid_total, 1)),
         "PointL2ValidFrac": float(l2_den / max(point_bin_den, 1)),
         "num_samples": float(total),
         "num_valid_samples": float(valid_total),
     }
+    if bool(include_l2_breakdown):
+        out["Avg L2"] = dist
+        out["Min L2"] = min_l2
+    return out
 
 
 def collect_generation_samples(
@@ -612,6 +797,7 @@ def collect_generation_samples(
     constrained_decoding: bool = False,
     constrained_target_order: str = "point_object",
     constrained_temperature: float = 1.0,
+    max_reasoning_tokens: int = 80,
 ) -> list[dict[str, Any]]:
     limit = max(0, int(max_samples))
     if limit <= 0:
@@ -648,6 +834,7 @@ def collect_generation_samples(
                     amp_dtype=amp_dtype,
                     target_order=str(constrained_target_order),
                     temperature=float(constrained_temperature),
+                    max_reasoning_tokens=int(max_reasoning_tokens),
                 )
             else:
                 prompt_len = int(joint["input_ids"].shape[1])
@@ -773,12 +960,11 @@ def print_generation_samples(samples: list[dict[str, Any]]) -> None:
 def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
     rows = [
         ("FormatValid", float(test_metrics.get("FormatValid", 0.0))),
-        ("Avg L2", float(test_metrics.get("Avg L2", 0.0))),
-        ("Min L2", float(test_metrics.get("Min L2", 0.0))),
+        ("Avg L2", float(test_metrics.get("Avg L2", test_metrics.get("Dist", 0.0)))),
+        ("Min L2", float(test_metrics.get("Min L2", test_metrics.get("Dist", 0.0)))),
         ("PointBinExact", float(test_metrics.get("PointBinExact", 0.0))),
         ("ObjectAcc", float(test_metrics.get("ObjectAcc", 0.0))),
         ("MultiAcc@1", float(test_metrics.get("MultiAcc@1", 0.0))),
-        ("JointExact", float(test_metrics.get("JointExact", 0.0))),
         ("ExtraTextRate", float(test_metrics.get("ExtraTextRate", 0.0))),
         ("num_samples", float(test_metrics.get("num_samples", 0.0))),
     ]

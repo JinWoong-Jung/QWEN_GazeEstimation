@@ -218,7 +218,7 @@ Object: ...
 - 현재 eval 포맷(기본): `<|gaze_point|><loc_057><loc_083><|gaze_object|><obj_012>`
 - direct/object-first schema도 parser는 지원: `<|gaze_object|><obj_012><|gaze_point|><loc_057><loc_083>`
 - "Evaluation Metrics" 섹션이 CLIP retrieval `acc@1 / acc@3 / multiacc@1`을 기술하나, 현재 `eval_utils.run_test_metrics()`는 이를 계산하지 않음
-- 현재 실제 메트릭: `FormatValid`, `Avg L2`, `Min L2`, `PointBinExact`, `ObjectAcc`, `MultiAcc@1`, `JointExact`, `ExtraTextRate`, `PointL2ValidFrac`
+- 현재 실제 메트릭: `FormatValid`, `Dist`(val), `Avg L2`/`Min L2`(test), `PointBinExact`, `ObjectAcc`, `MultiAcc@1`, `ExtraTextRate`, `PointL2ValidFrac`
 - Data Flow 섹션의 CLIP retrieval 경로 설명 제거
 
 ---

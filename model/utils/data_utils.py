@@ -188,13 +188,19 @@ def maybe_hflip(
     return flipped, clamp01(ngx), (nx1, y1, nx2, y2)
 
 
-def color_jitter(scene: Image.Image, p: float = 0.8) -> Image.Image:
+def color_jitter(
+    scene: Image.Image,
+    p: float = 0.5,
+    brightness: tuple[float, float] = (0.8, 1.2),
+    contrast: tuple[float, float] = (0.8, 1.2),
+    saturation: tuple[float, float] = (0.8, 1.2),
+) -> Image.Image:
     if random.random() >= float(p):
         return scene
     out = scene
-    b = random.uniform(0.5, 1.5)
-    c = random.uniform(0.5, 1.5)
-    s = random.uniform(0.0, 1.5)
+    b = random.uniform(float(brightness[0]), float(brightness[1]))
+    c = random.uniform(float(contrast[0]), float(contrast[1]))
+    s = random.uniform(float(saturation[0]), float(saturation[1]))
     out = ImageEnhance.Brightness(out).enhance(b)
     out = ImageEnhance.Contrast(out).enhance(c)
     out = ImageEnhance.Color(out).enhance(s)
@@ -208,33 +214,16 @@ def apply_train_augmentation(
     bbox_px: tuple[float, float, float, float],
 ) -> tuple[Image.Image, float, float, tuple[float, float, float, float]]:
     w, h = scene.size
-    bx = sanitize_bbox_pixels(bbox_px, width=w, height=h)
-    bbox_f = (float(bx[0]), float(bx[1]), float(bx[2]), float(bx[3]))
-
-    if random.random() < 0.5:
-        scale = random.uniform(1.0, 1.2)
-        bbox_f = expand_bbox(bbox_f, width=w, height=h, scale=scale)
-
-    scene, gaze_x, gaze_y, bbox_f = safe_crop(
-        scene=scene,
-        gaze_x=gaze_x,
-        gaze_y=gaze_y,
-        bbox_px=bbox_f,
-        p=0.5,
-    )
-    scene, gaze_x, bbox_f = maybe_hflip(
-        scene=scene,
-        gaze_x=gaze_x,
-        bbox_px=bbox_f,
-        p=0.5,
-    )
-    scene = color_jitter(scene, p=0.8)
-
+    x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
+    bbox_px = (float(x1), float(y1), float(x2), float(y2))
+    # Spatial augmentation (gaze coords updated accordingly)
+    scene, gaze_x, gaze_y, bbox_px = safe_crop(scene, gaze_x, gaze_y, bbox_px, p=0.5)
+    scene, gaze_x, bbox_px = maybe_hflip(scene, gaze_x, bbox_px, p=0.5)
+    # Photometric augmentation (direction-invariant)
+    scene = color_jitter(scene, p=0.5)
     nw, nh = scene.size
-    x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_f, width=nw, height=nh)
-    gaze_x = clamp01(gaze_x)
-    gaze_y = clamp01(gaze_y)
-    return scene, gaze_x, gaze_y, (float(x1), float(y1), float(x2), float(y2))
+    x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=nw, height=nh)
+    return scene, clamp01(gaze_x), clamp01(gaze_y), (float(x1), float(y1), float(x2), float(y2))
 
 
 def apply_safe_augmentation(
@@ -243,12 +232,8 @@ def apply_safe_augmentation(
     gaze_y: float,
     bbox_px: tuple[float, float, float, float],
 ) -> tuple[Image.Image, float, float, tuple[float, float, float, float]]:
-    """Color-jitter-only augmentation for samples with spatial reasoning text.
-
-    Skips hflip and crop so that left/right and spatial-relation words in the
-    reasoning file stay consistent with the augmented image.
-    """
-    scene = color_jitter(scene, p=0.8)
+    """Weak photometric-only augmentation that preserves gaze/bbox coordinates."""
+    scene = color_jitter(scene, p=0.5)
     w, h = scene.size
     x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
     return scene, clamp01(gaze_x), clamp01(gaze_y), (float(x1), float(y1), float(x2), float(y2))

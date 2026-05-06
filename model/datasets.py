@@ -20,6 +20,7 @@ from .utils.data_utils import (
 from .utils.gaze_tokens import (
     GAZE_OBJ_UNKNOWN,
     build_structured_target_text,
+    normalize_reasoning_text,
     quantize_coord,
 )
 
@@ -158,7 +159,8 @@ class GazeDataset(Dataset):
         reasoning_index: dict[str, Any] | None = None,
         force_reasoning_format: bool = False,
         target_order: str = "reasoning_object_point",
-        disable_spatial_aug_for_reasoning: bool = True,
+        max_reasoning_words: int = 60,
+        max_reasoning_chars: int = 500,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -176,7 +178,8 @@ class GazeDataset(Dataset):
         self.reasoning_index: dict[str, Any] | None = reasoning_index
         self.force_reasoning_format = bool(force_reasoning_format)
         self.target_order = str(target_order or "reasoning_object_point")
-        self.disable_spatial_aug_for_reasoning = bool(disable_spatial_aug_for_reasoning)
+        self.max_reasoning_words = int(max_reasoning_words)
+        self.max_reasoning_chars = int(max_reasoning_chars)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
@@ -234,24 +237,20 @@ class GazeDataset(Dataset):
             if rpath is not None:
                 reasoning_text = load_reasoning_text(rpath)
                 has_reasoning_file = reasoning_text is not None
+                if reasoning_text:
+                    reasoning_text = normalize_reasoning_text(
+                        reasoning_text,
+                        max_words=self.max_reasoning_words,
+                        max_chars=self.max_reasoning_chars,
+                    )
 
         if self.apply_augmentation:
-            # Spatial aug (hflip/crop) invalidates original-image reasoning text.
-            # Use safe (color-jitter-only) aug for reasoning samples.
-            if has_reasoning_file and self.disable_spatial_aug_for_reasoning:
-                scene, gaze_x, gaze_y, bbox_px = apply_safe_augmentation(
-                    scene=scene,
-                    gaze_x=gaze_x,
-                    gaze_y=gaze_y,
-                    bbox_px=bbox_px,
-                )
-            else:
-                scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
-                    scene=scene,
-                    gaze_x=gaze_x,
-                    gaze_y=gaze_y,
-                    bbox_px=bbox_px,
-                )
+            scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
+                scene=scene,
+                gaze_x=gaze_x,
+                gaze_y=gaze_y,
+                bbox_px=bbox_px,
+            )
 
         w, h = scene.size
         x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
@@ -312,11 +311,11 @@ class GazeDataset(Dataset):
 
 
 class MultiViewGazeDataset(Dataset):
-    """Two-view dataset: one direct view and one reasoning view per record.
+    """Two-view dataset: point_object views for all records + reasoning_only views for a ratio.
 
-    Direct views use full augmentation and point_object target order.
-    Reasoning views use safe augmentation and reasoning_point_object target order.
-    Both views are stored in self._views for full dual-view training.
+    Direct views use full augmentation (crop, hflip, color jitter) and point_object target order.
+    Reasoning views use safe augmentation (color jitter only) and reasoning_only target order.
+    Reasoning views are a random sample of records_with_reasoning_files * reasoning_ratio.
     """
 
     def __init__(
@@ -334,8 +333,10 @@ class MultiViewGazeDataset(Dataset):
         filter_invalid_object_samples: bool = True,
         coord_bins: int = 1000,
         reasoning_index: dict[str, Any] | None = None,
-        max_reasoning_words: int = 30,
-        max_reasoning_chars: int = 220,
+        max_reasoning_words: int = 60,
+        max_reasoning_chars: int = 500,
+        reasoning_ratio: float = 0.2,
+        seed: int = 42,
     ) -> None:
         from pathlib import Path as _Path
 
@@ -376,19 +377,57 @@ class MultiViewGazeDataset(Dataset):
                 )
         self.records = records
 
-        # Build view list: (record_index, view_type)
+        # Direct views: all records, point_object format
         self._direct_views: list[tuple[int, str]] = [(i, "direct") for i in range(len(self.records))]
-        self._reasoning_views: list[tuple[int, str]] = []
 
-        if reasoning_index is not None:
+        # Reasoning views: random sample of reasoning_ratio * N_total from records that have files
+        import random as _random_mod
+        self._rng = _random_mod.Random(int(seed))
+        self._reasoning_ratio: float = float(reasoning_ratio)
+        self._capable: list[tuple[int, str]] = []
+        self._reasoning_views: list[tuple[int, str]] = []
+        if reasoning_index is not None and float(reasoning_ratio) > 0.0:
             for i, rec in enumerate(self.records):
                 folder = _Path(rec.image_rel).parent.name
                 stem = _Path(rec.image_rel).stem
                 key = f"{folder}/{stem}_{int(rec.sample_id)}"
                 if reasoning_index.get(key) is not None:
-                    self._reasoning_views.append((i, "reasoning"))
+                    self._capable.append((i, "reasoning"))
+            n_reasoning = self._num_reasoning_views()
+            self._reasoning_views = self._capable[:n_reasoning]
+            print(
+                f"[INFO] MultiViewGazeDataset: {len(self._direct_views)} point_object views + "
+                f"{n_reasoning} epoch-resampled reasoning_only views "
+                f"(from {len(self._capable)} capable, ratio={self._reasoning_ratio:.2f})"
+            )
+        else:
+            print(
+                f"[INFO] MultiViewGazeDataset: {len(self._direct_views)} point_object views + "
+                f"0 reasoning_only views (reasoning disabled)"
+            )
 
         self._views: list[tuple[int, str]] = self._direct_views + self._reasoning_views
+
+    def _num_reasoning_views(self) -> int:
+        return min(
+            len(self._capable),
+            max(0, int(round(len(self.records) * self._reasoning_ratio))),
+        )
+
+    def _resample_reasoning(self, verbose: bool = False) -> None:
+        n = self._num_reasoning_views()
+        self._reasoning_views = self._rng.sample(self._capable, n) if n > 0 else []
+        self._views = self._direct_views + self._reasoning_views
+        if verbose:
+            print(
+                f"[INFO] MultiViewGazeDataset: {len(self._direct_views)} point_object views + "
+                f"{len(self._reasoning_views)} reasoning_only views "
+                f"(from {len(self._capable)} capable, ratio={self._reasoning_ratio:.2f})"
+            )
+
+    def resample_reasoning_views(self) -> None:
+        """Re-sample reasoning_only views. Call at the start of each epoch."""
+        self._resample_reasoning(verbose=False)
 
     def get_view_counts(self) -> tuple[int, int]:
         """Return (n_direct, n_reasoning) view counts."""
@@ -419,7 +458,7 @@ class MultiViewGazeDataset(Dataset):
         bbox_px = rec.bbox_px
 
         if view_type == "reasoning":
-            # Reasoning view: safe (color-jitter-only) augmentation
+            # Reasoning view: safe (color-jitter-only) augmentation — no spatial changes
             scene, gaze_x, gaze_y, bbox_px = apply_safe_augmentation(
                 scene=scene, gaze_x=gaze_x, gaze_y=gaze_y, bbox_px=bbox_px,
             )
@@ -439,7 +478,7 @@ class MultiViewGazeDataset(Dataset):
                             max_chars=self.max_reasoning_chars,
                         )
             if reasoning_text:
-                target_order = "reasoning_point_object"
+                target_order = "reasoning_only"
                 prompt_text = self.prompt_text_reasoning
             else:
                 # Malformed or missing content → treat as direct view
@@ -490,13 +529,18 @@ class MultiViewGazeDataset(Dataset):
         bx = quantize_coord(float(gaze_x), bins=self.coord_bins)
         by = quantize_coord(float(gaze_y), bins=self.coord_bins)
 
+        # For reasoning_only views, point and object tokens are absent from the target.
+        is_reasoning_only = (target_order == "reasoning_only")
+        point_valid = 0.0 if is_reasoning_only else 1.0
+        object_valid = 0.0 if is_reasoning_only else float(target_object_valid)
+
         return {
             "scene_image": scene,
             "text_input": prompt,
             "target_text": target_text,
             "target_text_valid": torch.tensor(target_text_valid, dtype=torch.float32),
-            "target_point_valid": torch.tensor(1.0, dtype=torch.float32),
-            "target_object_valid": torch.tensor(target_object_valid, dtype=torch.float32),
+            "target_point_valid": torch.tensor(point_valid, dtype=torch.float32),
+            "target_object_valid": torch.tensor(object_valid, dtype=torch.float32),
             "target_label": int(rec.label_id),
             "target_label_ids": [int(obj_id)] if int(obj_id) >= 0 else [],
             "target_point": torch.tensor([float(gaze_x), float(gaze_y)], dtype=torch.float32),
