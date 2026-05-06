@@ -39,8 +39,10 @@ def _make_tokenizer(coord_bins: int = 8, num_classes: int = 4) -> MagicMock:
             next_id += 1
         return _vocab[tok]
 
-    _register("<|gaze_point|>")
-    _register("<|gaze_object|>")
+    _register("<|point_start|>")
+    _register("<|point_end|>")
+    _register("<|object_start|>")
+    _register("<|object_end|>")
     for i in range(coord_bins):
         _register(f"<loc_{i:0{loc_w}d}>")
     for i in range(num_classes):
@@ -172,10 +174,10 @@ class TestAppendTokenToJoint(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 _PT_OBJ_RE = re.compile(
-    r"^<\|gaze_point\|>(<loc_\d+>)(<loc_\d+>)<\|gaze_object\|>(<obj_\d+>)$"
+    r"^<\|point_start\|>(<loc_\d+>)(<loc_\d+>)<\|point_end\|><\|object_start\|>(<obj_\d+>)<\|object_end\|>$"
 )
 _OBJ_PT_RE = re.compile(
-    r"^<\|gaze_object\|>(<obj_\d+>)<\|gaze_point\|>(<loc_\d+>)(<loc_\d+>)$"
+    r"^<\|object_start\|>(<obj_\d+>)<\|object_end\|><\|point_start\|>(<loc_\d+>)(<loc_\d+>)<\|point_end\|>$"
 )
 
 

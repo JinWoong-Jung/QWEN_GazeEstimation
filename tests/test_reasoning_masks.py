@@ -19,7 +19,7 @@ class _SimpleTokenizer:
     """Word-level tokenizer that keeps <...> tokens atomic.
 
     Designed for unit tests only. Splits on spaces and newlines while
-    preserving <loc_NNN>, <obj_NNN>, <think>, </think> as single tokens.
+    preserving <loc_NNN>, <obj_NNN>, and active span markers as single tokens.
     """
 
     def __init__(self) -> None:

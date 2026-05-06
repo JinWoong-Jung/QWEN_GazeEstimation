@@ -68,7 +68,8 @@ from .utils.eval_utils import (
     print_test_metrics_table,
     run_test_metrics,
 )
-from .utils.gaze_tokens import parse_structured_output_text, register_gaze_special_tokens
+from .utils.gaze_tokens import parse_structured_output_text
+from .utils.special_tokens import GAZE_SCHEMA_MARKERS, register_gaze_special_tokens
 from .utils.loss_utils import compute_answer_loss
 from .utils.processor_collate import (
     QwenRLCollator,
@@ -800,12 +801,13 @@ def main() -> None:
     gaze_token_ids = sorted({int(v) for v in token_id_map.values() if int(v) >= 0})
     print(
         f"[INFO] tokenizer extended: vocab_size={new_vocab_size} "
-        f"(added loc tokens: {coord_bins}, obj tokens: {num_classes}, fmt tokens: 3)"
+        f"(added loc tokens: {coord_bins}, obj tokens: {num_classes}, "
+        f"fmt tokens: {len(GAZE_SCHEMA_MARKERS)})"
     )
 
     # Build ordered loc_token_ids tensor for Gaussian soft-label CE.
     # Entries are the vocab IDs of <loc_000>..<loc_{coord_bins-1}> in bin order.
-    from .utils.gaze_tokens import format_loc_token, _loc_token_width
+    from .utils.special_tokens import format_loc_token, _loc_token_width
     _lw = _loc_token_width(coord_bins)
     _loc_id_list = [int(token_id_map.get(format_loc_token(b, _lw), -1)) for b in range(coord_bins)]
     loc_token_ids_tensor: torch.Tensor | None = (

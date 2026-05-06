@@ -4,10 +4,14 @@ import math
 import unittest
 
 from model.utils.gaze_tokens import (
-    GAZE_OBJECT_MARKER,
-    GAZE_POINT_MARKER,
     build_structured_target_text,
     parse_structured_output_text,
+)
+from model.utils.special_tokens import (
+    OBJECT_END_MARKER,
+    OBJECT_START_MARKER,
+    POINT_END_MARKER,
+    POINT_START_MARKER,
 )
 from model.utils.eval_utils import decode_generated, l2_stats, valid_label_ids
 import torch
@@ -53,13 +57,15 @@ class TestParseInEvalContext(unittest.TestCase):
     def test_decode_generated_preserves_gaze_schema_markers_for_parse(self):
         class _Tok:
             id2tok = {
-                10: GAZE_POINT_MARKER,
+                10: POINT_START_MARKER,
                 11: "<loc_299>",
                 12: "<loc_699>",
-                13: GAZE_OBJECT_MARKER,
-                14: "<obj_005>",
-                15: "<|im_end|>",
-                16: "<|endoftext|>",
+                13: POINT_END_MARKER,
+                14: OBJECT_START_MARKER,
+                15: "<obj_005>",
+                16: OBJECT_END_MARKER,
+                17: "<|im_end|>",
+                18: "<|endoftext|>",
             }
 
             def decode(self, ids, skip_special_tokens=False):
@@ -70,11 +76,11 @@ class TestParseInEvalContext(unittest.TestCase):
             tokenizer = _Tok()
 
         input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
-        generated_ids = torch.tensor([[1, 2, 3, 10, 11, 12, 13, 14, 15, 16]], dtype=torch.long)
+        generated_ids = torch.tensor([[1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18]], dtype=torch.long)
         pred = decode_generated(_Proc(), generated_ids, input_ids, attention_mask=None)[0]
 
-        self.assertIn(GAZE_POINT_MARKER, pred)
-        self.assertIn(GAZE_OBJECT_MARKER, pred)
+        self.assertIn(POINT_START_MARKER, pred)
+        self.assertIn(OBJECT_START_MARKER, pred)
         self.assertNotIn("<|endoftext|>", pred)
         parsed = parse_structured_output_text(pred, self.NUM_CLASSES)
         self.assertTrue(parsed["valid_format"])

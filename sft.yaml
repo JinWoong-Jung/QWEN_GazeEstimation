@@ -39,7 +39,7 @@ train:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   filter_invalid_object_samples: false
-  train_augmentation_mode: "full"  # "full" | "color_only" | "no_crop" | "no_aug"
+  train_augmentation_mode: "color_only"  # "full" | "color_only" | "no_crop" | "no_aug"
   save_last_every_n_epochs: 5
   use_reasoning: false
   reasoning_view_ratio: 0.2   # ratio of total records to use as reasoning_only views
@@ -58,7 +58,7 @@ eval:
   run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_dist"      # val_dist | val_object_acc | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 5       # point_object fallback (constrained path ignores this; free path: exactly 5 tokens)
+  generation_max_new_tokens: 8       # point_object fallback (constrained path ignores this; free path: exactly 8 tokens)
   generation_num_beams: 1
   repetition_penalty: 1.0
   no_repeat_ngram_size: 0
@@ -71,20 +71,16 @@ prompt:
   visual_prompting: true
   # point_object prompt: used for all training views and evaluation
   prompt_text_direct: |
-    The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
-    Output the gaze point(coordinate tokens) and object(object token).
-    Coordinate tokens follow image coordinates:
-    for x, <loc_{coord_min:03d}> is the left edge and <loc_{coord_max:03d}> is the right edge;
-    for y, <loc_{coord_min:03d}> is the top edge and <loc_{coord_max:03d}> is the bottom edge.
-    Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Return exactly this schema:
-    <|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>
+    Given the image and the person head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}],
+    predict the gaze point(coordinate tokens) and object(object token).
+    Return only:
+    <|point_start|><loc_XXX><loc_YYY><|point_end|><|object_start|><obj_KKK><|object_end|>
   # reasoning_only prompt: used only for reasoning_only training views
   prompt_text_reasoning: |
-    The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
-    In one or two short sentences, reason about where this person is looking and what they are gazing at.
+    Given the image and the person head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}],
+    reason about where this person is looking and what they are gazing at.
     Return exactly this schema:
-    <|gaze_reasoning|><your reasoning here>
+    <|reasoning_start|><your reasoning here><|reasoning_end|>
 
 model:
   coord_bins: 128

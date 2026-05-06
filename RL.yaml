@@ -69,7 +69,7 @@ prompt:
     Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
     Return exactly this token schema, with no spaces, newlines, or extra text around the markers:
-    <|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>
+    <|point_start|><loc_NNN><loc_MMM><|point_end|><|object_start|><obj_KKK><|object_end|>
 
 model:
   coord_bins: 128

@@ -8,9 +8,6 @@ import torch
 from model.utils.gaze_tokens import (
     COORD_BINS,
     FORMAT_TOKENS,
-    GAZE_OBJECT_MARKER,
-    GAZE_POINT_MARKER,
-    GAZE_REASONING_MARKER,
     GAZE_SCHEMA_MARKERS,
     build_gaze_special_tokens,
     register_gaze_special_tokens,
@@ -132,8 +129,8 @@ class TestRegisterGazeSpecialTokens(unittest.TestCase):
         before = len(tok.get_vocab())
         register_gaze_special_tokens(tok, num_classes=num_classes)
         after = len(tok.get_vocab())
-        # 3 schema markers + 1000 loc tokens + 5 obj tokens + 1 unknown obj token
-        expected_new = 3 + COORD_BINS + num_classes + 1
+        # 6 schema markers + 1000 loc tokens + 5 obj tokens + 1 unknown obj token
+        expected_new = 6 + COORD_BINS + num_classes + 1
         self.assertEqual(after - before, expected_new)
 
     def test_custom_coord_bins_vocab_size(self) -> None:
@@ -142,7 +139,7 @@ class TestRegisterGazeSpecialTokens(unittest.TestCase):
         before = len(tok.get_vocab())
         register_gaze_special_tokens(tok, num_classes=num_classes, coord_bins=128)
         after = len(tok.get_vocab())
-        self.assertEqual(after - before, 3 + 128 + num_classes + 1)
+        self.assertEqual(after - before, 6 + 128 + num_classes + 1)
         self.assertIn("<loc_127>", tok.get_vocab())
         self.assertNotIn("<loc_999>", tok.get_vocab())
 

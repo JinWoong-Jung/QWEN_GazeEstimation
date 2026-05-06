@@ -13,14 +13,17 @@ from tqdm.auto import tqdm
 from transformers import LogitsProcessor, LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
 
 from .common import to_device
-from .gaze_tokens import (
+from .gaze_tokens import parse_structured_output_text
+from .special_tokens import (
     ANSWER_END,
-    GAZE_OBJECT_MARKER,
-    GAZE_POINT_MARKER,
-    GAZE_REASONING_MARKER,
+    OBJECT_END_MARKER,
+    OBJECT_START_MARKER,
+    POINT_END_MARKER,
+    POINT_START_MARKER,
+    REASONING_END_MARKER,
+    REASONING_START_MARKER,
     format_loc_token,
     format_obj_token,
-    parse_structured_output_text,
 )
 from .loss_utils import compute_answer_loss
 
@@ -49,9 +52,8 @@ class _GazeObjEndStoppingCriteria(StoppingCriteria):
 class HybridConstrainedLogitsProcessor(LogitsProcessor):
     """Per-sequence state machine for hybrid constrained decoding.
 
-    Phase 1: forces <|gaze_reasoning|>, then allows free generation until the
-    model naturally emits the transition marker or max_reasoning_tokens is
-    reached (at which point the marker is forced).
+    Phase 1: forces <|reasoning_start|>, then allows free generation until the
+    model naturally emits <|reasoning_end|> or max_reasoning_tokens is reached.
     Phase 2: restricts each structured slot to its allowed token set.
 
     Designed for use with model.generate() so that KV-cache and batched GPU
@@ -62,74 +64,91 @@ class HybridConstrainedLogitsProcessor(LogitsProcessor):
     def __init__(
         self,
         prompt_len: int,
-        reasoning_marker_id: int,
-        point_marker_id: int,
-        object_marker_id: int,
+        reasoning_start_id: int,
+        reasoning_end_id: int,
+        point_start_id: int,
+        point_end_id: int,
+        object_start_id: int,
+        object_end_id: int,
         loc_ids: list[int],
         obj_ids: list[int],
         target_order: str,
         max_reasoning_tokens: int,
     ) -> None:
         self.prompt_len = int(prompt_len)
-        self.reasoning_marker_id = int(reasoning_marker_id)
-        self.point_marker_id = int(point_marker_id)
-        self.object_marker_id = int(object_marker_id)
+        self.reasoning_start_id = int(reasoning_start_id)
+        self.reasoning_end_id = int(reasoning_end_id)
+        self.point_start_id = int(point_start_id)
+        self.point_end_id = int(point_end_id)
+        self.object_start_id = int(object_start_id)
+        self.object_end_id = int(object_end_id)
         self.loc_ids_list = [int(x) for x in loc_ids]
         self.loc_ids_set = set(self.loc_ids_list)
         self.obj_ids_list = [int(x) for x in obj_ids]
         self.obj_ids_set = set(self.obj_ids_list)
         self.target_order = str(target_order)
         self.max_reasoning_tokens = int(max_reasoning_tokens)
-        self.transition_id = (
-            self.point_marker_id
-            if self.target_order == "reasoning_point_object"
-            else self.object_marker_id
-        )
+
+    def _point_state(self, post: list[int], next_done_state: str) -> str:
+        if not post or post[0] != self.point_start_id:
+            return "FORCE_POINT_START"
+        point_span = post[1:]
+        n_loc = sum(1 for t in point_span if t in self.loc_ids_set)
+        if n_loc == 0:
+            return "POINT_X"
+        if n_loc == 1:
+            return "POINT_Y"
+        if self.point_end_id not in point_span:
+            return "FORCE_POINT_END"
+        return next_done_state
+
+    def _object_state(self, post: list[int], next_done_state: str) -> str:
+        if not post or post[0] != self.object_start_id:
+            return "FORCE_OBJECT_START"
+        obj_span = post[1:]
+        n_obj = sum(1 for t in obj_span if t in self.obj_ids_set)
+        if n_obj == 0:
+            return "OBJECT"
+        if self.object_end_id not in obj_span:
+            return "FORCE_OBJECT_END"
+        return next_done_state
 
     def _get_state(self, gen: list[int]) -> str:
         """Derive decoding state purely from already-generated token ids."""
-        if not gen or gen[0] != self.reasoning_marker_id:
-            return "FORCE_REASONING"
+        if not gen or gen[0] != self.reasoning_start_id:
+            return "FORCE_REASONING_START"
 
-        trans_idx = -1
+        rsn_end_idx = -1
         for k, t in enumerate(gen):
-            if t == self.transition_id:
-                trans_idx = k
+            if k > 0 and t == self.reasoning_end_id:
+                rsn_end_idx = k
                 break
 
-        if trans_idx == -1:
-            n_reasoning = len(gen) - 1  # subtract <|gaze_reasoning|> itself
+        if rsn_end_idx == -1:
+            n_reasoning = len(gen) - 1  # subtract <|reasoning_start|> itself
             if n_reasoning >= self.max_reasoning_tokens:
-                return "FORCE_TRANSITION"
+                return "FORCE_REASONING_END"
             return "REASONING"
 
-        post = gen[trans_idx + 1 :]
+        post = gen[rsn_end_idx + 1 :]
         if self.target_order == "reasoning_point_object":
-            n_loc = sum(1 for t in post if t in self.loc_ids_set)
-            n_obj_m = sum(1 for t in post if t == self.object_marker_id)
-            n_obj = sum(1 for t in post if t in self.obj_ids_set)
-            if n_loc == 0:
-                return "POINT_X"
-            if n_loc == 1:
-                return "POINT_Y"
-            if n_obj_m == 0:
-                return "FORCE_OBJECT"
-            if n_obj == 0:
-                return "OBJECT"
-            return "DONE"
+            point_state = self._point_state(post, "AFTER_POINT")
+            if point_state != "AFTER_POINT":
+                return point_state
+            try:
+                point_end_pos = post.index(self.point_end_id)
+            except ValueError:
+                return "FORCE_POINT_END"
+            return self._object_state(post[point_end_pos + 1 :], "DONE")
         else:  # reasoning_object_point
-            n_obj = sum(1 for t in post if t in self.obj_ids_set)
-            n_pt_m = sum(1 for t in post if t == self.point_marker_id)
-            n_loc = sum(1 for t in post if t in self.loc_ids_set)
-            if n_obj == 0:
-                return "OBJECT"
-            if n_pt_m == 0:
-                return "FORCE_POINT"
-            if n_loc == 0:
-                return "POINT_X"
-            if n_loc == 1:
-                return "POINT_Y"
-            return "DONE"
+            object_state = self._object_state(post, "AFTER_OBJECT")
+            if object_state != "AFTER_OBJECT":
+                return object_state
+            try:
+                object_end_pos = post.index(self.object_end_id)
+            except ValueError:
+                return "FORCE_OBJECT_END"
+            return self._point_state(post[object_end_pos + 1 :], "DONE")
 
     def __call__(
         self,
@@ -138,10 +157,12 @@ class HybridConstrainedLogitsProcessor(LogitsProcessor):
     ) -> torch.FloatTensor:
         NEG_INF = float("-inf")
         _FORCE_MAP = {
-            "FORCE_REASONING": self.reasoning_marker_id,
-            "FORCE_TRANSITION": self.transition_id,
-            "FORCE_OBJECT": self.object_marker_id,
-            "FORCE_POINT": self.point_marker_id,
+            "FORCE_REASONING_START": self.reasoning_start_id,
+            "FORCE_REASONING_END": self.reasoning_end_id,
+            "FORCE_POINT_START": self.point_start_id,
+            "FORCE_POINT_END": self.point_end_id,
+            "FORCE_OBJECT_START": self.object_start_id,
+            "FORCE_OBJECT_END": self.object_end_id,
         }
         for i in range(int(input_ids.shape[0])):
             gen = input_ids[i, self.prompt_len :].tolist()
@@ -254,25 +275,29 @@ def constrained_generate_hybrid(
 
     loc_ids = _loc_token_ids(tokenizer, coord_bins=int(coord_bins))
     obj_ids = _obj_token_ids(tokenizer, num_classes=int(num_classes))
-    reasoning_marker_id = _marker_id(tokenizer, GAZE_REASONING_MARKER)
-    point_marker_id = _marker_id(tokenizer, GAZE_POINT_MARKER)
-    object_marker_id = _marker_id(tokenizer, GAZE_OBJECT_MARKER)
+    reasoning_start_id = _marker_id(tokenizer, REASONING_START_MARKER)
+    reasoning_end_id = _marker_id(tokenizer, REASONING_END_MARKER)
+    point_start_id = _marker_id(tokenizer, POINT_START_MARKER)
+    point_end_id = _marker_id(tokenizer, POINT_END_MARKER)
+    object_start_id = _marker_id(tokenizer, OBJECT_START_MARKER)
+    object_end_id = _marker_id(tokenizer, OBJECT_END_MARKER)
 
     lp = HybridConstrainedLogitsProcessor(
         prompt_len=prompt_len,
-        reasoning_marker_id=reasoning_marker_id,
-        point_marker_id=point_marker_id,
-        object_marker_id=object_marker_id,
+        reasoning_start_id=reasoning_start_id,
+        reasoning_end_id=reasoning_end_id,
+        point_start_id=point_start_id,
+        point_end_id=point_end_id,
+        object_start_id=object_start_id,
+        object_end_id=object_end_id,
         loc_ids=loc_ids,
         obj_ids=obj_ids,
         target_order=order,
         max_reasoning_tokens=int(max_reasoning_tokens),
     )
 
-    # Budget: 1 (<|gaze_reasoning|>) + max_reasoning_tokens (free reasoning)
-    #       + 1 (transition marker) + 2 (loc_x, loc_y)
-    #       + 1 (<|gaze_object|>) + 1 (obj) = max_reasoning_tokens + 6
-    max_new = int(max_reasoning_tokens) + 6
+    # Budget: reasoning start/end + free reasoning + point span(5) + object span(3).
+    max_new = int(max_reasoning_tokens) + 10
 
     with torch.autocast(
         device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
@@ -414,11 +439,15 @@ def constrained_generate_structured(
     loc_ids = _loc_token_ids(tokenizer, coord_bins=int(coord_bins))
     obj_ids = _obj_token_ids(tokenizer, num_classes=int(num_classes))
 
-    point_marker_id = _marker_id(tokenizer, GAZE_POINT_MARKER)
-    object_marker_id = _marker_id(tokenizer, GAZE_OBJECT_MARKER)
+    point_start_id = _marker_id(tokenizer, POINT_START_MARKER)
+    point_end_id = _marker_id(tokenizer, POINT_END_MARKER)
+    object_start_id = _marker_id(tokenizer, OBJECT_START_MARKER)
+    object_end_id = _marker_id(tokenizer, OBJECT_END_MARKER)
 
-    point_marker = torch.full((bsz,), point_marker_id, device=device, dtype=torch.long)
-    object_marker = torch.full((bsz,), object_marker_id, device=device, dtype=torch.long)
+    point_start = torch.full((bsz,), point_start_id, device=device, dtype=torch.long)
+    point_end = torch.full((bsz,), point_end_id, device=device, dtype=torch.long)
+    object_start = torch.full((bsz,), object_start_id, device=device, dtype=torch.long)
+    object_end = torch.full((bsz,), object_end_id, device=device, dtype=torch.long)
 
     cur = dict(joint)
     generated_steps: list[torch.LongTensor] = []
@@ -426,9 +455,9 @@ def constrained_generate_structured(
     y_probs: torch.Tensor | None = None
 
     if order == "point_object":
-        # <|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>
-        cur = _append_token_to_joint(cur, point_marker)
-        generated_steps.append(point_marker)
+        # <|point_start|><loc_x><loc_y><|point_end|><|object_start|><obj_k><|object_end|>
+        cur = _append_token_to_joint(cur, point_start)
+        generated_steps.append(point_start)
 
         x_tok, x_probs = _select_next_from_allowed(
             model, cur, loc_ids,
@@ -448,24 +477,31 @@ def constrained_generate_structured(
         cur = _append_token_to_joint(cur, y_tok)
         generated_steps.append(y_tok)
 
-        cur = _append_token_to_joint(cur, object_marker)
-        generated_steps.append(object_marker)
+        cur = _append_token_to_joint(cur, point_end)
+        generated_steps.append(point_end)
+
+        cur = _append_token_to_joint(cur, object_start)
+        generated_steps.append(object_start)
 
         obj_tok, _ = _select_next_from_allowed(model, cur, obj_ids, amp_dtype=amp_dtype, temperature=temperature)
         generated_steps.append(obj_tok)
+        generated_steps.append(object_end)
 
     else:
         # order == "object_point"
-        # <|gaze_object|><obj_k><|gaze_point|><loc_x><loc_y>
-        cur = _append_token_to_joint(cur, object_marker)
-        generated_steps.append(object_marker)
+        # <|object_start|><obj_k><|object_end|><|point_start|><loc_x><loc_y><|point_end|>
+        cur = _append_token_to_joint(cur, object_start)
+        generated_steps.append(object_start)
 
         obj_tok, _ = _select_next_from_allowed(model, cur, obj_ids, amp_dtype=amp_dtype, temperature=temperature)
         cur = _append_token_to_joint(cur, obj_tok)
         generated_steps.append(obj_tok)
 
-        cur = _append_token_to_joint(cur, point_marker)
-        generated_steps.append(point_marker)
+        cur = _append_token_to_joint(cur, object_end)
+        generated_steps.append(object_end)
+
+        cur = _append_token_to_joint(cur, point_start)
+        generated_steps.append(point_start)
 
         x_tok, x_probs = _select_next_from_allowed(
             model, cur, loc_ids,
@@ -483,6 +519,7 @@ def constrained_generate_structured(
             selection_strategy=loc_selection_strategy,
         )
         generated_steps.append(y_tok)
+        generated_steps.append(point_end)
 
     gen_ids = torch.stack(generated_steps, dim=1)  # [B, T]
     texts = tokenizer.batch_decode(gen_ids.detach().cpu(), skip_special_tokens=False)
@@ -518,7 +555,11 @@ def decode_generated(
         # Keep parser-visible schema markers intact. The parser accepts <|im_end|>
         # as an optional trailing EOS, and gaze markers are part of the output schema.
         # Strip other Qwen chat markers (e.g. <|endoftext|>).
-        txt = re.sub(r"<\|(?!im_start\||im_end\||gaze_)[^>]+?\|>", "", str(txt)).strip()
+        txt = re.sub(
+            r"<\|(?!(?:im_start|im_end|gaze_|point_|object_|reasoning_))[^>]+?\|>",
+            "",
+            str(txt),
+        ).strip()
         out.append(str(txt))
     return out
 

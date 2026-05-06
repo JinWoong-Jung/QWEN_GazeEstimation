@@ -43,6 +43,7 @@ QWEN_GazeEstimation/
 │       ├── object_tokens.py
 │       ├── processor_collate.py
 │       ├── rl_utils.py
+│       ├── special_tokens.py
 │       └── wandb_utils.py
 ├── data/
 ├── scripts/
@@ -59,7 +60,8 @@ Generated directories such as `checkpoints/`, `outputs/`, `wandb/`, `.pytest_cac
 - `model/model.py`: minimal `QwenTextGenerationModel` wrapper; returns logits and delegates generation.
 - `model/trainer.py`: config loading, model setup, dataset setup, LoRA, train/eval loop, checkpointing.
 - `model/datasets.py`: train/val/test dataset classes and structured target construction.
-- `model/utils/gaze_tokens.py`: special token schema, loc/object token builders, quantization, structured parser.
+- `model/utils/gaze_tokens.py`: structured target formatting, quantization, structured parser, legacy re-exports.
+- `model/utils/special_tokens.py`: gaze special-token constants, loc/object token formatting, tokenizer registration.
 - `model/utils/processor_collate.py`: chat template input building, labels, structured loss masks.
 - `model/utils/loss_utils.py`: structured CE, Gaussian point CE, point expectation loss.
 - `model/utils/eval_utils.py`: generation decode, structured parsing, validation/test metrics.

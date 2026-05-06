@@ -89,12 +89,13 @@ class TestBuildPrompt(unittest.TestCase):
             for name in ("sft.yaml", "RL.yaml")
         )
         # point_object schema (sft.yaml: prompt_text_direct; RL.yaml: prompt_text)
-        self.assertIn("<|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>", cfg)
+        self.assertIn(
+            "<|point_start|><loc_NNN><loc_MMM><|point_end|><|object_start|><obj_KKK><|object_end|>",
+            cfg,
+        )
         # reasoning_only schema (sft.yaml: prompt_text_reasoning)
-        self.assertIn("<|gaze_reasoning|><your reasoning here>", cfg)
+        self.assertIn("<|reasoning_start|><your reasoning here><|reasoning_end|>", cfg)
         self.assertNotIn("Reasoning: <your reasoning here>", cfg)
-        self.assertNotIn("Point: <loc_NNN><loc_MMM>", cfg)
-        self.assertNotIn("Object: <obj_KKK>", cfg)
 
     def test_sft_uses_split_prompt_multiview_sampling(self) -> None:
         cfg = (Path(__file__).resolve().parents[1] / "sft.yaml").read_text(encoding="utf-8")

@@ -7,16 +7,14 @@ import torch
 
 from ..modules.preprocess import resize_scene
 from .common import chat_text
-from .gaze_tokens import (
+from .special_tokens import (
     ANSWER_END,
     GAZE_OBJ_UNKNOWN,
-    GAZE_REASONING_MARKER,
-    GAZE_POINT_MARKER,
-    GAZE_OBJECT_MARKER,
-    REASONING_START,
-    REASONING_END,
+    REASONING_END_MARKER,
+    REASONING_START_MARKER,
+    _LOC_RE,
+    _OBJ_RE,
 )
-from .gaze_tokens import _LOC_RE, _OBJ_RE
 
 
 _LABEL_IDS_PAD_LEN: int = 5
@@ -114,15 +112,12 @@ def build_structured_masks(
     Returns (loss_mask_point, loss_mask_object, loss_mask_format, loss_mask_reasoning).
     point     = tokens matching <loc_*>
     object    = tokens matching <obj_*> or <obj_unknown>
-    reasoning = Reasoning: content tokens inside <think>...</think>
+    reasoning = content tokens inside <|reasoning_start|>...<|reasoning_end|>
     format    = all other tokens inside the answer span (structure tokens, Point:, Object:, etc.)
 
     Mask boundary rules (disjoint, union = full answer span):
-      <think> token + following \\n        → format
-      "Reasoning:" label + following space  → format
-      text after "Reasoning: " until \\n before </think>  → reasoning
-      \\n before </think>                   → format
-      </think> token                        → format
+      <|reasoning_start|> / <|reasoning_end|> → format
+      reasoning text between markers          → reasoning
       <loc_*>                               → point
       <obj_*> / <obj_unknown>               → object
       everything else                       → format
@@ -143,24 +138,16 @@ def build_structured_masks(
     if tokenizer is None:
         return mask_pt, mask_obj, mask_fmt, mask_rsn
 
-    # Pre-compute boundary token id sequences for all schema formats.
-    think_start_ids: list[int] = []
-    think_end_ids: list[int] = []
-    reasoning_label_ids: list[int] = []
-    gaze_rsn_ids: list[int] = []
-    gaze_pt_ids: list[int] = []
-    gaze_obj_ids: list[int] = []
+    # Pre-compute boundary token id sequences for the active schema.
+    rsn_start_ids: list[int] = []
+    rsn_end_ids: list[int] = []
     if hasattr(tokenizer, "__call__"):
         def _tok_ids(s: str) -> list[int]:
             out = tokenizer(s, add_special_tokens=False, return_attention_mask=False)
             ids = out.get("input_ids", [])
             return [int(x) for x in ids] if ids else []
-        think_start_ids = _tok_ids(REASONING_START)
-        think_end_ids   = _tok_ids(REASONING_END)
-        reasoning_label_ids = _tok_ids("Reasoning:")
-        gaze_rsn_ids = _tok_ids(GAZE_REASONING_MARKER)
-        gaze_pt_ids  = _tok_ids(GAZE_POINT_MARKER)
-        gaze_obj_ids = _tok_ids(GAZE_OBJECT_MARKER)
+        rsn_start_ids = _tok_ids(REASONING_START_MARKER)
+        rsn_end_ids = _tok_ids(REASONING_END_MARKER)
 
     # Batch tokenize all target texts once (1 call instead of bsz calls).
     raw_out = tokenizer(
@@ -196,70 +183,15 @@ def build_structured_masks(
         # Detect reasoning block span within ans_ids (offset indices).
         rsn_content_offsets: set[int] = set()
 
-        # New special-token schema: <|gaze_reasoning|> marker
-        gaze_rsn_pos = find_subseq(ans_ids, gaze_rsn_ids, from_right=False) if gaze_rsn_ids else -1
-
-        ts_pos = find_subseq(ans_ids, think_start_ids, from_right=False) if think_start_ids else -1
-        rl_pos = find_subseq(ans_ids, reasoning_label_ids, from_right=False) if reasoning_label_ids else -1
-
-        if gaze_rsn_pos >= 0:
-            # New special-token schema: content is between <|gaze_reasoning|> and
-            # the next <|gaze_point|> or <|gaze_object|> marker (whichever comes first).
-            content_start = gaze_rsn_pos + len(gaze_rsn_ids)
+        rsn_start_pos = find_subseq(ans_ids, rsn_start_ids, from_right=False) if rsn_start_ids else -1
+        if rsn_start_pos >= 0:
+            # Active span schema: content is between reasoning start/end.
+            content_start = rsn_start_pos + len(rsn_start_ids)
             content_end = len(ans_ids)
-            for marker_ids in (gaze_pt_ids, gaze_obj_ids):
-                if not marker_ids:
-                    continue
-                m_len = len(marker_ids)
-                for ci in range(content_start, len(ans_ids) - m_len + 1):
-                    if ans_ids[ci : ci + m_len] == marker_ids:
-                        if ci < content_end:
-                            content_end = ci
-                        break
-            for off in range(content_start, content_end):
-                rsn_content_offsets.add(off)
-
-        elif ts_pos >= 0 and think_end_ids and (rl_pos < 0 or ts_pos < rl_pos):
-            # Legacy <think>...</think> format.
-            te_pos = find_subseq(ans_ids, think_end_ids, from_right=False)
-            if te_pos > ts_pos:
-                think_start_end = ts_pos + len(think_start_ids)
-                think_end_start = te_pos
-                rl_len = len(reasoning_label_ids)
-                rsn_label_start = think_start_end
-                if rsn_label_start < len(tok_strs) and tok_strs[rsn_label_start] in {"<0x0A>", "\n", "Ċ", "▁\n"}:
-                    rsn_label_start += 1
-                rsn_label_end = rsn_label_start + rl_len
-                content_start = rsn_label_end
-                if content_start < len(ans_ids):
-                    space_str = tok_strs[content_start] if content_start < len(tok_strs) else ""
-                    if space_str in {"▁", " ", "Ġ"} or (len(space_str) == 1 and space_str.isspace()):
-                        content_start += 1
-                content_end = think_end_start
-                if content_end > content_start and content_end - 1 >= 0:
-                    last_tok = tok_strs[content_end - 1] if content_end - 1 < len(tok_strs) else ""
-                    if last_tok in {"<0x0A>", "\n", "Ċ", "ĠĊ", "▁\n"}:
-                        content_end -= 1
-                for off in range(content_start, content_end):
-                    rsn_content_offsets.add(off)
-
-        elif rl_pos >= 0:
-            # Legacy flat format: "Reasoning: <content>\nObject:..."
-            content_start = rl_pos + len(reasoning_label_ids)
-            # Skip a space token (but not a newline) immediately after "Reasoning:"
-            if content_start < len(ans_ids):
-                space_str = tok_strs[content_start] if content_start < len(tok_strs) else ""
-                if space_str in {"▁", " ", "Ġ"}:
-                    content_start += 1
-            # Collect tokens up to the first newline.
-            # Also catches BPE fusions like ".Ċ" (period+newline) by checking
-            # if the token string contains the Qwen newline character Ċ (U+010A).
-            content_end = content_start
-            while content_end < len(ans_ids):
-                t_str = tok_strs[content_end] if content_end < len(tok_strs) else ""
-                if t_str in {"<0x0A>", "\n", "Ċ", "ĠĊ", "▁\n"} or "Ċ" in t_str or "\n" in t_str:
-                    break
-                content_end += 1
+            if rsn_end_ids:
+                rel_end = find_subseq(ans_ids[content_start:], rsn_end_ids, from_right=False)
+                if rel_end >= 0:
+                    content_end = content_start + rel_end
             for off in range(content_start, content_end):
                 rsn_content_offsets.add(off)
 

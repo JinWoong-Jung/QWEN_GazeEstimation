@@ -6,14 +6,15 @@ from pathlib import Path
 
 from model.utils.data_utils import load_reasoning_text
 from model.utils.gaze_tokens import (
-    GAZE_OBJECT_MARKER,
-    GAZE_POINT_MARKER,
-    GAZE_REASONING_MARKER,
-    REASONING_END,
-    REASONING_START,
     build_structured_target_text,
     build_structured_target_text_with_reasoning,
     parse_structured_output_text,
+)
+from model.utils.special_tokens import (
+    OBJECT_START_MARKER,
+    POINT_START_MARKER,
+    REASONING_END_MARKER,
+    REASONING_START_MARKER,
 )
 
 
@@ -38,36 +39,29 @@ class TestBuildWithReasoning(unittest.TestCase):
             0.5, 0.5, 10, 100, "",
             force_reasoning_format=True,
         )
-        # New special-token schema: <|gaze_reasoning|> marker, no legacy <think> wrapper
-        self.assertNotIn(REASONING_START, result)
-        self.assertNotIn(REASONING_END, result)
         self.assertNotIn("Reasoning:", result)
-        self.assertIn(GAZE_REASONING_MARKER, result)
-        self.assertIn(GAZE_POINT_MARKER, result)
-        self.assertIn(GAZE_OBJECT_MARKER, result)
+        self.assertIn(REASONING_START_MARKER, result)
+        self.assertIn(REASONING_END_MARKER, result)
+        self.assertIn(POINT_START_MARKER, result)
+        self.assertIn(OBJECT_START_MARKER, result)
 
     def test_with_reasoning_uses_gaze_reasoning_marker(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "Looking at the TV.")
-        # New schema: <|gaze_reasoning|> marker, no legacy <think> or "Reasoning:" prefix
-        self.assertNotIn(REASONING_START, result)
-        self.assertNotIn(REASONING_END, result)
         self.assertNotIn("Reasoning:", result)
-        self.assertIn(GAZE_REASONING_MARKER, result)
+        self.assertIn(REASONING_START_MARKER, result)
         self.assertIn("Looking at the TV.", result)
 
     def test_reasoning_marker_before_point_and_object(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "test reason")
-        rsn_pos = result.index(GAZE_REASONING_MARKER)
-        pt_pos  = result.index(GAZE_POINT_MARKER)
-        obj_pos = result.index(GAZE_OBJECT_MARKER)
+        rsn_pos = result.index(REASONING_START_MARKER)
+        pt_pos  = result.index(POINT_START_MARKER)
+        obj_pos = result.index(OBJECT_START_MARKER)
         self.assertLess(rsn_pos, pt_pos)
         self.assertLess(rsn_pos, obj_pos)
 
     def test_reasoning_content_embedded_in_marker(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "abc")
-        # Content immediately after <|gaze_reasoning|>, no newline/space gap
-        self.assertIn(GAZE_REASONING_MARKER + "abc", result)
-        self.assertNotIn(REASONING_START, result)
+        self.assertIn(REASONING_START_MARKER + "abc", result)
 
     def test_base_content_preserved(self):
         # When using reasoning, the tail of the result matches the direct object_point format
@@ -77,8 +71,7 @@ class TestBuildWithReasoning(unittest.TestCase):
 
     def test_reasoning_stripped(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "  padded  ")
-        # Normalized reasoning text directly after the marker
-        self.assertIn(GAZE_REASONING_MARKER + "padded", result)
+        self.assertIn(REASONING_START_MARKER + "padded", result)
 
     def test_no_newlines_in_new_schema(self):
         result = build_structured_target_text_with_reasoning(0.5, 0.5, 10, 100, "some text")
@@ -121,12 +114,12 @@ class TestStrictReWithReasoning(unittest.TestCase):
         self.assertIsNotNone(p["point_xy"])
 
     def test_invalid_missing_point(self):
-        text = "<think>\nReasoning: blah\n</think>\nObject: <obj_010>"
+        text = "<|reasoning_start|>blah<|reasoning_end|><|object_start|><obj_010><|object_end|>"
         p = parse_structured_output_text(text, 100)
         self.assertFalse(p["valid_format"])
 
     def test_invalid_missing_object(self):
-        text = "Point: <loc_064><loc_064>"
+        text = "<|point_start|><loc_064><loc_064><|point_end|>"
         p = parse_structured_output_text(text, 100)
         self.assertFalse(p["valid_format"])
 
@@ -138,16 +131,12 @@ class TestStrictReWithReasoning(unittest.TestCase):
 
     def test_new_schema_reasoning_markers_stripped_from_reasoning(self):
         """Schema markers injected into reasoning text must be removed by normalize."""
-        bad_text = f"Look {GAZE_POINT_MARKER} at screen"
+        bad_text = f"Look {POINT_START_MARKER} at screen"
         text = build_structured_target_text_with_reasoning(0.5, 0.5, 7, 100, bad_text)
-        # The marker must not appear inside the reasoning body (between gaze_rsn and next marker)
-        rsn_start = text.index(GAZE_REASONING_MARKER) + len(GAZE_REASONING_MARKER)
-        next_marker = min(
-            text.index(GAZE_OBJECT_MARKER),
-            text.index(GAZE_POINT_MARKER, rsn_start),
-        )
+        rsn_start = text.index(REASONING_START_MARKER) + len(REASONING_START_MARKER)
+        next_marker = text.index(REASONING_END_MARKER)
         reasoning_body = text[rsn_start:next_marker]
-        self.assertNotIn(GAZE_POINT_MARKER, reasoning_body)
+        self.assertNotIn(POINT_START_MARKER, reasoning_body)
         p = parse_structured_output_text(text, 100)
         self.assertTrue(p["valid_format"])
 

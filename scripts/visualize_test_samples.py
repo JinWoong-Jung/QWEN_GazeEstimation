@@ -37,7 +37,7 @@ from model.utils.data_utils import (
     load_vocab2id,
 )
 from model.utils.eval_utils import collect_generation_samples
-from model.utils.gaze_tokens import register_gaze_special_tokens
+from model.utils.special_tokens import register_gaze_special_tokens
 from model.utils.processor_collate import QwenTestCollator
 
 

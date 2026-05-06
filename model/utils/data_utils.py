@@ -11,7 +11,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageEnhance, ImageOps
 
-from .gaze_tokens import COORD_BINS, format_loc_token, quantize_coord
+from .gaze_tokens import quantize_coord
+from .special_tokens import COORD_BINS, format_loc_token
 
 
 def is_normalized_point(x: float, y: float) -> bool:
