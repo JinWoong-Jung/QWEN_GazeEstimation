@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 from typing import Any
 
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .common import to_device
 from .eval_utils import l2_stats
 
 
@@ -396,3 +398,77 @@ def compute_grpo_loss(
         "ratio_mean": float(ratio.detach().mean().item()),
         "ratio_std":  float(ratio.detach().std().item()) if ratio.numel() > 1 else 0.0,
     }
+
+
+def infer_logprobs_chunked(
+    model: torch.nn.Module,
+    lp_joint: dict[str, Any],
+    input_ids: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    micro_bsz: int,
+) -> torch.Tensor:
+    """Inference-mode per-token log-probs, processed in micro-batches.
+
+    Splits the B*G batch into chunks of `micro_bsz` so that only one chunk's
+    activations + logits live on GPU at a time.  Returns [B*G, L-1] on CPU.
+
+    pixel_values in Qwen-VL is a flat [total_patches, C, h, w] tensor — not
+    [B, ...].  We use image_grid_thw (num_images, 3) to slice it per sample.
+    When image_grid_thw is unavailable we fall back to equal-size splitting.
+    """
+    total = int(input_ids.shape[0])
+    if micro_bsz <= 0 or micro_bsz >= total:
+        joint_dev = to_device(lp_joint, device=device)
+        ids_dev = input_ids.to(device=device)
+        with torch.inference_mode():
+            with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                enabled=(device.type == "cuda")):
+                out = model(joint_inputs=joint_dev, use_cache=False)
+        lp = compute_token_logprobs(out["logits"].detach(), ids_dev).cpu()
+        del out
+        return lp
+
+    grid_thw = lp_joint.get("image_grid_thw", None)
+    if torch.is_tensor(grid_thw) and int(grid_thw.shape[0]) == total:
+        patches_per_sample = [
+            int(grid_thw[i, 0]) * int(grid_thw[i, 1]) * int(grid_thw[i, 2])
+            for i in range(total)
+        ]
+    else:
+        pv = lp_joint.get("pixel_values", None)
+        total_patches = int(pv.shape[0]) if torch.is_tensor(pv) else 0
+        base = total_patches // total if total > 0 else 0
+        patches_per_sample = [base] * total
+
+    _cum_patches = list(itertools.accumulate(patches_per_sample, initial=0))
+
+    def _slice_joint(start: int, end: int) -> dict[str, Any]:
+        sliced: dict[str, Any] = {}
+        patch_start = _cum_patches[start]
+        patch_end   = _cum_patches[end]
+        for k, v in lp_joint.items():
+            if not torch.is_tensor(v):
+                sliced[k] = v
+            elif k == "pixel_values":
+                sliced[k] = v[patch_start:patch_end]
+            elif k == "image_grid_thw":
+                sliced[k] = v[start:end]
+            elif v.shape[0] == total:
+                sliced[k] = v[start:end]
+            else:
+                sliced[k] = v
+        return sliced
+
+    chunks: list[torch.Tensor] = []
+    for start in range(0, total, micro_bsz):
+        end = min(start + micro_bsz, total)
+        chunk_joint = to_device(_slice_joint(start, end), device=device)
+        chunk_ids   = input_ids[start:end].to(device=device)
+        with torch.inference_mode():
+            with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                enabled=(device.type == "cuda")):
+                out = model(joint_inputs=chunk_joint, use_cache=False)
+        chunks.append(compute_token_logprobs(out["logits"].detach(), chunk_ids).cpu())
+        del out, chunk_joint
+    return torch.cat(chunks, dim=0)   # [B*G, L-1]

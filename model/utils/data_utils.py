@@ -120,6 +120,7 @@ def safe_crop(
     gaze_y: float,
     bbox_px: tuple[float, float, float, float],
     p: float = 0.5,
+    aspect: float | None = None,
 ) -> tuple[Image.Image, float, float, tuple[float, float, float, float]]:
     if random.random() >= float(p):
         return scene, gaze_x, gaze_y, bbox_px
@@ -129,25 +130,63 @@ def safe_crop(
     gy = clamp01(gaze_y) * (h - 1)
     x1, y1, x2, y2 = bbox_px
 
-    min_x = max(0.0, min(gx, x1))
-    min_y = max(0.0, min(gy, y1))
-    max_x = min(float(w - 1), max(gx, x2))
-    max_y = min(float(h - 1), max(gy, y2))
+    if aspect is not None:
+        asp = max(float(aspect), 1e-6)
+        zone_x1 = max(0.0, min(gx, x1))
+        zone_y1 = max(0.0, min(gy, y1))
+        zone_x2 = min(float(w), max(gx, x2))
+        zone_y2 = min(float(h), max(gy, y2))
+        zw = max(1.0, zone_x2 - zone_x1)
+        zh = max(1.0, zone_y2 - zone_y1)
+        zone_x1 = max(0.0, zone_x1 - 0.05 * zw)
+        zone_y1 = max(0.0, zone_y1 - 0.05 * zh)
+        zone_x2 = min(float(w), zone_x2 + 0.05 * zw)
+        zone_y2 = min(float(h), zone_y2 + 0.05 * zh)
+        zw = max(1.0, zone_x2 - zone_x1)
+        zh = max(1.0, zone_y2 - zone_y1)
 
-    left = random.uniform(0.0, float(min_x))
-    top = random.uniform(0.0, float(min_y))
-    right = random.uniform(float(max_x), float(w - 1))
-    bottom = random.uniform(float(max_y), float(h - 1))
+        if zw >= zh * asp:
+            min_crop_w = zw
+            min_crop_h = min_crop_w / asp
+        else:
+            min_crop_h = zh
+            min_crop_w = min_crop_h * asp
+        max_crop_w = min(float(w), float(h) * asp)
+        if min_crop_w > max_crop_w or min_crop_h > float(h):
+            return scene, gaze_x, gaze_y, bbox_px
 
-    crop_w = max(2.0, right - left)
-    crop_h = max(2.0, bottom - top)
-    if crop_w < 2.0 or crop_h < 2.0:
-        return scene, gaze_x, gaze_y, bbox_px
+        crop_w = random.uniform(float(min_crop_w), float(max_crop_w))
+        crop_h = crop_w / asp
+        xmin = max(zone_x2 - crop_w, 0.0)
+        xmax = min(zone_x1, max(float(w) - crop_w, 0.0))
+        ymin = max(zone_y2 - crop_h, 0.0)
+        ymax = min(zone_y1, max(float(h) - crop_h, 0.0))
+        left = random.uniform(xmin, xmax) if xmin <= xmax else 0.0
+        top = random.uniform(ymin, ymax) if ymin <= ymax else 0.0
+        l = int(max(0, min(w - 2, round(left))))
+        t = int(max(0, min(h - 2, round(top))))
+        r = int(max(l + 2, min(w, round(left + crop_w))))
+        b = int(max(t + 2, min(h, round(top + crop_h))))
+    else:
+        min_x = max(0.0, min(gx, x1))
+        min_y = max(0.0, min(gy, y1))
+        max_x = min(float(w - 1), max(gx, x2))
+        max_y = min(float(h - 1), max(gy, y2))
 
-    l = int(max(0, min(w - 2, round(left))))
-    t = int(max(0, min(h - 2, round(top))))
-    r = int(max(l + 2, min(w, round(right + 1))))
-    b = int(max(t + 2, min(h, round(bottom + 1))))
+        left = random.uniform(0.0, float(min_x))
+        top = random.uniform(0.0, float(min_y))
+        right = random.uniform(float(max_x), float(w - 1))
+        bottom = random.uniform(float(max_y), float(h - 1))
+
+        crop_w = max(2.0, right - left)
+        crop_h = max(2.0, bottom - top)
+        if crop_w < 2.0 or crop_h < 2.0:
+            return scene, gaze_x, gaze_y, bbox_px
+
+        l = int(max(0, min(w - 2, round(left))))
+        t = int(max(0, min(h - 2, round(top))))
+        r = int(max(l + 2, min(w, round(right + 1))))
+        b = int(max(t + 2, min(h, round(bottom + 1))))
     if r <= l + 1 or b <= t + 1:
         return scene, gaze_x, gaze_y, bbox_px
 
@@ -212,15 +251,45 @@ def apply_train_augmentation(
     gaze_x: float,
     gaze_y: float,
     bbox_px: tuple[float, float, float, float],
+    mode: str = "full",
 ) -> tuple[Image.Image, float, float, tuple[float, float, float, float]]:
     w, h = scene.size
     x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
     bbox_px = (float(x1), float(y1), float(x2), float(y2))
-    # Spatial augmentation (gaze coords updated accordingly)
-    scene, gaze_x, gaze_y, bbox_px = safe_crop(scene, gaze_x, gaze_y, bbox_px, p=0.5)
-    scene, gaze_x, bbox_px = maybe_hflip(scene, gaze_x, bbox_px, p=0.5)
-    # Photometric augmentation (direction-invariant)
-    scene = color_jitter(scene, p=0.5)
+    aug_mode = str(mode or "full").strip().lower()
+    if aug_mode in {"none", "no_aug", "off", "false"}:
+        pass
+    elif aug_mode in {"color", "color_only", "photometric", "safe"}:
+        scene = color_jitter(scene, p=0.5)
+    elif aug_mode in {"no_crop", "flip_color", "hflip_color"}:
+        scene, gaze_x, bbox_px = maybe_hflip(scene, gaze_x, bbox_px, p=0.5)
+        scene = color_jitter(
+            scene,
+            p=0.8,
+            brightness=(0.5, 1.5),
+            contrast=(0.5, 1.5),
+            saturation=(0.0, 1.5),
+        )
+    elif aug_mode in {"full", "crop_flip_color", "default"}:
+        # Match semgaze train augmentation: square safe crop, horizontal flip,
+        # strong color jitter. Resize/normalize are handled by the collator and
+        # Qwen image processor after dataset sampling.
+        scene, gaze_x, gaze_y, bbox_px = safe_crop(
+            scene, gaze_x, gaze_y, bbox_px, p=0.8, aspect=1.0,
+        )
+        scene, gaze_x, bbox_px = maybe_hflip(scene, gaze_x, bbox_px, p=0.5)
+        scene = color_jitter(
+            scene,
+            p=0.8,
+            brightness=(0.5, 1.5),
+            contrast=(0.5, 1.5),
+            saturation=(0.0, 1.5),
+        )
+    else:
+        raise ValueError(
+            f"unsupported train augmentation mode={mode!r}; "
+            "expected one of: full, color_only, no_crop, no_aug"
+        )
     nw, nh = scene.size
     x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=nw, height=nh)
     return scene, clamp01(gaze_x), clamp01(gaze_y), (float(x1), float(y1), float(x2), float(y2))

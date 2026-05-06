@@ -8,7 +8,7 @@ and produces a dist histogram with Q1/Q3 statistics.
 Usage:
     cd QWEN_GazeEstimation
     python eval_train_dist.py \\
-        --config config_rl.yaml \\
+        --config RL.yaml \\
         --checkpoint_dir checkpoints/baseline/best \\
         [--output_dir eval_train_dist_output] \\
         [--max_samples 10000] \\
@@ -475,7 +475,7 @@ def main() -> None:
     cli = argparse.ArgumentParser(
         description="Evaluate SFT checkpoint on GazeFollow train split."
     )
-    cli.add_argument("--config", type=str, default="config_rl.yaml",
+    cli.add_argument("--config", type=str, default="RL.yaml",
                      help="YAML config path (same as used for training)")
     cli.add_argument("--checkpoint_dir", type=str, required=True,
                      help="Path to checkpoint directory (contains lora_adapter/)")

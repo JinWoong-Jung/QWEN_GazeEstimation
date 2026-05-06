@@ -14,7 +14,7 @@ Outputs:
 Usage:
     python RL_data_pipeline.py \\
         --eval_results eval_train_dist_output/train_dist_results.json \\
-        --config config_rl.yaml \\
+        --config RL.yaml \\
         --output_dir rl_data \\
         --n_total 5000 \\
         --ratio_easy 0.15 \\
@@ -315,7 +315,7 @@ def main() -> None:
     cli.add_argument("--eval_results", type=str,
                      default="eval_train_dist_output/train_dist_results.json",
                      help="eval_train_dist.py가 출력한 train_dist_results.json 경로")
-    cli.add_argument("--config", type=str, default="config_rl.yaml",
+    cli.add_argument("--config", type=str, default="RL.yaml",
                      help="학습에 사용한 YAML config 경로")
     cli.add_argument("--output_dir", type=str, default="rl_data",
                      help="출력 디렉토리")

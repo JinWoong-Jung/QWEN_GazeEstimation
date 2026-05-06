@@ -39,8 +39,9 @@ train:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   filter_invalid_object_samples: false
+  train_augmentation_mode: "full"  # "full" | "color_only" | "no_crop" | "no_aug"
   save_last_every_n_epochs: 5
-  use_reasoning: true
+  use_reasoning: false
   reasoning_view_ratio: 0.2   # ratio of total records to use as reasoning_only views
 
 reasoning:
@@ -64,16 +65,19 @@ eval:
   generation_stop_at_object_end: true
   constrained_decoding: true
   constrained_target_order: "point_object"
+  constrained_loc_decoding: "argmax"  # "argmax" | "round_expectation"
 
 prompt:
   visual_prompting: true
   # point_object prompt: used for all training views and evaluation
   prompt_text_direct: |
     The head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}] marks the person.
-    Output the gaze point and object.
-    Use exactly one x-bin and one y-bin token, each in the range <loc_{coord_min:03d}> to <loc_{coord_max:03d}>.
+    Output the gaze point(coordinate tokens) and object(object token).
+    Coordinate tokens follow image coordinates:
+    for x, <loc_{coord_min:03d}> is the left edge and <loc_{coord_max:03d}> is the right edge;
+    for y, <loc_{coord_min:03d}> is the top edge and <loc_{coord_max:03d}> is the bottom edge.
     Use exactly one object token in the range <obj_{obj_min:03d}> to <obj_{obj_max:03d}>.
-    Return exactly this token schema, with no spaces, newlines, or extra text around the markers:
+    Return exactly this schema:
     <|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>
   # reasoning_only prompt: used only for reasoning_only training views
   prompt_text_reasoning: |
@@ -97,13 +101,13 @@ loss:
   loss_object_weight: 1.0
   loss_format_weight: 0.2
   loss_reasoning_weight: 0.1
-  gaussian_point_sigma: 7.0   # Gaussian soft-label CE sigma (bins). 0.0 = hard CE.
+  gaussian_point_sigma: 3.0   # Gaussian soft-label CE sigma (bins). 0.0 = hard CE.
 
 wandb:
   enabled: true
   project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "reasoning_SFT"
+  run_name: "reasoning_SFT_v2"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

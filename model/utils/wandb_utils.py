@@ -96,3 +96,34 @@ def finish_wandb(run: Any) -> None:
         run.finish()
     except Exception:
         pass
+
+
+def test_log_payload(test_metrics: dict[str, float]) -> dict[str, float]:
+    payload = {
+        "test/FormatValid": float(test_metrics.get("FormatValid", 0.0)),
+        "test/Avg_L2": float(test_metrics.get("Avg L2", 0.0)),
+        "test/Min_L2": float(test_metrics.get("Min L2", 0.0)),
+        "test/ObjectAcc": float(test_metrics.get("ObjectAcc", 0.0)),
+        "test/MultiAcc@1": float(test_metrics.get("MultiAcc@1", 0.0)),
+        "test/ExtraTextRate": float(test_metrics.get("ExtraTextRate", 0.0)),
+        "test/num_samples": float(test_metrics.get("num_samples", 0.0)),
+    }
+    if "DistExpected" in test_metrics:
+        payload["test/DistExpected"] = float(test_metrics.get("DistExpected", 0.0))
+        payload["test/Avg_L2_Expected"] = float(test_metrics.get("Avg L2 Expected", test_metrics.get("DistExpected", 0.0)))
+        payload["test/Min_L2_Expected"] = float(test_metrics.get("Min L2 Expected", test_metrics.get("DistExpected", 0.0)))
+    return payload
+
+
+def val_metric_log_payload(val_metrics: dict[str, float]) -> dict[str, float]:
+    payload = {
+        "val/dist": float(val_metrics.get("Dist", 0.0)),
+        "val/object_acc": float(val_metrics.get("ObjectAcc", 0.0)),
+        "val/format_valid": float(val_metrics.get("FormatValid", 0.0)),
+        "val/extra_text_rate": float(val_metrics.get("ExtraTextRate", 0.0)),
+        "val/point_l2_valid_frac": float(val_metrics.get("PointL2ValidFrac", 0.0)),
+    }
+    if "DistExpected" in val_metrics:
+        payload["val/dist_expected"] = float(val_metrics.get("DistExpected", 0.0))
+        payload["val/expected_l2_valid_frac"] = float(val_metrics.get("ExpectedL2ValidFrac", 0.0))
+    return payload

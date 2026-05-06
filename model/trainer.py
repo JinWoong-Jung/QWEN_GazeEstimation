@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import math
 import os
@@ -23,18 +22,29 @@ warnings.filterwarnings(
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import (
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    get_cosine_schedule_with_warmup,
-)
+from transformers import get_cosine_schedule_with_warmup
 
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from .datasets import GazeDataset, GazeTestDataset, MultiViewGazeDataset
 from .model import QwenTextGenerationModel
-from .utils.checkpoint import load_added_token_rows, load_token_rows, load_checkpoint_for_eval, save_checkpoint
-from .utils.common import to_device
+from .utils.checkpoint import (
+    checkpoint_monitor_value,
+    infer_checkpoint_monitor_mode,
+    load_added_token_rows,
+    load_checkpoint_for_eval,
+    load_token_rows,
+    save_checkpoint,
+)
+from .utils.common import env_flag, parse_dtype, resolve_path, set_seed, to_autocast_dtype, to_device
+from .utils.model_init import (
+    _download_model_to_local_dir,  # re-export: scripts/visualize_test_samples.py 등 외부 참조용
+    enable_token_id_gradients,
+    init_base_model,
+    init_processor,
+    peft_config_has_trainable_tokens,
+    resolve_model_source,
+)
 from .utils.config_parser import (
     build_parser,
     load_yaml_config,
@@ -45,7 +55,6 @@ from .utils.data_utils import (
     build_reasoning_index,
     load_label_map,
     load_label_text_map,
-    load_reasoning_text,
     load_records,
     load_test_groups,
     load_test_label_map,
@@ -54,6 +63,7 @@ from .utils.data_utils import (
 from .utils.eval_utils import (
     collect_generation_samples,
     decode_generated,
+    maybe_save_generation_preview,
     print_generation_samples,
     print_test_metrics_table,
     run_test_metrics,
@@ -68,129 +78,18 @@ from .utils.processor_collate import (
     build_train_inputs,
 )
 from .utils.rl_utils import (
-    AdaptiveKLController,
-    FixedKLController,
     build_kl_controller,
     compute_policy_loss_per_token,
     compute_token_logprobs,
-    compute_token_logprobs_sum,
     compute_total_reward,
     group_normalize_advantages,
+    infer_logprobs_chunked,
 )
-from .utils.wandb_utils import finish_wandb, init_wandb
+from .utils.wandb_utils import finish_wandb, init_wandb, test_log_payload, val_metric_log_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-
-def resolve_path(path: str) -> Path:
-    p = Path(path)
-    return p if p.is_absolute() else ROOT / p
-
-
-def _download_model_to_local_dir(repo_id: str, local_dir: Path) -> str:
-    """Download a Hugging Face model repo into the requested local directory."""
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise ImportError(
-            "huggingface_hub is required to download missing model paths. "
-            "Install it or place the model files under the configured model_path."
-        ) from exc
-
-    local_dir = Path(local_dir)
-    local_dir.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=str(repo_id),
-        local_dir=str(local_dir),
-    )
-    return str(local_dir)
-
-
-def resolve_model_source(path: str, *, default_namespace: str = "Qwen") -> str:
-    raw = str(path).strip()
-    if not raw:
-        raise ValueError("Model path must not be empty.")
-
-    local_path = resolve_path(raw)
-    if local_path.exists():
-        return str(local_path)
-
-    if raw.startswith("/"):
-        model_name = Path(raw).name
-        inferred_repo_id = f"{default_namespace}/{model_name}"
-        print(
-            f"[INFO] local model path not found: {raw}. "
-            f"Downloading Hugging Face repo {inferred_repo_id} to {local_path}"
-        )
-        return _download_model_to_local_dir(inferred_repo_id, local_path)
-
-    path_like_prefixes = ("./", "../", "model/", "models/", "checkpoints/", "data/")
-    if raw.startswith(path_like_prefixes):
-        model_name = Path(raw).name
-        inferred_repo_id = f"{default_namespace}/{model_name}"
-        print(
-            f"[INFO] local model path not found: {local_path}. "
-            f"Downloading Hugging Face repo {inferred_repo_id} to {local_path}"
-        )
-        return _download_model_to_local_dir(inferred_repo_id, local_path)
-
-    if raw.count("/") == 1:
-        model_name = raw.split("/", 1)[1]
-        local_model_dir = ROOT / "model" / model_name
-        if local_model_dir.exists():
-            return str(local_model_dir)
-        print(f"[INFO] downloading Hugging Face repo {raw} to {local_model_dir}")
-        return _download_model_to_local_dir(raw, local_model_dir)
-
-    model_name = Path(raw).name
-    inferred_repo_id = f"{default_namespace}/{model_name}"
-    local_model_dir = ROOT / "model" / model_name
-    if local_model_dir.exists():
-        return str(local_model_dir)
-    print(
-        f"[INFO] treating missing local model path as Hugging Face repo id "
-        f"{inferred_repo_id}; downloading to {local_model_dir}"
-    )
-    return _download_model_to_local_dir(inferred_repo_id, local_model_dir)
-
-
-def set_seed(seed: int) -> None:
-    os.environ["PYTHONHASHSEED"] = str(int(seed))
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    if os.environ.get("QWEN_DETERMINISTIC", "").lower() in {"1", "true"}:
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        if hasattr(torch.backends, "cudnn"):
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-        if hasattr(torch, "use_deterministic_algorithms"):
-            torch.use_deterministic_algorithms(True, warn_only=True)
-    else:
-        if hasattr(torch.backends, "cudnn"):
-            torch.backends.cudnn.benchmark = True
-
-
-def parse_dtype(dtype: str) -> torch.dtype | str:
-    v = str(dtype).strip().lower()
-    if v in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    if v in {"fp16", "float16"}:
-        return torch.float16
-    if v in {"fp32", "float32"}:
-        return torch.float32
-    return "auto"
-
-
-def to_autocast_dtype(dtype: torch.dtype | str) -> torch.dtype:
-    if dtype == torch.float16:
-        return torch.float16
-    if dtype == torch.float32:
-        return torch.float32
-    return torch.bfloat16
 
 
 def build_id2label(vocab2id: dict[str, int]) -> dict[int, str]:
@@ -210,11 +109,6 @@ def count_valid_targets(records: list[Any]) -> int:
         if (label_id >= 0) or bool(txt):
             n += 1
     return n
-
-
-def env_flag(name: str) -> bool:
-    v = str(os.environ.get(name, "")).strip().lower()
-    return v in {"1", "true", "yes", "y", "on"}
 
 
 def log_target_example(tag: str, dataset: Any) -> None:
@@ -259,292 +153,6 @@ def infer_num_classes(vocab2id: dict[str, int], vocab2id_path: Path) -> int:
             f"head={first} tail={last}"
         )
     return n
-
-
-def init_processor(
-    *,
-    model_path: str,
-    checkpoint_dir: Path | None,
-    min_pixels: int | None = None,
-    max_pixels: int | None = None,
-) -> Any:
-    processor_path: str | Path = model_path
-    if checkpoint_dir is not None and (checkpoint_dir / "processor").exists():
-        processor_path = checkpoint_dir / "processor"
-    kwargs: dict[str, Any] = {"trust_remote_code": True}
-    if min_pixels is not None:
-        kwargs["min_pixels"] = int(min_pixels)
-    if max_pixels is not None:
-        kwargs["max_pixels"] = int(max_pixels)
-    return AutoProcessor.from_pretrained(str(processor_path), **kwargs)
-
-
-def init_base_model(
-    *,
-    model_path: str,
-    model_kwargs: dict[str, Any],
-) -> Any:
-    return AutoModelForImageTextToText.from_pretrained(str(model_path), **model_kwargs)
-
-
-def enable_token_id_gradients(peft_model: Any, token_ids: list[int]) -> None:
-    """Unfreeze exactly the embedding rows used by gaze special tokens.
-
-    Safer than unfreezing [base_vocab_size:new_vocab_size]: in Qwen, the
-    tokenizer length can be smaller than the model embedding matrix size, so
-    newly registered special tokens may land in existing reserved rows below
-    base_vocab_size. A range-based hook would silently leave those frozen.
-
-    Uses index_select + index_copy instead of a range zero-out so only the
-    exact gaze token rows receive gradient updates.
-    """
-    ids = sorted({int(x) for x in token_ids if int(x) >= 0})
-    if not ids:
-        raise ValueError("No gaze token ids provided to enable_token_id_gradients.")
-
-    def _install_row_mask_hook(weight: torch.nn.Parameter, ids_: list[int]) -> int:
-        n_rows = int(weight.shape[0])
-        valid_ids = sorted({i for i in ids_ if 0 <= i < n_rows})
-        if not valid_ids:
-            return 0
-        weight.requires_grad_(True)
-        ids_cpu = torch.tensor(valid_ids, dtype=torch.long)
-
-        def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
-            ids_dev = ids_cpu.to(device=grad.device)
-            out = torch.zeros_like(grad)
-            out.index_copy_(0, ids_dev, grad.index_select(0, ids_dev))
-            return out
-
-        weight.register_hook(_mask_grad)
-        return len(valid_ids)
-
-    input_emb = peft_model.get_input_embeddings()
-    n_input = _install_row_mask_hook(input_emb.weight, ids)
-
-    output_emb = (
-        peft_model.get_output_embeddings()
-        if hasattr(peft_model, "get_output_embeddings")
-        else None
-    )
-    n_output = 0
-    if output_emb is not None and hasattr(output_emb, "weight"):
-        tied = (
-            output_emb.weight is input_emb.weight
-            or output_emb.weight.data_ptr() == input_emb.weight.data_ptr()
-        )
-        if not tied:
-            n_output = _install_row_mask_hook(output_emb.weight, ids)
-
-    print(
-        f"[INFO] trainable gaze token rows installed: input={n_input}, output={n_output}"
-    )
-
-
-def peft_config_has_trainable_tokens(peft_model: Any) -> bool:
-    cfgs = getattr(peft_model, "peft_config", {}) or {}
-    for cfg in cfgs.values():
-        indices = getattr(cfg, "trainable_token_indices", None)
-        if isinstance(indices, dict):
-            if any(len(v) > 0 for v in indices.values()):
-                return True
-        elif indices:
-            return True
-    return False
-
-
-
-def test_log_payload(test_metrics: dict[str, float]) -> dict[str, float]:
-    return {
-        "test/FormatValid": float(test_metrics.get("FormatValid", 0.0)),
-        "test/Avg_L2": float(test_metrics.get("Avg L2", 0.0)),
-        "test/Min_L2": float(test_metrics.get("Min L2", 0.0)),
-        "test/ObjectAcc": float(test_metrics.get("ObjectAcc", 0.0)),
-        "test/MultiAcc@1": float(test_metrics.get("MultiAcc@1", 0.0)),
-        "test/ExtraTextRate": float(test_metrics.get("ExtraTextRate", 0.0)),
-        "test/num_samples": float(test_metrics.get("num_samples", 0.0)),
-    }
-
-
-def val_metric_log_payload(val_metrics: dict[str, float]) -> dict[str, float]:
-    return {
-        "val/dist": float(val_metrics.get("Dist", 0.0)),
-        "val/object_acc": float(val_metrics.get("ObjectAcc", 0.0)),
-        "val/format_valid": float(val_metrics.get("FormatValid", 0.0)),
-        "val/extra_text_rate": float(val_metrics.get("ExtraTextRate", 0.0)),
-        "val/point_l2_valid_frac": float(val_metrics.get("PointL2ValidFrac", 0.0)),
-    }
-
-
-def maybe_save_generation_preview(
-    *,
-    args: argparse.Namespace,
-    out_dir: Path,
-    model: torch.nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-    processor: Any,
-    num_classes: int,
-    coord_bins: int,
-    preview_attr: str = "preview_test_samples",
-    filename: str = "test_generation_preview.json",
-    desc: str = "Test preview",
-    log_prefix: str = "TEST",
-) -> None:
-    preview_n = max(0, int(getattr(args, preview_attr, 0)))
-    if preview_n <= 0:
-        return
-
-    preview_samples = collect_generation_samples(
-        model=model,
-        loader=loader,
-        device=device,
-        amp_dtype=amp_dtype,
-        processor=processor,
-        num_classes=int(num_classes),
-        coord_bins=int(coord_bins),
-        show_tqdm=bool(args.show_tqdm),
-        desc=desc,
-        max_new_tokens=int(args.generation_max_new_tokens),
-        num_beams=int(getattr(args, "generation_num_beams", 1)),
-        repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
-        no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
-        max_samples=preview_n,
-        stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
-        constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-        constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
-        constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
-        max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
-    )
-    preview_path = out_dir / filename
-    preview_path.write_text(
-        json.dumps(preview_samples, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print(f"[{log_prefix}] saved generation preview: {preview_path} (samples={len(preview_samples)})")
-    print_generation_samples(preview_samples)
-
-
-def infer_checkpoint_monitor_mode(monitor: str, mode: str) -> str:
-    mode_norm = str(mode or "auto").strip().lower()
-    if mode_norm in {"min", "max"}:
-        return mode_norm
-    if mode_norm != "auto":
-        raise ValueError(f"checkpoint_monitor_mode must be one of auto|min|max, got: {mode}")
-    monitor_norm = str(monitor or "").strip().lower()
-    return "min" if (
-        "loss" in monitor_norm or "dist" in monitor_norm
-        or "l2" in monitor_norm or "extra" in monitor_norm
-    ) else "max"
-
-
-def checkpoint_monitor_value(
-    monitor: str,
-    *,
-    val_gen_metrics: dict[str, float] | None,
-) -> float | None:
-    monitor_norm = str(monitor or "val_dist").strip().lower().replace("/", "_").replace("-", "_")
-    if val_gen_metrics is None:
-        return None
-    key_map: dict[str, str] = {
-        "val_dist": "Dist",
-        "dist": "Dist",
-        "val_object_acc": "ObjectAcc",
-        "object_acc": "ObjectAcc",
-        "val_format_valid": "FormatValid",
-        "format_valid": "FormatValid",
-        "val_extra_text_rate": "ExtraTextRate",
-        "extra_text_rate": "ExtraTextRate",
-    }
-    metric_key = key_map.get(monitor_norm)
-    if metric_key is None:
-        raise ValueError(
-            "Unsupported checkpoint_monitor. Use one of: "
-            "val_dist, val_object_acc, val_format_valid."
-        )
-    return float(val_gen_metrics.get(metric_key, 0.0))
-
-
-def _infer_logprobs_chunked(
-    model: torch.nn.Module,
-    lp_joint: dict[str, Any],
-    input_ids: torch.Tensor,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-    micro_bsz: int,
-) -> torch.Tensor:
-    """Inference-mode per-token log-probs, processed in micro-batches.
-
-    Splits the B*G batch into chunks of `micro_bsz` so that only one chunk's
-    activations + logits live on GPU at a time.  Returns [B*G, L-1] on CPU.
-
-    pixel_values in Qwen-VL is a flat [total_patches, C, h, w] tensor — not
-    [B, ...].  We use image_grid_thw (num_images, 3) to slice it per sample.
-    When image_grid_thw is unavailable we fall back to equal-size splitting.
-    """
-    total = int(input_ids.shape[0])
-    if micro_bsz <= 0 or micro_bsz >= total:
-        # No chunking: process full batch at once
-        joint_dev = to_device(lp_joint, device=device)
-        ids_dev = input_ids.to(device=device)
-        with torch.inference_mode():
-            with torch.autocast(device_type=device.type, dtype=amp_dtype,
-                                enabled=(device.type == "cuda")):
-                out = model(joint_inputs=joint_dev, use_cache=False)
-        lp = compute_token_logprobs(out["logits"].detach(), ids_dev).cpu()
-        del out
-        return lp
-
-    # --- Build per-sample patch counts from image_grid_thw ---
-    grid_thw = lp_joint.get("image_grid_thw", None)
-    if torch.is_tensor(grid_thw) and int(grid_thw.shape[0]) == total:
-        # Each row is (T, H, W); patches_i = T * H * W
-        patches_per_sample = [
-            int(grid_thw[i, 0]) * int(grid_thw[i, 1]) * int(grid_thw[i, 2])
-            for i in range(total)
-        ]
-    else:
-        # Fallback: assume equal patch counts
-        pv = lp_joint.get("pixel_values", None)
-        total_patches = int(pv.shape[0]) if torch.is_tensor(pv) else 0
-        base = total_patches // total if total > 0 else 0
-        patches_per_sample = [base] * total
-
-    # Precompute cumulative patch offsets once to avoid O(N) re-summation per chunk.
-    _cum_patches = list(itertools.accumulate(patches_per_sample, initial=0))
-
-    # --- Slice helper: extract keys for sample indices [start, end) ---
-    def _slice_joint(start: int, end: int) -> dict[str, Any]:
-        sliced: dict[str, Any] = {}
-        patch_start = _cum_patches[start]
-        patch_end   = _cum_patches[end]
-        for k, v in lp_joint.items():
-            if not torch.is_tensor(v):
-                sliced[k] = v
-            elif k == "pixel_values":
-                sliced[k] = v[patch_start:patch_end]
-            elif k == "image_grid_thw":
-                sliced[k] = v[start:end]
-            elif v.shape[0] == total:
-                sliced[k] = v[start:end]
-            else:
-                sliced[k] = v
-        return sliced
-
-    # --- Chunked forward ---
-    chunks: list[torch.Tensor] = []
-    for start in range(0, total, micro_bsz):
-        end = min(start + micro_bsz, total)
-        chunk_joint = to_device(_slice_joint(start, end), device=device)
-        chunk_ids   = input_ids[start:end].to(device=device)
-        with torch.inference_mode():
-            with torch.autocast(device_type=device.type, dtype=amp_dtype,
-                                enabled=(device.type == "cuda")):
-                out = model(joint_inputs=chunk_joint, use_cache=False)
-        chunks.append(compute_token_logprobs(out["logits"].detach(), chunk_ids).cpu())
-        del out, chunk_joint
-    return torch.cat(chunks, dim=0)   # [B*G, L-1]
 
 
 def _run_rl_training(
@@ -861,7 +469,7 @@ def _run_rl_training(
             # -------------------------------------------------------
             # 6. Ref log-probs — per-token [B*G, L-1] (Rex-Omni style)
             # -------------------------------------------------------
-            ref_log_probs = _infer_logprobs_chunked(
+            ref_log_probs = infer_logprobs_chunked(
                 model=ref_model,
                 lp_joint=lp_joint,
                 input_ids=lp_input_ids,
@@ -875,7 +483,7 @@ def _run_rl_training(
             #    (Rex-Omni: old_lp is computed once, then reused across n_ppo_epochs)
             # -------------------------------------------------------
             policy_model.eval()
-            old_log_probs = _infer_logprobs_chunked(
+            old_log_probs = infer_logprobs_chunked(
                 model=policy_model,
                 lp_joint=lp_joint,
                 input_ids=lp_input_ids,
@@ -1008,6 +616,7 @@ def _run_rl_training(
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
                 include_l2_breakdown=False,
             )
@@ -1031,6 +640,8 @@ def _run_rl_training(
                 f" val_fmt={float(val_gen_metrics.get('FormatValid', 0.0)):.4f}"
                 f" val_obj={float(val_gen_metrics.get('ObjectAcc', 0.0)):.4f}"
             )
+            if "DistExpected" in val_gen_metrics:
+                epoch_msg += f" val_dist_expected={float(val_gen_metrics.get('DistExpected', 0.0)):.6f}"
         print(epoch_msg)
 
         if wandb_run is not None:
@@ -1321,6 +932,7 @@ def main() -> None:
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
             )
             print_test_metrics_table(test_metrics)
@@ -1418,6 +1030,13 @@ def main() -> None:
     )
 
     image_cache_size = max(0, int(getattr(args, "image_cache_size", 0)))
+    train_augmentation_mode = str(getattr(args, "train_augmentation_mode", "full") or "full").strip().lower()
+    _aug_modes = {"full", "crop_flip_color", "default", "color", "color_only", "photometric", "safe", "no_crop", "flip_color", "hflip_color", "none", "no_aug", "off", "false"}
+    if train_augmentation_mode not in _aug_modes:
+        raise ValueError(
+            f"unsupported train_augmentation_mode={train_augmentation_mode!r}; "
+            "expected one of: full, color_only, no_crop, no_aug"
+        )
 
     reasoning_index = None
     if getattr(args, "use_reasoning", False):
@@ -1428,6 +1047,40 @@ def main() -> None:
                 f"[INFO] Loaded reasoning index: {len(reasoning_index)} entries "
                 f"({len(reasoning_index)}/{max(1, len(train_records))} train samples)"
             )
+            matched_reasoning = 0
+            reasoning_hits: list[str] = []
+            reasoning_misses: list[str] = []
+            for rec in train_records:
+                folder = Path(rec.image_rel).parent.name
+                stem = Path(rec.image_rel).stem
+                key = f"{folder}/{stem}_{int(rec.sample_id)}"
+                rpath = reasoning_index.get(key)
+                if rpath is not None:
+                    matched_reasoning += 1
+                    if len(reasoning_hits) < 3:
+                        try:
+                            rel_rpath = rpath.relative_to(reasoning_dir)
+                        except ValueError:
+                            rel_rpath = rpath
+                        reasoning_hits.append(f"{key} -> {rel_rpath}")
+                elif len(reasoning_misses) < 3:
+                    reasoning_misses.append(key)
+            missing_reasoning = len(train_records) - matched_reasoning
+            print(
+                "[INFO] Reasoning index match: "
+                f"matched={matched_reasoning}/{len(train_records)} "
+                f"missing={missing_reasoning} "
+                f"hit_ratio={matched_reasoning / max(1, len(train_records)):.6f}"
+            )
+            if reasoning_hits:
+                print("[INFO] Reasoning match examples: " + " ; ".join(reasoning_hits))
+            if reasoning_misses:
+                print("[WARN] Reasoning missing examples: " + " ; ".join(reasoning_misses))
+            if matched_reasoning == 0 and len(train_records) > 0:
+                print(
+                    "[WARN] No train records matched the reasoning index. "
+                    "Check that reasoning files are stored as folder/stem_sampleid.txt."
+                )
         else:
             print(f"[WARN] train_reasoning_dir not found: {reasoning_dir}")
 
@@ -1453,6 +1106,7 @@ def main() -> None:
             max_reasoning_words=_max_reasoning_words,
             max_reasoning_chars=_max_reasoning_chars,
             reasoning_ratio=_reasoning_view_ratio,
+            train_augmentation_mode=train_augmentation_mode,
             seed=int(getattr(args, "seed", 42)),
         )
     else:
@@ -1469,6 +1123,7 @@ def main() -> None:
             image_cache_size=image_cache_size,
             filter_invalid_object_samples=filter_invalid,
             coord_bins=coord_bins,
+            train_augmentation_mode=train_augmentation_mode,
             target_order="point_object",
         )
     val_ds = GazeDataset(
@@ -1494,6 +1149,7 @@ def main() -> None:
     ) if len(train_ds) <= 1000 else -1
     print(
         f"[INFO] structured pipeline: filter_invalid_object_samples={filter_invalid} "
+        f"train_augmentation_mode={train_augmentation_mode} "
         f"train_valid_structured={n_train_valid if n_train_valid >= 0 else 'not_counted'}"
     )
     log_target_example("train", train_ds)
@@ -1714,6 +1370,7 @@ def main() -> None:
                     constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                     constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                     constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                    constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                     max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
                 )
                 print_test_metrics_table(test_metrics)
@@ -1951,6 +1608,7 @@ def main() -> None:
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
                 include_l2_breakdown=False,
             )
@@ -1978,6 +1636,8 @@ def main() -> None:
                 f" val_format_valid={float(val_gen_metrics.get('FormatValid', 0.0)):.6f}"
                 f" val_l2_cov={float(val_gen_metrics.get('PointL2ValidFrac', 0.0)):.3f}"
             )
+            if "DistExpected" in val_gen_metrics:
+                epoch_msg += f" val_dist_expected={float(val_gen_metrics.get('DistExpected', 0.0)):.6f}"
         print(epoch_msg)
 
         if wandb_run is not None:
@@ -2049,15 +1709,19 @@ def main() -> None:
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
                 include_l2_breakdown=False,
             )
         if isinstance(val_gen_metrics, dict):
-            print(
+            msg = (
                 f"[EVAL] val_dist={float(val_gen_metrics.get('Dist', 0.0)):.6f} "
                 f"val_object_acc={float(val_gen_metrics.get('ObjectAcc', 0.0)):.6f} "
                 f"val_format_valid={float(val_gen_metrics.get('FormatValid', 0.0)):.6f}"
             )
+            if "DistExpected" in val_gen_metrics:
+                msg += f" val_dist_expected={float(val_gen_metrics.get('DistExpected', 0.0)):.6f}"
+            print(msg)
         else:
             print("[EVAL] no validation generation metrics were produced.")
         if wandb_run is not None:
@@ -2141,6 +1805,7 @@ def main() -> None:
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
                 constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+                constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
             )
             print_test_metrics_table(test_metrics)

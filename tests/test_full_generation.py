@@ -86,9 +86,9 @@ class TestBuildPrompt(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         cfg = "\n".join(
             (root / name).read_text(encoding="utf-8")
-            for name in ("sft.yaml", "config_rl.yaml")
+            for name in ("sft.yaml", "RL.yaml")
         )
-        # point_object schema (sft.yaml: prompt_text_direct; config_rl.yaml: prompt_text)
+        # point_object schema (sft.yaml: prompt_text_direct; RL.yaml: prompt_text)
         self.assertIn("<|gaze_point|><loc_NNN><loc_MMM><|gaze_object|><obj_KKK>", cfg)
         # reasoning_only schema (sft.yaml: prompt_text_reasoning)
         self.assertIn("<|gaze_reasoning|><your reasoning here>", cfg)

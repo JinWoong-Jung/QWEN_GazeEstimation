@@ -157,6 +157,8 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
                    default=str(default_value(d, "constrained_target_order", "point_object")))
     p.add_argument("--constrained_temperature", type=float,
                    default=float(default_value(d, "constrained_temperature", 1.0)))
+    p.add_argument("--constrained_loc_decoding", type=str,
+                   default=str(default_value(d, "constrained_loc_decoding", "argmax")))
     p.add_argument("--max_reasoning_tokens", type=int,
                    default=int(default_value(d, "max_reasoning_tokens", 80)))
 
@@ -175,6 +177,8 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_true")
     p.add_argument("--no_filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_false")
     p.set_defaults(filter_invalid_object_samples=bool(default_value(d, "filter_invalid_object_samples", True)))
+    p.add_argument("--train_augmentation_mode", type=str,
+                   default=str(default_value(d, "train_augmentation_mode", "full")))
     p.add_argument("--train_reasoning_dir", type=str, default=str(default_value(d, "train_reasoning_dir", "")))
     p.add_argument("--use_reasoning", dest="use_reasoning", action="store_true")
     p.add_argument("--no_use_reasoning", dest="use_reasoning", action="store_false")

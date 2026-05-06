@@ -156,6 +156,7 @@ class GazeDataset(Dataset):
         image_cache_size: int = 0,
         filter_invalid_object_samples: bool = True,
         coord_bins: int = 1000,
+        train_augmentation_mode: str = "full",
         reasoning_index: dict[str, Any] | None = None,
         force_reasoning_format: bool = False,
         target_order: str = "reasoning_object_point",
@@ -174,6 +175,7 @@ class GazeDataset(Dataset):
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
         self.coord_bins = int(coord_bins)
+        self.train_augmentation_mode = str(train_augmentation_mode or "full")
         self.visual_prompting = bool(visual_prompting)
         self.reasoning_index: dict[str, Any] | None = reasoning_index
         self.force_reasoning_format = bool(force_reasoning_format)
@@ -250,6 +252,7 @@ class GazeDataset(Dataset):
                 gaze_x=gaze_x,
                 gaze_y=gaze_y,
                 bbox_px=bbox_px,
+                mode=self.train_augmentation_mode,
             )
 
         w, h = scene.size
@@ -313,7 +316,7 @@ class GazeDataset(Dataset):
 class MultiViewGazeDataset(Dataset):
     """Two-view dataset: point_object views for all records + reasoning_only views for a ratio.
 
-    Direct views use full augmentation (crop, hflip, color jitter) and point_object target order.
+    Direct views use the configured train augmentation and point_object target order.
     Reasoning views use safe augmentation (color jitter only) and reasoning_only target order.
     Reasoning views are a random sample of records_with_reasoning_files * reasoning_ratio.
     """
@@ -336,6 +339,7 @@ class MultiViewGazeDataset(Dataset):
         max_reasoning_words: int = 60,
         max_reasoning_chars: int = 500,
         reasoning_ratio: float = 0.2,
+        train_augmentation_mode: str = "full",
         seed: int = 42,
     ) -> None:
         from pathlib import Path as _Path
@@ -348,6 +352,7 @@ class MultiViewGazeDataset(Dataset):
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
         self.coord_bins = int(coord_bins)
+        self.train_augmentation_mode = str(train_augmentation_mode or "full")
         self.visual_prompting = bool(visual_prompting)
         self.reasoning_index: dict[str, Any] | None = reasoning_index
         self.max_reasoning_words = int(max_reasoning_words)
@@ -485,9 +490,13 @@ class MultiViewGazeDataset(Dataset):
                 target_order = "point_object"
                 prompt_text = self.prompt_text_direct
         else:
-            # Direct view: full augmentation
+            # Direct view: configured train augmentation
             scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
-                scene=scene, gaze_x=gaze_x, gaze_y=gaze_y, bbox_px=bbox_px,
+                scene=scene,
+                gaze_x=gaze_x,
+                gaze_y=gaze_y,
+                bbox_px=bbox_px,
+                mode=self.train_augmentation_mode,
             )
             reasoning_text = None
             target_order = "point_object"

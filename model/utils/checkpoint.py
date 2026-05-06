@@ -278,3 +278,43 @@ def load_checkpoint_for_eval(
 
     # Return True only if the adapter — the primary component — was loaded successfully.
     return adapter_loaded
+
+
+def infer_checkpoint_monitor_mode(monitor: str, mode: str) -> str:
+    mode_norm = str(mode or "auto").strip().lower()
+    if mode_norm in {"min", "max"}:
+        return mode_norm
+    if mode_norm != "auto":
+        raise ValueError(f"checkpoint_monitor_mode must be one of auto|min|max, got: {mode}")
+    monitor_norm = str(monitor or "").strip().lower()
+    return "min" if (
+        "loss" in monitor_norm or "dist" in monitor_norm
+        or "l2" in monitor_norm or "extra" in monitor_norm
+    ) else "max"
+
+
+def checkpoint_monitor_value(
+    monitor: str,
+    *,
+    val_gen_metrics: dict[str, float] | None,
+) -> float | None:
+    monitor_norm = str(monitor or "val_dist").strip().lower().replace("/", "_").replace("-", "_")
+    if val_gen_metrics is None:
+        return None
+    key_map: dict[str, str] = {
+        "val_dist": "Dist",
+        "dist": "Dist",
+        "val_object_acc": "ObjectAcc",
+        "object_acc": "ObjectAcc",
+        "val_format_valid": "FormatValid",
+        "format_valid": "FormatValid",
+        "val_extra_text_rate": "ExtraTextRate",
+        "extra_text_rate": "ExtraTextRate",
+    }
+    metric_key = key_map.get(monitor_norm)
+    if metric_key is None:
+        raise ValueError(
+            "Unsupported checkpoint_monitor. Use one of: "
+            "val_dist, val_object_acc, val_format_valid."
+        )
+    return float(val_gen_metrics.get(metric_key, 0.0))

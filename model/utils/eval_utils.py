@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
+import json
 import math
 import re
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -310,6 +313,7 @@ def _select_next_from_allowed(
     allowed_token_ids: list[int],
     amp_dtype: torch.dtype,
     temperature: float = 1.0,
+    selection_strategy: str = "argmax",
 ) -> tuple[torch.LongTensor, torch.Tensor]:
     device = joint["input_ids"].device
     allowed = torch.tensor(allowed_token_ids, device=device, dtype=torch.long)
@@ -323,9 +327,41 @@ def _select_next_from_allowed(
     allowed_logits = logits.index_select(dim=-1, index=allowed)  # [B, K]
     temp = max(float(temperature), 1e-6)
     allowed_probs = torch.softmax(allowed_logits / temp, dim=-1)
-    selected_idx = torch.argmax(allowed_probs, dim=-1)  # [B]
+    strategy = str(selection_strategy or "argmax").strip().lower()
+    if strategy in {"argmax", "max"}:
+        selected_idx = torch.argmax(allowed_probs, dim=-1)  # [B]
+    elif strategy in {"round_expectation", "expected_round", "expectation_round"}:
+        bins = torch.arange(int(allowed_probs.shape[-1]), device=device, dtype=torch.float32)
+        expected_idx = (allowed_probs.to(dtype=torch.float32) * bins).sum(dim=-1)
+        selected_idx = expected_idx.round().to(dtype=torch.long).clamp_(0, int(allowed_probs.shape[-1]) - 1)
+    else:
+        raise ValueError(
+            f"unsupported constrained loc selection_strategy={selection_strategy!r}; "
+            "expected 'argmax' or 'round_expectation'"
+        )
     selected_token_ids = allowed.index_select(dim=0, index=selected_idx)  # [B]
     return selected_token_ids, allowed_probs
+
+
+def _expected_xy_from_loc_probs(
+    x_probs: torch.Tensor,
+    y_probs: torch.Tensor,
+    coord_bins: int,
+) -> list[tuple[float, float]]:
+    if x_probs.dim() != 2 or y_probs.dim() != 2:
+        raise ValueError(
+            f"expected [B, C] loc probabilities, got x={tuple(x_probs.shape)} y={tuple(y_probs.shape)}"
+        )
+    if tuple(x_probs.shape) != tuple(y_probs.shape):
+        raise ValueError(
+            f"x/y loc probability shapes must match, got x={tuple(x_probs.shape)} y={tuple(y_probs.shape)}"
+        )
+    denom = float(max(1, int(coord_bins) - 1))
+    bins = torch.arange(int(x_probs.shape[-1]), device=x_probs.device, dtype=torch.float32)
+    x_exp = (x_probs.to(dtype=torch.float32) * bins).sum(dim=-1) / denom
+    y_exp = (y_probs.to(dtype=torch.float32) * bins).sum(dim=-1) / denom
+    xy = torch.stack([x_exp, y_exp], dim=-1).detach().cpu()
+    return [(float(xy[i, 0].item()), float(xy[i, 1].item())) for i in range(int(xy.shape[0]))]
 
 
 def constrained_generate_structured(
@@ -338,7 +374,9 @@ def constrained_generate_structured(
     target_order: str = "point_object",
     temperature: float = 1.0,
     max_reasoning_tokens: int = 80,
-) -> list[str]:
+    return_expected_xy: bool = False,
+    loc_selection_strategy: str = "argmax",
+) -> list[str] | tuple[list[str], list[tuple[float, float] | None]]:
     """Slot-level constrained decoding using Qwen LM logits directly.
 
     Supported target_order values:
@@ -348,7 +386,7 @@ def constrained_generate_structured(
     """
     order = str(target_order or "point_object").strip()
     if order in {"reasoning_point_object", "reasoning_object_point"}:
-        return constrained_generate_hybrid(
+        texts = constrained_generate_hybrid(
             model=model,
             joint=joint,
             processor=processor,
@@ -359,6 +397,9 @@ def constrained_generate_structured(
             temperature=float(temperature),
             max_reasoning_tokens=int(max_reasoning_tokens),
         )
+        if bool(return_expected_xy):
+            return texts, [None for _ in texts]
+        return texts
     if order not in {"point_object", "object_point"}:
         raise ValueError(
             f"constrained_generate_structured: unsupported target_order={order!r}. "
@@ -381,17 +422,29 @@ def constrained_generate_structured(
 
     cur = dict(joint)
     generated_steps: list[torch.LongTensor] = []
+    x_probs: torch.Tensor | None = None
+    y_probs: torch.Tensor | None = None
 
     if order == "point_object":
         # <|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>
         cur = _append_token_to_joint(cur, point_marker)
         generated_steps.append(point_marker)
 
-        x_tok, _ = _select_next_from_allowed(model, cur, loc_ids, amp_dtype=amp_dtype, temperature=temperature)
+        x_tok, x_probs = _select_next_from_allowed(
+            model, cur, loc_ids,
+            amp_dtype=amp_dtype,
+            temperature=temperature,
+            selection_strategy=loc_selection_strategy,
+        )
         cur = _append_token_to_joint(cur, x_tok)
         generated_steps.append(x_tok)
 
-        y_tok, _ = _select_next_from_allowed(model, cur, loc_ids, amp_dtype=amp_dtype, temperature=temperature)
+        y_tok, y_probs = _select_next_from_allowed(
+            model, cur, loc_ids,
+            amp_dtype=amp_dtype,
+            temperature=temperature,
+            selection_strategy=loc_selection_strategy,
+        )
         cur = _append_token_to_joint(cur, y_tok)
         generated_steps.append(y_tok)
 
@@ -414,16 +467,31 @@ def constrained_generate_structured(
         cur = _append_token_to_joint(cur, point_marker)
         generated_steps.append(point_marker)
 
-        x_tok, _ = _select_next_from_allowed(model, cur, loc_ids, amp_dtype=amp_dtype, temperature=temperature)
+        x_tok, x_probs = _select_next_from_allowed(
+            model, cur, loc_ids,
+            amp_dtype=amp_dtype,
+            temperature=temperature,
+            selection_strategy=loc_selection_strategy,
+        )
         cur = _append_token_to_joint(cur, x_tok)
         generated_steps.append(x_tok)
 
-        y_tok, _ = _select_next_from_allowed(model, cur, loc_ids, amp_dtype=amp_dtype, temperature=temperature)
+        y_tok, y_probs = _select_next_from_allowed(
+            model, cur, loc_ids,
+            amp_dtype=amp_dtype,
+            temperature=temperature,
+            selection_strategy=loc_selection_strategy,
+        )
         generated_steps.append(y_tok)
 
     gen_ids = torch.stack(generated_steps, dim=1)  # [B, T]
     texts = tokenizer.batch_decode(gen_ids.detach().cpu(), skip_special_tokens=False)
-    return [str(t).strip() for t in texts]
+    stripped = [str(t).strip() for t in texts]
+    if bool(return_expected_xy):
+        if x_probs is None or y_probs is None:
+            return stripped, [None for _ in stripped]
+        return stripped, _expected_xy_from_loc_probs(x_probs, y_probs, coord_bins=int(coord_bins))
+    return stripped
 
 
 def decode_generated(
@@ -581,6 +649,7 @@ def run_test_metrics(
     constrained_decoding: bool = False,
     constrained_target_order: str = "point_object",
     constrained_temperature: float = 1.0,
+    constrained_loc_decoding: str = "argmax",
     max_reasoning_tokens: int = 80,
     include_l2_breakdown: bool = True,
 ) -> dict[str, float]:
@@ -595,6 +664,9 @@ def run_test_metrics(
     avg_l2_sum = 0.0
     min_l2_sum = 0.0
     l2_den = 0
+    expected_avg_l2_sum = 0.0
+    expected_min_l2_sum = 0.0
+    expected_l2_den = 0
     point_bin_exact = 0
     object_acc = 0
     multi_acc_at_1 = 0
@@ -627,10 +699,11 @@ def run_test_metrics(
             target_point_valid = target_point_valid.to(dtype=torch.float32)
             target_object_valid = target_object_valid.to(dtype=torch.float32)
             target_format_valid = target_format_valid.to(dtype=torch.float32)
+            expected_points: list[tuple[float, float] | None] | None = None
 
             if bool(constrained_decoding):
                 with torch.no_grad():
-                    preds = constrained_generate_structured(
+                    constrained_out = constrained_generate_structured(
                         model=model,
                         joint=joint,
                         processor=processor,
@@ -640,7 +713,10 @@ def run_test_metrics(
                         target_order=str(constrained_target_order),
                         temperature=float(constrained_temperature),
                         max_reasoning_tokens=int(max_reasoning_tokens),
+                        return_expected_xy=True,
+                        loc_selection_strategy=str(constrained_loc_decoding),
                     )
+                    preds, expected_points = constrained_out
             else:
                 prompt_len = int(joint["input_ids"].shape[1])
                 stopping = make_gaze_obj_end_stopping_criteria(
@@ -676,6 +752,8 @@ def run_test_metrics(
                 )
             bsz = len(target_texts)
             preds = preds[:bsz]
+            if expected_points is not None:
+                expected_points = expected_points[:bsz]
 
             for i in range(bsz):
                 total += 1
@@ -706,6 +784,19 @@ def run_test_metrics(
                         avg_l2_sum += float(stats[0])
                         min_l2_sum += float(stats[1])
                         l2_den += 1
+                if (
+                    is_point_valid
+                    and expected_points is not None
+                    and i < len(expected_points)
+                    and expected_points[i] is not None
+                    and isinstance(gt_points, list)
+                    and i < len(gt_points)
+                ):
+                    expected_stats = l2_stats(expected_points[i], gt_points[i])
+                    if expected_stats is not None:
+                        expected_avg_l2_sum += float(expected_stats[0])
+                        expected_min_l2_sum += float(expected_stats[1])
+                        expected_l2_den += 1
 
                 # point bin exact match: denominator = point_bin_den (all is_point_valid samples,
                 # format failures count as misses — consistent with ObjectAcc gating on obj_den)
@@ -775,6 +866,14 @@ def run_test_metrics(
     if bool(include_l2_breakdown):
         out["Avg L2"] = dist
         out["Min L2"] = min_l2
+    if expected_l2_den > 0:
+        expected_dist = float(expected_avg_l2_sum / expected_l2_den)
+        expected_min_l2 = float(expected_min_l2_sum / expected_l2_den)
+        out["DistExpected"] = expected_dist
+        out["ExpectedL2ValidFrac"] = float(expected_l2_den / max(point_bin_den, 1))
+        if bool(include_l2_breakdown):
+            out["Avg L2 Expected"] = expected_dist
+            out["Min L2 Expected"] = expected_min_l2
     return out
 
 
@@ -797,6 +896,7 @@ def collect_generation_samples(
     constrained_decoding: bool = False,
     constrained_target_order: str = "point_object",
     constrained_temperature: float = 1.0,
+    constrained_loc_decoding: str = "argmax",
     max_reasoning_tokens: int = 80,
 ) -> list[dict[str, Any]]:
     limit = max(0, int(max_samples))
@@ -834,6 +934,7 @@ def collect_generation_samples(
                     amp_dtype=amp_dtype,
                     target_order=str(constrained_target_order),
                     temperature=float(constrained_temperature),
+                    loc_selection_strategy=str(constrained_loc_decoding),
                     max_reasoning_tokens=int(max_reasoning_tokens),
                 )
             else:
@@ -968,6 +1069,11 @@ def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
         ("ExtraTextRate", float(test_metrics.get("ExtraTextRate", 0.0))),
         ("num_samples", float(test_metrics.get("num_samples", 0.0))),
     ]
+    if "DistExpected" in test_metrics:
+        rows[3:3] = [
+            ("Avg L2 Expected", float(test_metrics.get("Avg L2 Expected", test_metrics.get("DistExpected", 0.0)))),
+            ("Min L2 Expected", float(test_metrics.get("Min L2 Expected", test_metrics.get("DistExpected", 0.0)))),
+        ]
     key_w = max(len(k) for k, _ in rows)
     val_w = 12
     line = "+" + "-" * (key_w + 2) + "+" + "-" * (val_w + 2) + "+"
@@ -981,3 +1087,54 @@ def print_test_metrics_table(test_metrics: dict[str, float]) -> None:
         else:
             print(f"| {k.ljust(key_w)} | {v:>{val_w}.6f} |")
     print(line)
+
+
+def maybe_save_generation_preview(
+    *,
+    args: argparse.Namespace,
+    out_dir: Path,
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    processor: Any,
+    num_classes: int,
+    coord_bins: int,
+    preview_attr: str = "preview_test_samples",
+    filename: str = "test_generation_preview.json",
+    desc: str = "Test preview",
+    log_prefix: str = "TEST",
+) -> None:
+    preview_n = max(0, int(getattr(args, preview_attr, 0)))
+    if preview_n <= 0:
+        return
+
+    preview_samples = collect_generation_samples(
+        model=model,
+        loader=loader,
+        device=device,
+        amp_dtype=amp_dtype,
+        processor=processor,
+        num_classes=int(num_classes),
+        coord_bins=int(coord_bins),
+        show_tqdm=bool(args.show_tqdm),
+        desc=desc,
+        max_new_tokens=int(args.generation_max_new_tokens),
+        num_beams=int(getattr(args, "generation_num_beams", 1)),
+        repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
+        no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
+        max_samples=preview_n,
+        stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
+        constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
+        constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+        constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
+        constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
+        max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
+    )
+    preview_path = out_dir / filename
+    preview_path.write_text(
+        json.dumps(preview_samples, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[{log_prefix}] saved generation preview: {preview_path} (samples={len(preview_samples)})")
+    print_generation_samples(preview_samples)

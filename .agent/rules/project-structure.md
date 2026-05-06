@@ -13,7 +13,7 @@ QWEN_GazeEstimation fine-tunes Qwen3-VL with LoRA for gaze estimation from a sce
 
 - `main.py`: calls `model.trainer.main()`.
 - `sft.yaml`: active SFT configuration.
-- `config_rl.yaml` and `model/utils/rl_utils.py`: separate RL path; do not assume SFT changes automatically cover RL.
+- `RL.yaml` and `model/utils/rl_utils.py`: separate RL path; do not assume SFT changes automatically cover RL.
 
 ## Layout
 
@@ -21,7 +21,7 @@ QWEN_GazeEstimation fine-tunes Qwen3-VL with LoRA for gaze estimation from a sce
 QWEN_GazeEstimation/
 ├── main.py
 ├── sft.yaml
-├── config_rl.yaml
+├── RL.yaml
 ├── RL_data_pipeline.py
 ├── eval_train_dist.py
 ├── model/
