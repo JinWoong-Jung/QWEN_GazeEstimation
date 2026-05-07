@@ -1648,6 +1648,7 @@ def main() -> None:
                                 "train/loss_point": float(losses["loss_point"].detach().item()),
                                 "train/loss_object": float(losses["loss_object"].detach().item()),
                                 "train/loss_format": float(losses["loss_format"].detach().item()),
+                                "train/loss_reasoning": float(losses["loss_reasoning"].detach().item()),
                                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "train/grad_norm": grad_norm_value,
                                 "train/epoch": epoch_progress,

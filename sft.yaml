@@ -90,7 +90,7 @@ loss:
   loss_point_weight: 3.0
   loss_object_weight: 1.0
   loss_format_weight: 0.1
-  loss_reasoning_weight: 0.1
+  loss_reasoning_weight: 0.2
   gaussian_point_sigma: 3.0   # Gaussian soft-label CE sigma (bins). 0.0 = hard CE.
 
 wandb:
