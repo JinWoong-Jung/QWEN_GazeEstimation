@@ -110,14 +110,10 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--gradient_checkpointing", dest="gradient_checkpointing", action="store_true")
     p.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing", action="store_false")
     p.set_defaults(gradient_checkpointing=bool(default_value(d, "gradient_checkpointing", False)))
-    p.add_argument("--show_tqdm", dest="show_tqdm", action="store_true")
-    p.add_argument("--no_show_tqdm", dest="show_tqdm", action="store_false")
-    p.set_defaults(show_tqdm=bool(default_value(d, "show_tqdm", True)))
+    # show_tqdm is always True; removed from config
 
     # --- val/test control ---
-    p.add_argument("--run_test", dest="run_test", action="store_true")
-    p.add_argument("--no_run_test", dest="run_test", action="store_false")
-    p.set_defaults(run_test=bool(default_value(d, "run_test", True)))
+    # run_test is always True; removed from config
     p.add_argument("--run_val_metrics", dest="run_val_metrics", action="store_true")
     p.add_argument("--no_run_val_metrics", dest="run_val_metrics", action="store_false")
     p.set_defaults(run_val_metrics=bool(default_value(d, "run_val_metrics", True)))
@@ -180,6 +176,11 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--train_augmentation_mode", type=str,
                    default=str(default_value(d, "train_augmentation_mode", "full")))
     p.add_argument("--train_reasoning_dir", type=str, default=str(default_value(d, "train_reasoning_dir", "")))
+    p.add_argument("--sample_mode", type=str,
+                   default=str(default_value(d, "sample_mode", "direct_only")))
+    p.add_argument("--val_test_output_format", type=str,
+                   default=str(default_value(d, "val_test_output_format", "direct")))
+    # legacy flag kept for backward compat; trainer converts use_reasoning=True → sample_mode=direct+reasoning
     p.add_argument("--use_reasoning", dest="use_reasoning", action="store_true")
     p.add_argument("--no_use_reasoning", dest="use_reasoning", action="store_false")
     p.set_defaults(use_reasoning=bool(default_value(d, "use_reasoning", False)))

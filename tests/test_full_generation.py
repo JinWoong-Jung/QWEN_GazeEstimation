@@ -104,7 +104,7 @@ class TestBuildPrompt(unittest.TestCase):
         self.assertIn("prompt_text_reasoning", cfg)
         self.assertIn("reasoning_view_ratio", cfg)
         self.assertIn("constrained_decoding: true", cfg)
-        self.assertIn("constrained_target_order: \"point_object\"", cfg)
+        self.assertIn("constrained_target_order: \"reasoning_point_object\"", cfg)
         self.assertNotIn("direct_view_ratio", cfg)
 
 

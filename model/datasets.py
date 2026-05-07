@@ -314,11 +314,18 @@ class GazeDataset(Dataset):
 
 
 class MultiViewGazeDataset(Dataset):
-    """Two-view dataset: point_object views for all records + reasoning_only views for a ratio.
+    """Mixed direct/reasoning dataset supporting four sample modes.
+
+    sample_mode options:
+    - "direct&reasoning": total size = N; split is (1-ratio)*N direct + ratio*N reasoning.
+      When capable < ratio*N, reasoning is capped and direct is boosted so total stays N.
+      Both views are resampled every epoch.
+    - "direct+reasoning": all N records as direct + ratio*N reasoning appended per epoch.
+      Total per epoch = N * (1 + ratio). Only reasoning views are resampled each epoch.
 
     Direct views use the configured train augmentation and point_object target order.
-    Reasoning views use safe augmentation (color jitter only) and reasoning_only target order.
-    Reasoning views are a random sample of records_with_reasoning_files * reasoning_ratio.
+    Reasoning views use safe augmentation (color jitter only) and reasoning_point_object
+    target order (full schema: reasoning + point + object).
     """
 
     def __init__(
@@ -341,6 +348,7 @@ class MultiViewGazeDataset(Dataset):
         reasoning_ratio: float = 0.2,
         train_augmentation_mode: str = "full",
         seed: int = 42,
+        sample_mode: str = "direct+reasoning",
     ) -> None:
         from pathlib import Path as _Path
 
@@ -360,6 +368,12 @@ class MultiViewGazeDataset(Dataset):
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
+        self._sample_mode = str(sample_mode or "direct+reasoning").strip()
+        if self._sample_mode not in {"direct&reasoning", "direct+reasoning"}:
+            raise ValueError(
+                f"MultiViewGazeDataset sample_mode must be 'direct&reasoning' or 'direct+reasoning', "
+                f"got: {self._sample_mode!r}"
+            )
 
         if bool(filter_invalid_object_samples):
             before = len(records)
@@ -381,58 +395,76 @@ class MultiViewGazeDataset(Dataset):
                     f"with invalid object labels"
                 )
         self.records = records
+        N = len(self.records)
 
-        # Direct views: all records, point_object format
-        self._direct_views: list[tuple[int, str]] = [(i, "direct") for i in range(len(self.records))]
-
-        # Reasoning views: random sample of reasoning_ratio * N_total from records that have files
         import random as _random_mod
         self._rng = _random_mod.Random(int(seed))
         self._reasoning_ratio: float = float(reasoning_ratio)
-        self._capable: list[tuple[int, str]] = []
-        self._reasoning_views: list[tuple[int, str]] = []
-        if reasoning_index is not None and float(reasoning_ratio) > 0.0:
+
+        # Build list of record indices that have reasoning files
+        self._capable: list[int] = []
+        if reasoning_index is not None:
             for i, rec in enumerate(self.records):
                 folder = _Path(rec.image_rel).parent.name
                 stem = _Path(rec.image_rel).stem
                 key = f"{folder}/{stem}_{int(rec.sample_id)}"
                 if reasoning_index.get(key) is not None:
-                    self._capable.append((i, "reasoning"))
-            n_reasoning = self._num_reasoning_views()
-            self._reasoning_views = self._capable[:n_reasoning]
-            print(
-                f"[INFO] MultiViewGazeDataset: {len(self._direct_views)} point_object views + "
-                f"{n_reasoning} epoch-resampled reasoning_only views "
-                f"(from {len(self._capable)} capable, ratio={self._reasoning_ratio:.2f})"
-            )
-        else:
-            print(
-                f"[INFO] MultiViewGazeDataset: {len(self._direct_views)} point_object views + "
-                f"0 reasoning_only views (reasoning disabled)"
-            )
+                    self._capable.append(i)
 
+        self._direct_views: list[tuple[int, str]] = []
+        self._reasoning_views: list[tuple[int, str]] = []
+        self._build_initial_views()
         self._views: list[tuple[int, str]] = self._direct_views + self._reasoning_views
 
-    def _num_reasoning_views(self) -> int:
-        return min(
-            len(self._capable),
-            max(0, int(round(len(self.records) * self._reasoning_ratio))),
+        n_d, n_r = len(self._direct_views), len(self._reasoning_views)
+        print(
+            f"[INFO] MultiViewGazeDataset ({self._sample_mode}): "
+            f"{n_d} direct views + {n_r} reasoning views = {n_d + n_r} total "
+            f"(capable={len(self._capable)}, ratio={self._reasoning_ratio:.2f})"
         )
 
-    def _resample_reasoning(self, verbose: bool = False) -> None:
-        n = self._num_reasoning_views()
-        self._reasoning_views = self._rng.sample(self._capable, n) if n > 0 else []
-        self._views = self._direct_views + self._reasoning_views
-        if verbose:
-            print(
-                f"[INFO] MultiViewGazeDataset: {len(self._direct_views)} point_object views + "
-                f"{len(self._reasoning_views)} reasoning_only views "
-                f"(from {len(self._capable)} capable, ratio={self._reasoning_ratio:.2f})"
-            )
+    def _build_initial_views(self) -> None:
+        N = len(self.records)
+        n_r_target = max(0, int(round(N * self._reasoning_ratio)))
+        n_r_actual = min(n_r_target, len(self._capable))
 
+        if self._sample_mode == "direct&reasoning":
+            # total = N; direct = N - n_r_actual so total stays N after cap
+            n_d = N - n_r_actual
+            all_indices = list(range(N))
+            direct_indices = self._rng.sample(all_indices, n_d) if n_d < N else all_indices
+            self._direct_views = [(i, "direct") for i in direct_indices]
+            reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
+            self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
+        else:  # direct+reasoning
+            # direct = all N (fixed); reasoning = n_r_actual sampled from capable
+            self._direct_views = [(i, "direct") for i in range(N)]
+            reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
+            self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
+
+    def resample_epoch_views(self) -> None:
+        """Resample views at the start of each epoch."""
+        N = len(self.records)
+        n_r_target = max(0, int(round(N * self._reasoning_ratio)))
+        n_r_actual = min(n_r_target, len(self._capable))
+
+        if self._sample_mode == "direct&reasoning":
+            # Resample both direct and reasoning
+            n_d = N - n_r_actual
+            all_indices = list(range(N))
+            direct_indices = self._rng.sample(all_indices, n_d) if n_d < N else all_indices
+            self._direct_views = [(i, "direct") for i in direct_indices]
+            reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
+            self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
+        else:  # direct+reasoning: direct fixed, only resample reasoning
+            reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
+            self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
+
+        self._views = self._direct_views + self._reasoning_views
+
+    # backward-compat alias kept for callers using the old name
     def resample_reasoning_views(self) -> None:
-        """Re-sample reasoning_only views. Call at the start of each epoch."""
-        self._resample_reasoning(verbose=False)
+        self.resample_epoch_views()
 
     def get_view_counts(self) -> tuple[int, int]:
         """Return (n_direct, n_reasoning) view counts."""
@@ -483,10 +515,11 @@ class MultiViewGazeDataset(Dataset):
                             max_chars=self.max_reasoning_chars,
                         )
             if reasoning_text:
-                target_order = "reasoning_only"
+                # Full schema: <|reasoning_start|>...<|reasoning_end|><|point_start|>...<|object_end|>
+                target_order = "reasoning_point_object"
                 prompt_text = self.prompt_text_reasoning
             else:
-                # Malformed or missing content → treat as direct view
+                # Malformed or missing reasoning content → treat as direct view
                 target_order = "point_object"
                 prompt_text = self.prompt_text_direct
         else:
@@ -538,10 +571,9 @@ class MultiViewGazeDataset(Dataset):
         bx = quantize_coord(float(gaze_x), bins=self.coord_bins)
         by = quantize_coord(float(gaze_y), bins=self.coord_bins)
 
-        # For reasoning_only views, point and object tokens are absent from the target.
-        is_reasoning_only = (target_order == "reasoning_only")
-        point_valid = 0.0 if is_reasoning_only else 1.0
-        object_valid = 0.0 if is_reasoning_only else float(target_object_valid)
+        # reasoning_point_object views contain the full schema, so point/object are always valid.
+        point_valid = 1.0
+        object_valid = float(target_object_valid)
 
         return {
             "scene_image": scene,

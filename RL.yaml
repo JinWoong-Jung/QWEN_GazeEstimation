@@ -55,10 +55,6 @@ eval:
   checkpoint_monitor: "val_dist"      # val_dist | val_object_acc | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
   generation_max_new_tokens: 16       # direct gaze schema + EOS fits comfortably
-  generation_num_beams: 1
-  repetition_penalty: 1.0
-  no_repeat_ngram_size: 0
-  generation_stop_at_object_end: true
 
 prompt:
   visual_prompting: true

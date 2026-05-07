@@ -1145,10 +1145,15 @@ def maybe_save_generation_preview(
     filename: str = "test_generation_preview.json",
     desc: str = "Test preview",
     log_prefix: str = "TEST",
+    max_new_tokens: int | None = None,
+    constrained_target_order: str | None = None,
 ) -> None:
     preview_n = max(0, int(getattr(args, preview_attr, 0)))
     if preview_n <= 0:
         return
+
+    _max_new_tokens = max_new_tokens if max_new_tokens is not None else int(getattr(args, "generation_max_new_tokens", 8))
+    _target_order = constrained_target_order if constrained_target_order is not None else str(getattr(args, "constrained_target_order", "point_object"))
 
     preview_samples = collect_generation_samples(
         model=model,
@@ -1158,16 +1163,16 @@ def maybe_save_generation_preview(
         processor=processor,
         num_classes=int(num_classes),
         coord_bins=int(coord_bins),
-        show_tqdm=bool(args.show_tqdm),
+        show_tqdm=True,
         desc=desc,
-        max_new_tokens=int(args.generation_max_new_tokens),
+        max_new_tokens=_max_new_tokens,
         num_beams=int(getattr(args, "generation_num_beams", 1)),
         repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
         no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
         max_samples=preview_n,
         stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
         constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-        constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+        constrained_target_order=_target_order,
         constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
         constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
         max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),

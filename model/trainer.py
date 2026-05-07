@@ -201,6 +201,12 @@ def _run_rl_training(
     rl_top_p = float(getattr(args, "rl_top_p", 0.9))
     rl_epochs = max(1, int(getattr(args, "epochs", 5)))
     rl_max_new_tokens = max(16, int(getattr(args, "generation_max_new_tokens", 16)))
+    _rl_val_format = str(getattr(args, "val_test_output_format", "direct")).strip().lower()
+    _eval_target_order = (
+        "reasoning_point_object"
+        if _rl_val_format == "reasoning"
+        else str(getattr(args, "constrained_target_order", "point_object"))
+    )
 
     # PPO clipping — asymmetric + dual-clip (Rex-Omni)
     rl_clip_ratio_low  = float(getattr(args, "rl_clip_ratio_low",  getattr(args, "rl_clip_eps", 0.2)))
@@ -330,7 +336,7 @@ def _run_rl_training(
             desc=f"RL {epoch}/{rl_epochs}",
             leave=False,
             dynamic_ncols=True,
-            disable=not bool(getattr(args, "show_tqdm", True)),
+            disable=False,
         )
 
         for step, batch in enumerate(it, start=1):
@@ -572,7 +578,7 @@ def _run_rl_training(
                             step=global_step,
                         )
 
-            if bool(getattr(args, "show_tqdm", True)):
+            if True:
                 n_r = max(rollout_count, 1)
                 it.set_postfix(
                     rwd=f"{(sum_reward / n_r):.3f}",
@@ -607,7 +613,7 @@ def _run_rl_training(
                 processor=processor,
                 num_classes=int(num_classes),
                 coord_bins=coord_bins,
-                show_tqdm=bool(getattr(args, "show_tqdm", True)),
+                show_tqdm=True,
                 desc=f"RL ValMetric {epoch}",
                 max_new_tokens=rl_max_new_tokens,
                 num_beams=int(getattr(args, "generation_num_beams", 1)),
@@ -615,7 +621,7 @@ def _run_rl_training(
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_target_order=_eval_target_order,
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
                 constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
@@ -635,6 +641,8 @@ def _run_rl_training(
                 filename=f"val_generation_preview_epoch_{epoch:03d}.json",
                 desc=f"RL Val preview {epoch}",
                 log_prefix="VAL",
+                max_new_tokens=rl_max_new_tokens,
+                constrained_target_order=_eval_target_order,
             )
             epoch_msg += (
                 f" val_dist={float(val_gen_metrics.get('Dist', 0.0)):.6f}"
@@ -743,16 +751,56 @@ def main() -> None:
     if train_stage not in {"sft", "rl"}:
         raise ValueError(f"train_stage must be 'sft' or 'rl', got: {train_stage!r}")
 
-    # prompt_text_direct: used for point_object views and eval
-    # prompt_text_reasoning: used for reasoning_only views
+    # prompt_text_direct: used for point_object views and val/test when val_test_output_format=direct
+    # prompt_text_reasoning: used for reasoning views and val/test when val_test_output_format=reasoning
     # Falls back to prompt_text if the dedicated keys are absent
     _prompt_fallback = str(getattr(args, "prompt_text", "") or "")
     _prompt_text_direct = str(getattr(args, "prompt_text_direct", "") or "") or _prompt_fallback
     _prompt_text_reasoning_view = str(getattr(args, "prompt_text_reasoning", "") or "") or _prompt_fallback
     prompt_text_for_run = _prompt_text_direct
-    _prompt_text_eval = _prompt_text_direct
-    _eval_target_order = "point_object"
-    _force_eval = False
+
+    # --- sample_mode: replaces use_reasoning ---
+    _legacy_use_reasoning = bool(getattr(args, "use_reasoning", False))
+    sample_mode = str(getattr(args, "sample_mode", "direct_only")).strip().lower()
+    if _legacy_use_reasoning and sample_mode == "direct_only":
+        sample_mode = "direct+reasoning"
+        print("[WARN] use_reasoning=True (legacy flag); treating as sample_mode='direct+reasoning'")
+    _VALID_SAMPLE_MODES = {"direct_only", "reasoning_only", "direct&reasoning", "direct+reasoning"}
+    if sample_mode not in _VALID_SAMPLE_MODES:
+        raise ValueError(
+            f"train.sample_mode must be one of {sorted(_VALID_SAMPLE_MODES)}, got: {sample_mode!r}"
+        )
+    print(f"[INFO] sample_mode={sample_mode!r}")
+
+    # --- val/test output format ---
+    val_test_format = str(getattr(args, "val_test_output_format", "direct")).strip().lower()
+    if val_test_format not in {"direct", "reasoning"}:
+        raise ValueError(
+            f"eval.val_test_output_format must be 'direct' or 'reasoning', got: {val_test_format!r}"
+        )
+    if val_test_format == "reasoning":
+        _prompt_text_eval = _prompt_text_reasoning_view
+        _eval_target_order = "reasoning_point_object"
+        _force_eval = True
+    else:
+        _prompt_text_eval = _prompt_text_direct
+        _eval_target_order = "point_object"
+        _force_eval = False
+    print(f"[INFO] val_test_output_format={val_test_format!r} → target_order={_eval_target_order!r}")
+
+    # generation_max_new_tokens: auto-bump for reasoning eval
+    _gen_max_tokens = int(getattr(args, "generation_max_new_tokens", 8))
+    if val_test_format == "reasoning":
+        _max_rsn_tokens = int(getattr(args, "max_reasoning_tokens", 80))
+        _gen_max_tokens_eval = max(_gen_max_tokens, _max_rsn_tokens + 8)
+        if _gen_max_tokens_eval > _gen_max_tokens:
+            print(
+                f"[INFO] val_test_output_format='reasoning': generation_max_new_tokens "
+                f"auto-set {_gen_max_tokens} → {_gen_max_tokens_eval}"
+            )
+    else:
+        _gen_max_tokens_eval = _gen_max_tokens
+
     filter_invalid = bool(getattr(args, "filter_invalid_object_samples", True))
     loss_weights = {
         "point": float(getattr(args, "loss_point_weight", 1.0)),
@@ -924,15 +972,15 @@ def main() -> None:
                 processor=processor,
                 num_classes=int(num_classes),
                 coord_bins=coord_bins,
-                show_tqdm=bool(args.show_tqdm),
+                show_tqdm=True,
                 desc="Test",
-                max_new_tokens=int(args.generation_max_new_tokens),
+                max_new_tokens=_gen_max_tokens_eval,
                 num_beams=int(getattr(args, "generation_num_beams", 1)),
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_target_order=_eval_target_order,
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
                 constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
@@ -954,6 +1002,8 @@ def main() -> None:
                 processor=processor,
                 num_classes=int(num_classes),
                 coord_bins=coord_bins,
+                max_new_tokens=_gen_max_tokens_eval,
+                constrained_target_order=_eval_target_order,
             )
 
         elapsed = time.time() - start_time
@@ -1041,7 +1091,8 @@ def main() -> None:
         )
 
     reasoning_index = None
-    if getattr(args, "use_reasoning", False):
+    _needs_reasoning_index = sample_mode in {"reasoning_only", "direct&reasoning", "direct+reasoning"}
+    if _needs_reasoning_index:
         reasoning_dir = resolve_path(str(getattr(args, "train_reasoning_dir", "")))
         if reasoning_dir.exists():
             reasoning_index = build_reasoning_index(reasoning_dir)
@@ -1084,14 +1135,72 @@ def main() -> None:
                     "Check that reasoning files are stored as folder/stem_sampleid.txt."
                 )
         else:
-            print(f"[WARN] train_reasoning_dir not found: {reasoning_dir}")
+            print(
+                f"[WARN] sample_mode={sample_mode!r} requires reasoning data "
+                f"but train_reasoning_dir not found: {reasoning_dir}"
+            )
 
     _max_reasoning_words = int(getattr(args, "max_reasoning_words", 60))
     _max_reasoning_chars = int(getattr(args, "max_reasoning_chars", 500))
     _reasoning_view_ratio = float(getattr(args, "reasoning_view_ratio", 0.2))
 
-    if reasoning_index is not None:
-        train_ds: GazeDataset | MultiViewGazeDataset = MultiViewGazeDataset(
+    if sample_mode == "direct_only":
+        train_ds: GazeDataset | MultiViewGazeDataset = GazeDataset(
+            records=train_records,
+            prompt_template=args.prompt_template,
+            prompt_text=prompt_text_for_run,
+            apply_augmentation=True,
+            id2label=id2label,
+            vocab2id=vocab2id,
+            vocab2id_lower=vocab2id_lower,
+            num_classes=int(num_classes),
+            visual_prompting=bool(args.visual_prompting),
+            image_cache_size=image_cache_size,
+            filter_invalid_object_samples=filter_invalid,
+            coord_bins=coord_bins,
+            train_augmentation_mode=train_augmentation_mode,
+            target_order="point_object",
+        )
+    elif sample_mode == "reasoning_only":
+        # Only records that have reasoning GT files are used for training
+        _capable_records = [
+            r for r in train_records
+            if reasoning_index is not None and reasoning_index.get(
+                f"{Path(r.image_rel).parent.name}/{Path(r.image_rel).stem}_{int(r.sample_id)}"
+            ) is not None
+        ]
+        if not _capable_records:
+            raise RuntimeError(
+                "sample_mode='reasoning_only' but no train records matched the reasoning index. "
+                "Check train_reasoning_dir or switch to a different sample_mode."
+            )
+        print(
+            f"[INFO] reasoning_only: using {len(_capable_records)}/{len(train_records)} "
+            f"records with reasoning GT"
+        )
+        train_ds = GazeDataset(
+            records=_capable_records,
+            prompt_template=args.prompt_template,
+            prompt_text=_prompt_text_reasoning_view,
+            apply_augmentation=True,
+            id2label=id2label,
+            vocab2id=vocab2id,
+            vocab2id_lower=vocab2id_lower,
+            num_classes=int(num_classes),
+            visual_prompting=bool(args.visual_prompting),
+            image_cache_size=image_cache_size,
+            filter_invalid_object_samples=filter_invalid,
+            coord_bins=coord_bins,
+            train_augmentation_mode=train_augmentation_mode,
+            reasoning_index=reasoning_index,
+            max_reasoning_words=_max_reasoning_words,
+            max_reasoning_chars=_max_reasoning_chars,
+            force_reasoning_format=True,
+            target_order="reasoning_point_object",
+        )
+    else:
+        # "direct&reasoning" or "direct+reasoning"
+        train_ds = MultiViewGazeDataset(
             records=train_records,
             prompt_template=args.prompt_template,
             prompt_text_direct=_prompt_text_direct,
@@ -1110,23 +1219,7 @@ def main() -> None:
             reasoning_ratio=_reasoning_view_ratio,
             train_augmentation_mode=train_augmentation_mode,
             seed=int(getattr(args, "seed", 42)),
-        )
-    else:
-        train_ds = GazeDataset(
-            records=train_records,
-            prompt_template=args.prompt_template,
-            prompt_text=prompt_text_for_run,
-            apply_augmentation=True,
-            id2label=id2label,
-            vocab2id=vocab2id,
-            vocab2id_lower=vocab2id_lower,
-            num_classes=int(num_classes),
-            visual_prompting=bool(args.visual_prompting),
-            image_cache_size=image_cache_size,
-            filter_invalid_object_samples=filter_invalid,
-            coord_bins=coord_bins,
-            train_augmentation_mode=train_augmentation_mode,
-            target_order="point_object",
+            sample_mode=sample_mode,
         )
     val_ds = GazeDataset(
         records=val_records,
@@ -1303,7 +1396,7 @@ def main() -> None:
             token_ids_to_save=gaze_token_ids,
         )
 
-        if args.run_test:
+        if True:  # run_test always enabled
             _rl_best_dir = out_dir / "best"
             if _rl_best_dir.exists():
                 _rl_loaded = load_checkpoint_for_eval(
@@ -1362,15 +1455,15 @@ def main() -> None:
                     processor=processor,
                     num_classes=int(num_classes),
                     coord_bins=coord_bins,
-                    show_tqdm=bool(args.show_tqdm),
+                    show_tqdm=True,
                     desc="Test",
-                    max_new_tokens=int(args.generation_max_new_tokens),
+                    max_new_tokens=_gen_max_tokens_eval,
                     num_beams=int(getattr(args, "generation_num_beams", 1)),
                     repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                     no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                     stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
                     constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-                    constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                    constrained_target_order=_eval_target_order,
                     constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
                     constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                     max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
@@ -1392,6 +1485,8 @@ def main() -> None:
                     processor=processor,
                     num_classes=int(num_classes),
                     coord_bins=coord_bins,
+                    max_new_tokens=_gen_max_tokens_eval,
+                    constrained_target_order=_eval_target_order,
                 )
 
         finish_wandb(wandb_run)
@@ -1445,7 +1540,9 @@ def main() -> None:
         print("[INFO] eval_only=True; skipping training loop.")
 
     for epoch in range(1, effective_epochs + 1):
-        if hasattr(train_ds, "resample_reasoning_views"):
+        if hasattr(train_ds, "resample_epoch_views"):
+            train_ds.resample_epoch_views()
+        elif hasattr(train_ds, "resample_reasoning_views"):
             train_ds.resample_reasoning_views()
         model.train()
         sum_loss = 0.0
@@ -1465,7 +1562,7 @@ def main() -> None:
             desc=f"Train {epoch}/{args.epochs}",
             leave=False,
             dynamic_ncols=True,
-            disable=not args.show_tqdm,
+            disable=False,
         )
 
         remainder_steps = num_train_batches % accum_steps
@@ -1563,7 +1660,7 @@ def main() -> None:
             step_count += 1
             _t_step_sum += time.perf_counter() - _t_step0
             _t_data0 = time.perf_counter()
-            if args.show_tqdm:
+            if True:
                 train_iter.set_postfix(loss=f"{(sum_loss / max(sample_count, 1)):.4f}")
 
         if step_count == 0 or sample_count == 0:
@@ -1600,15 +1697,15 @@ def main() -> None:
                 processor=processor,
                 num_classes=int(num_classes),
                 coord_bins=coord_bins,
-                show_tqdm=bool(args.show_tqdm),
+                show_tqdm=True,
                 desc=f"ValMetric {epoch}/{args.epochs}",
-                max_new_tokens=int(args.generation_max_new_tokens),
+                max_new_tokens=_gen_max_tokens_eval,
                 num_beams=int(getattr(args, "generation_num_beams", 1)),
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_target_order=_eval_target_order,
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
                 constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
@@ -1628,6 +1725,8 @@ def main() -> None:
                 filename=f"val_generation_preview_epoch_{epoch:03d}.json",
                 desc=f"Val preview {epoch}/{args.epochs}",
                 log_prefix="VAL",
+                max_new_tokens=_gen_max_tokens_eval,
+                constrained_target_order=_eval_target_order,
             )
 
         epoch_msg = f"[EPOCH {epoch}] train_loss={train_loss:.6f}"
@@ -1701,15 +1800,15 @@ def main() -> None:
                 processor=processor,
                 num_classes=int(num_classes),
                 coord_bins=coord_bins,
-                show_tqdm=bool(args.show_tqdm),
+                show_tqdm=True,
                 desc="Eval metrics (checkpoint)",
-                max_new_tokens=int(args.generation_max_new_tokens),
+                max_new_tokens=_gen_max_tokens_eval,
                 num_beams=int(getattr(args, "generation_num_beams", 1)),
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_target_order=_eval_target_order,
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
                 constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
@@ -1735,7 +1834,7 @@ def main() -> None:
 
     elapsed = time.time() - start_time
 
-    if args.run_test:
+    if True:  # run_test always enabled
         best_dir = out_dir / "best"
         if best_dir.exists():
             loaded_best = load_checkpoint_for_eval(
@@ -1797,15 +1896,15 @@ def main() -> None:
                 processor=processor,
                 num_classes=int(num_classes),
                 coord_bins=coord_bins,
-                show_tqdm=bool(args.show_tqdm),
+                show_tqdm=True,
                 desc="Test",
-                max_new_tokens=int(args.generation_max_new_tokens),
+                max_new_tokens=_gen_max_tokens_eval,
                 num_beams=int(getattr(args, "generation_num_beams", 1)),
                 repetition_penalty=float(getattr(args, "repetition_penalty", 1.0)),
                 no_repeat_ngram_size=int(getattr(args, "no_repeat_ngram_size", 0)),
                 stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
                 constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-                constrained_target_order=str(getattr(args, "constrained_target_order", "point_object")),
+                constrained_target_order=_eval_target_order,
                 constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
                 constrained_loc_decoding=str(getattr(args, "constrained_loc_decoding", "argmax")),
                 max_reasoning_tokens=int(getattr(args, "max_reasoning_tokens", 80)),
@@ -1827,6 +1926,8 @@ def main() -> None:
                 processor=processor,
                 num_classes=int(num_classes),
                 coord_bins=coord_bins,
+                max_new_tokens=_gen_max_tokens_eval,
+                constrained_target_order=_eval_target_order,
             )
 
     finish_wandb(wandb_run)

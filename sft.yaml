@@ -39,48 +39,42 @@ train:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   filter_invalid_object_samples: false
-  train_augmentation_mode: "color_only"  # "full" | "color_only" | "no_crop" | "no_aug"
+  train_augmentation_mode: "no_aug"  # "full" | "color_only" | "no_crop" | "no_aug"
   save_last_every_n_epochs: 5
-  use_reasoning: false
-  reasoning_view_ratio: 0.2   # ratio of total records to use as reasoning_only views
+  sample_mode: "reasoning_only"  # direct_only | reasoning_only | direct&reasoning | direct+reasoning
+  reasoning_view_ratio: 0.2   # used by direct&reasoning and direct+reasoning
 
 reasoning:
   max_reasoning_words: 60
   max_reasoning_chars: 500
+  max_reasoning_tokens: 80   # generation budget for reasoning eval; auto-bumped: max(generation_max_new_tokens, this+8)
 
 eval:
   test_batch_size: 16
-  show_tqdm: true
   eval_only: false
   test_only: false
-  run_test: true
   run_val_metrics: true
   run_val_metrics_every_n_epochs: 1
   checkpoint_monitor: "val_dist"      # val_dist | val_object_acc | val_format_valid
   checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 8       # point_object fallback (constrained path ignores this; free path: exactly 8 tokens)
-  generation_num_beams: 1
-  repetition_penalty: 1.0
-  no_repeat_ngram_size: 0
-  generation_stop_at_object_end: true
+  generation_max_new_tokens: 8       # direct eval; auto-bumped to max_reasoning_tokens+8 when val_test_output_format=reasoning
   constrained_decoding: true
-  constrained_target_order: "point_object"
+  constrained_target_order: "reasoning_point_object" # "point_object" | "reasoning_point_object"
   constrained_loc_decoding: "argmax"  # "argmax" | "round_expectation"
+  val_test_output_format: "reasoning"   # direct | reasoning
 
 prompt:
   visual_prompting: true
-  # point_object prompt: used for all training views and evaluation
+  # direct prompt: used for direct training views and val/test when val_test_output_format=direct
   prompt_text_direct: |
-    Given the image and the person head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}],
-    predict the gaze point(coordinate tokens) and object(object token).
-    Return only:
-    <|point_start|><loc_XXX><loc_YYY><|point_end|><|object_start|><obj_KKK><|object_end|>
-  # reasoning_only prompt: used only for reasoning_only training views
+    Given the image and head box <|box_start|>({loc_x1},{loc_y1}),({loc_x2},{loc_y2})<|box_end|>,
+    predict the gaze point and target.
+    Return only: <|point_start|><loc_XXX><loc_YYY><|point_end|><|object_start|><obj_KKK><|object_end|>
+  # reasoning prompt: used for reasoning training views and val/test when val_test_output_format=reasoning
   prompt_text_reasoning: |
-    Given the image and the person head box [{loc_x1}{loc_y1}{loc_x2}{loc_y2}],
-    reason about where this person is looking and what they are gazing at.
-    Return exactly this schema:
-    <|reasoning_start|><your reasoning here><|reasoning_end|>
+    Given the image and head box <|box_start|>({loc_x1},{loc_y1}),({loc_x2},{loc_y2})<|box_end|>,
+    briefly reason about the person's gaze target, and then predict the gaze point and target.
+    Return only: <|reasoning_start|><your reasoning here><|reasoning_end|><|point_start|><loc_XXX><loc_YYY><|point_end|><|object_start|><obj_KKK><|object_end|>
 
 model:
   coord_bins: 128
@@ -95,7 +89,7 @@ model:
 loss:
   loss_point_weight: 3.0
   loss_object_weight: 1.0
-  loss_format_weight: 0.2
+  loss_format_weight: 0.1
   loss_reasoning_weight: 0.1
   gaussian_point_sigma: 3.0   # Gaussian soft-label CE sigma (bins). 0.0 = hard CE.
 
@@ -103,7 +97,7 @@ wandb:
   enabled: true
   project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "reasoning_SFT_v2"
+  run_name: "SFT_reasoning_only_no_aug"
   wandb_log_every_steps: 20
   tags: []
   notes: ""
