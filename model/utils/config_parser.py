@@ -190,6 +190,11 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--max_reasoning_words", type=int, default=int(default_value(d, "max_reasoning_words", 60)))
     p.add_argument("--max_reasoning_chars", type=int, default=int(default_value(d, "max_reasoning_chars", 500)))
 
+    # --- self-distillation KL loss ---
+    p.add_argument("--distil_kl_weight", type=float, default=float(default_value(d, "distil_kl_weight", 0.0)))
+    p.add_argument("--teacher_suffix", type=str,
+                   default=str(default_value(d, "teacher_suffix", "\n\nUse the following reasoning to guide your prediction:\n{reasoning_text}\n\nNow apply the same reasoning process to predict the gaze point and target.")))
+
     # --- structured loss weights ---
     p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 1.0)))
     p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 1.0)))

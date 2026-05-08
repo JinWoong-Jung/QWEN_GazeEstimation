@@ -46,6 +46,54 @@ class _ImageLRUCache:
             self._cache[path] = img.copy()
 
 
+class _ReasoningTextLRUCache:
+    """Lazy LRU cache for normalized reasoning text, keyed by reasoning index key."""
+
+    def __init__(
+        self,
+        index: dict[str, Any] | None,
+        *,
+        max_words: int,
+        max_chars: int,
+        maxsize: int = 8192,
+    ) -> None:
+        self._index = index or {}
+        self._cache: OrderedDict[str, str | None] = OrderedDict()
+        self._max_words = int(max_words)
+        self._max_chars = int(max_chars)
+        self._maxsize = max(1, int(maxsize))
+
+    def __bool__(self) -> bool:
+        return bool(self._index)
+
+    def has_key(self, key: str) -> bool:
+        return key in self._index
+
+    def get(self, key: str) -> str | None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+
+        path = self._index.get(key)
+        text: str | None = None
+        if path is not None:
+            raw = load_reasoning_text(path)
+            if raw:
+                text = normalize_reasoning_text(raw, self._max_words, self._max_chars)
+
+        if len(self._cache) >= self._maxsize:
+            self._cache.popitem(last=False)
+        self._cache[key] = text
+        return text
+
+
+def _reasoning_key(image_rel: str, sample_id: int) -> str:
+    from pathlib import Path as _Path
+
+    path = _Path(image_rel)
+    return f"{path.parent.name}/{path.stem}_{int(sample_id)}"
+
+
 def _resolve_obj_id(
     label_text: str,
     label_id: int,
@@ -185,15 +233,11 @@ class GazeDataset(Dataset):
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
 
-        # Pre-load all reasoning texts at init to avoid per-sample disk I/O during training.
-        self._reasoning_text_cache: dict[str, str] = {}
-        if reasoning_index is not None:
-            for _key, _rpath in reasoning_index.items():
-                _text = load_reasoning_text(_rpath)
-                if _text:
-                    self._reasoning_text_cache[_key] = normalize_reasoning_text(
-                        _text, int(max_reasoning_words), int(max_reasoning_chars)
-                    )
+        self._reasoning_text_cache = _ReasoningTextLRUCache(
+            reasoning_index,
+            max_words=int(max_reasoning_words),
+            max_chars=int(max_reasoning_chars),
+        )
 
         if bool(filter_invalid_object_samples):
             before = len(records)
@@ -240,10 +284,7 @@ class GazeDataset(Dataset):
         reasoning_text: str | None = None
         has_reasoning_file = False
         if self._reasoning_text_cache:
-            from pathlib import Path as _Path
-            folder = _Path(rec.image_rel).parent.name
-            stem = _Path(rec.image_rel).stem
-            key = f"{folder}/{stem}_{int(rec.sample_id)}"
+            key = _reasoning_key(str(rec.image_rel), int(rec.sample_id))
             reasoning_text = self._reasoning_text_cache.get(key)
             has_reasoning_file = reasoning_text is not None
 
@@ -352,8 +393,6 @@ class MultiViewGazeDataset(Dataset):
         seed: int = 42,
         sample_mode: str = "direct+reasoning",
     ) -> None:
-        from pathlib import Path as _Path
-
         self.prompt_template = str(prompt_template or "")
         self.prompt_text_direct = str(prompt_text_direct or "")
         self.prompt_text_reasoning = str(prompt_text_reasoning or "")
@@ -408,22 +447,15 @@ class MultiViewGazeDataset(Dataset):
         self._capable: list[int] = []
         if reasoning_index is not None:
             for i, rec in enumerate(self.records):
-                folder = _Path(rec.image_rel).parent.name
-                stem = _Path(rec.image_rel).stem
-                key = f"{folder}/{stem}_{int(rec.sample_id)}"
+                key = _reasoning_key(str(rec.image_rel), int(rec.sample_id))
                 if reasoning_index.get(key) is not None:
                     self._capable.append(i)
 
-        # Pre-load all reasoning texts at init to avoid per-sample disk I/O during training.
-        self._reasoning_text_cache: dict[str, str] = {}
-        if reasoning_index is not None:
-            from pathlib import Path as _Path
-            for _key, _rpath in reasoning_index.items():
-                _text = load_reasoning_text(_rpath)
-                if _text:
-                    self._reasoning_text_cache[_key] = normalize_reasoning_text(
-                        _text, int(max_reasoning_words), int(max_reasoning_chars)
-                    )
+        self._reasoning_text_cache = _ReasoningTextLRUCache(
+            reasoning_index,
+            max_words=int(max_reasoning_words),
+            max_chars=int(max_reasoning_chars),
+        )
 
         self._direct_views: list[tuple[int, str]] = []
         self._reasoning_views: list[tuple[int, str]] = []
@@ -488,8 +520,6 @@ class MultiViewGazeDataset(Dataset):
         return len(self._views)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        from pathlib import Path as _Path
-
         rec_idx, view_type = self._views[idx]
         rec = self.records[rec_idx]
 
@@ -515,9 +545,7 @@ class MultiViewGazeDataset(Dataset):
             # Load reasoning text from pre-loaded cache; fall back to direct if missing.
             reasoning_text: str | None = None
             if self._reasoning_text_cache:
-                folder = _Path(rec.image_rel).parent.name
-                stem = _Path(rec.image_rel).stem
-                key = f"{folder}/{stem}_{int(rec.sample_id)}"
+                key = _reasoning_key(str(rec.image_rel), int(rec.sample_id))
                 reasoning_text = self._reasoning_text_cache.get(key)
             if reasoning_text:
                 # Full schema: <|reasoning_start|>...<|reasoning_end|><|point_start|>...<|object_end|>

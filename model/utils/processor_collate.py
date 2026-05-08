@@ -349,10 +349,14 @@ class QwenTrainCollator:
         processor: Any,
         max_text_length: int = 256,
         scene_size: tuple[int, int] | None = None,
+        distil_kl_weight: float = 0.0,
+        distil_teacher_suffix: str = "\n\nUse the following reasoning to guide your prediction:\n{reasoning_text}\n\nNow apply the same reasoning process to predict the gaze point and target.",
     ) -> None:
         self.processor = processor
         self.max_text_length = int(max_text_length)
         self.scene_size = (int(scene_size[0]), int(scene_size[1])) if scene_size is not None else None
+        self.distil_kl_weight = float(distil_kl_weight)
+        self.distil_teacher_suffix = str(distil_teacher_suffix)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         raw_images = [x["scene_image"] for x in batch]
@@ -398,7 +402,7 @@ class QwenTrainCollator:
             [x.get("target_object_id", torch.zeros((), dtype=torch.long)) for x in batch], dim=0
         )
 
-        return {
+        result = {
             "joint_inputs": joint_inputs,
             "labels": labels,
             "target_text": target_texts,
@@ -415,6 +419,33 @@ class QwenTrainCollator:
             "image_rel": [str(x.get("image_rel", "")) for x in batch],
             "view_type": [str(x.get("view_type", "direct")) for x in batch],
         }
+
+        # Build teacher inputs for self-distillation KL loss when enabled and reasoning is available.
+        if self.distil_kl_weight > 0.0:
+            reasoning_texts = [str(x.get("reasoning_text", "")).strip() for x in batch]
+            has_reasoning = [bool(r) for r in reasoning_texts]
+            if any(has_reasoning):
+                teacher_text_inputs = [
+                    (text + self.distil_teacher_suffix.format(reasoning_text=r)) if r else text
+                    for text, r in zip(text_inputs, reasoning_texts)
+                ]
+                teacher_joint_inputs, _, teacher_mask_pt, teacher_mask_obj, _, _ = build_train_inputs(
+                    processor=self.processor,
+                    scene_images=scene_images,
+                    text_inputs=teacher_text_inputs,
+                    target_texts=target_texts,
+                    target_text_valid=target_text_valid,
+                    target_point_valid=target_point_valid,
+                    target_object_valid=target_object_valid,
+                    target_format_valid=target_format_valid,
+                    max_text_length=self.max_text_length,
+                )
+                result["teacher_joint_inputs"] = teacher_joint_inputs
+                result["teacher_loss_mask_point"] = teacher_mask_pt
+                result["teacher_loss_mask_object"] = teacher_mask_obj
+                result["has_distil"] = torch.tensor(has_reasoning, dtype=torch.bool)
+
+        return result
 
 
 class QwenRLCollator:

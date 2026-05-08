@@ -217,6 +217,31 @@ class TestReasoningOnlyGazeDataset(unittest.TestCase):
             prompt = ds[i]["text_input"]
             self.assertIn("reasoning", prompt.lower())
 
+    def test_reasoning_text_is_loaded_lazily(self):
+        with patch("model.datasets.load_reasoning_text", return_value="The person is looking at the screen.") as mocked:
+            ds = GazeDataset(
+                records=self.records,
+                prompt_template=_PROMPT_TEMPLATE,
+                prompt_text=_PROMPT_REASONING,
+                apply_augmentation=False,
+                id2label=_ID2LABEL,
+                vocab2id=_VOCAB2ID,
+                vocab2id_lower=_VOCAB2ID_LOWER,
+                num_classes=_NUM_CLASSES,
+                coord_bins=_COORD_BINS,
+                reasoning_index=self.reasoning_index,
+                target_order="reasoning_point_object",
+                force_reasoning_format=True,
+            )
+            self.assertEqual(mocked.call_count, 0)
+
+            item = ds[0]
+            self.assertTrue(item["has_reasoning"])
+            self.assertEqual(mocked.call_count, 1)
+
+            _ = ds[0]
+            self.assertEqual(mocked.call_count, 1)
+
 
 class TestMultiViewDirectAndReasoning(unittest.TestCase):
     """direct&reasoning: total == N, schemas correct."""
@@ -304,6 +329,20 @@ class TestMultiViewDirectAndReasoning(unittest.TestCase):
             ds.resample_epoch_views()
             n_d, n_r = ds.get_view_counts()
             self.assertEqual(n_d + n_r, self.N, "total must stay N after resample")
+
+    def test_reasoning_text_is_loaded_lazily(self):
+        with patch("model.datasets.load_reasoning_text", return_value="The person is looking at the screen.") as mocked:
+            ds = self._make_ds(ratio=0.3)
+            self.assertEqual(mocked.call_count, 0)
+
+            reasoning_idx = next(i for i in range(len(ds)) if ds._views[i][1] == "reasoning")
+            item = ds[reasoning_idx]
+            self.assertEqual(item["view_type"], "reasoning")
+            self.assertTrue(item["has_reasoning"])
+            self.assertEqual(mocked.call_count, 1)
+
+            _ = ds[reasoning_idx]
+            self.assertEqual(mocked.call_count, 1)
 
 
 class TestMultiViewDirectPlusReasoning(unittest.TestCase):

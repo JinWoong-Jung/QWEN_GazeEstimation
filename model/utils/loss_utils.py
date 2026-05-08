@@ -275,6 +275,83 @@ def compute_structured_loss(
     }
 
 
+def compute_kl_distil_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    student_mask_point: torch.Tensor | None,
+    teacher_mask_point: torch.Tensor | None,
+    student_mask_object: torch.Tensor | None,
+    teacher_mask_object: torch.Tensor | None,
+    has_distil: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Forward KL divergence KL(student||teacher) at point+object token positions.
+
+    Student and teacher sequences have different lengths (teacher prompt is longer),
+    so masks are extracted per-sample and aligned by token order within each sample.
+    """
+    z = torch.zeros((), device=student_logits.device, dtype=student_logits.dtype)
+    if student_logits is None or teacher_logits is None:
+        return z
+
+    # Causal shift: logit[i] predicts token[i+1]
+    s_shift = student_logits[:, :-1, :]  # [B, Ls-1, V]
+    t_shift = teacher_logits[:, :-1, :]  # [B, Lt-1, V]
+
+    def _shift_mask(m: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+        if m is None or not torch.is_tensor(m) or m.dim() != 2:
+            return None
+        return m.to(device=device, dtype=torch.bool)[:, 1:]
+
+    sm_pt = _shift_mask(student_mask_point, student_logits.device)
+    sm_obj = _shift_mask(student_mask_object, student_logits.device)
+    tm_pt = _shift_mask(teacher_mask_point, teacher_logits.device)
+    tm_obj = _shift_mask(teacher_mask_object, teacher_logits.device)
+
+    # Build union mask per model
+    B = s_shift.shape[0]
+    s_union = torch.zeros(s_shift.shape[:2], dtype=torch.bool, device=s_shift.device)
+    t_union = torch.zeros(t_shift.shape[:2], dtype=torch.bool, device=t_shift.device)
+    if sm_pt is not None:
+        s_union |= sm_pt
+    if sm_obj is not None:
+        s_union |= sm_obj
+    if tm_pt is not None:
+        t_union |= tm_pt
+    if tm_obj is not None:
+        t_union |= tm_obj
+
+    if has_distil is not None:
+        hd = has_distil.to(device=s_shift.device, dtype=torch.bool)
+        s_union[~hd] = False
+        t_union[~hd] = False
+
+    # Collect matched logits per sample (student and teacher may have different seq lengths)
+    s_logits_list: list[torch.Tensor] = []
+    t_logits_list: list[torch.Tensor] = []
+    for i in range(B):
+        sm_i = s_union[i]  # [Ls-1]
+        tm_i = t_union[i]  # [Lt-1]
+        n_s = int(sm_i.sum().item())
+        n_t = int(tm_i.sum().item())
+        if n_s == 0 or n_t == 0 or n_s != n_t:
+            continue
+        s_logits_list.append(s_shift[i][sm_i])  # [n_ans, V]
+        t_logits_list.append(t_shift[i][tm_i])  # [n_ans, V]
+
+    if not s_logits_list:
+        return z
+
+    s_cat = torch.cat(s_logits_list, dim=0)           # [N_total, V]
+    t_cat = torch.cat(t_logits_list, dim=0).detach()  # [N_total, V]
+
+    return F.kl_div(
+        F.log_softmax(s_cat, dim=-1),
+        F.softmax(t_cat, dim=-1),
+        reduction="batchmean",
+        log_target=False,
+    )
+
+
 def compute_answer_loss(
     *,
     logits: torch.Tensor | None,

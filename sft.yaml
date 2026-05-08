@@ -12,7 +12,7 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
-  train_reasoning_dir: "/home/work/jinwoong/QWEN_GazeEstimation/data/gazefollow_reason_train"
+  train_reasoning_dir: "data/gazefollow_reason/output/train"
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
@@ -39,16 +39,8 @@ train:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   filter_invalid_object_samples: false
-  train_augmentation_mode_direct: "full"        # "full" | "no_crop" | "color_only" | "crop_only" | "no_aug"
-  train_augmentation_mode_reasoning: "crop_only"  # "crop_only" | "no_aug"  (color/hflip unsafe for reasoning text)
+  train_augmentation_mode_direct: "full"  # "full" | "no_crop" | "color_only" | "crop_only" | "no_aug"
   save_last_every_n_epochs: 5
-  sample_mode: "direct&reasoning"  # direct_only | reasoning_only | direct&reasoning(total 108,955) | direct+reasoning(total 108,955 + @)
-  reasoning_view_ratio: 0.5   # used by direct&reasoning and direct+reasoning
-
-reasoning:
-  max_reasoning_words: 60
-  max_reasoning_chars: 500
-  max_reasoning_tokens: 80   # generation budget for reasoning eval; auto-bumped: max(generation_max_new_tokens, this+8)
 
 eval:
   test_batch_size: 16
@@ -56,25 +48,19 @@ eval:
   test_only: false
   run_val_metrics: true
   run_val_metrics_every_n_epochs: 1
-  checkpoint_monitor: "val_dist"      # val_dist | val_object_acc | val_format_valid
-  checkpoint_monitor_mode: "min"     # auto | min | max
-  generation_max_new_tokens: 8       # direct eval; auto-bumped to max_reasoning_tokens+8 when output_format=reasoning
+  checkpoint_monitor: "val_dist"
+  checkpoint_monitor_mode: "min"
+  generation_max_new_tokens: 8
   constrained_decoding: true
-  output_format: "direct"            # "direct" (→ point_object) | "reasoning" (→ reasoning_point_object)
   constrained_loc_decoding: "argmax"  # "argmax" | "round_expectation"
 
 prompt:
   visual_prompting: true
-  # direct prompt: used for direct training views and val/test when output_format=direct
   prompt_text_direct: |
     Given the image and head box <|box_start|>({loc_x1},{loc_y1}),({loc_x2},{loc_y2})<|box_end|>,
     predict the gaze point and target.
-    Return only: <|point_start|><loc_XXX><loc_YYY><|point_end|><|object_start|><obj_KKK><|object_end|>
-  # reasoning prompt: used for reasoning training views and val/test when output_format=reasoning
-  prompt_text_reasoning: |
-    Given the image and head box <|box_start|>({loc_x1},{loc_y1}),({loc_x2},{loc_y2})<|box_end|>,
-    briefly reason about the person's gaze target, and then predict the gaze point and target.
-    Return only: <|reasoning_start|><your reasoning here><|reasoning_end|><|point_start|><loc_XXX><loc_YYY><|point_end|><|object_start|><obj_KKK><|object_end|>
+    Return only: <|point_start|>{loc_tok_min}~{loc_tok_max}{loc_tok_min}~{loc_tok_max}<|point_end|><|object_start|>{obj_tok_min}~{obj_tok_max}<|object_end|>
+  teacher_suffix: "\n\nUse the following reasoning to guide your prediction:\n{reasoning_text}\n\nNow apply the same reasoning process to predict the gaze point and target."
 
 model:
   coord_bins: 128
@@ -84,20 +70,22 @@ model:
   lora_alpha: 32
   lora_dropout: 0.05
   lora_bias: "none"
-  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 loss:
   loss_point_weight: 3.0
   loss_object_weight: 1.0
   loss_format_weight: 0.5
-  loss_reasoning_weight: 0.5
-  gaussian_point_sigma: 3.0   # Gaussian soft-label CE sigma (bins). 0.0 = hard CE.
+  gaussian_point_sigma: 3.0
+
+distil:
+  distil_kl_weight: 0.5  # 0.0 = disabled; >0 adds KL(student||teacher) at point+object positions
 
 wandb:
   enabled: true
   project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "SFT_reasoning&direct"
+  run_name: "SFT_distil"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

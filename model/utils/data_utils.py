@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageEnhance, ImageOps
 
 from .gaze_tokens import quantize_coord
-from .special_tokens import COORD_BINS, format_loc_token
+from .special_tokens import COORD_BINS, format_loc_token, format_obj_token
 
 
 def is_normalized_point(x: float, y: float) -> bool:
@@ -65,6 +65,7 @@ def build_prompt(
     coord_max = coord_n - 1
     obj_min = 0
     obj_max = max(0, int(num_classes) - 1) if num_classes is not None else 0
+    obj_w = max(3, len(str(obj_max)))
     format_vars: dict[str, Any] = {
         "xmin": float(xmin),
         "ymin": float(ymin),
@@ -78,6 +79,11 @@ def build_prompt(
         "coord_max": int(coord_max),
         "obj_min": int(obj_min),
         "obj_max": int(obj_max),
+        # Formatted token strings (e.g. <loc_000>, <loc_127>, <obj_000>, <obj_345>)
+        "loc_tok_min": format_loc_token(coord_min, loc_w),
+        "loc_tok_max": format_loc_token(coord_max, loc_w),
+        "obj_tok_min": format_obj_token(obj_min, obj_w),
+        "obj_tok_max": format_obj_token(obj_max, obj_w),
     }
     if point_decimals is not None:
         format_vars["point_decimals"] = int(point_decimals)

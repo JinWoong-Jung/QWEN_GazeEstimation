@@ -70,7 +70,7 @@ from .utils.eval_utils import (
 )
 from .utils.gaze_tokens import parse_structured_output_text
 from .utils.special_tokens import GAZE_SCHEMA_MARKERS, register_gaze_special_tokens
-from .utils.loss_utils import compute_answer_loss
+from .utils.loss_utils import compute_answer_loss, compute_kl_distil_loss
 from .utils.processor_collate import (
     QwenRLCollator,
     QwenTestCollator,
@@ -1091,7 +1091,10 @@ def main() -> None:
             )
 
     reasoning_index = None
-    _needs_reasoning_index = sample_mode in {"reasoning_only", "direct&reasoning", "direct+reasoning"}
+    _needs_reasoning_index = (
+        sample_mode in {"reasoning_only", "direct&reasoning", "direct+reasoning"}
+        or float(getattr(args, "distil_kl_weight", 0.0)) > 0.0
+    )
     if _needs_reasoning_index:
         reasoning_dir = resolve_path(str(getattr(args, "train_reasoning_dir", "")))
         if reasoning_dir.exists():
@@ -1160,6 +1163,9 @@ def main() -> None:
             coord_bins=coord_bins,
             train_augmentation_mode=train_augmentation_mode_direct,
             target_order="point_object",
+            reasoning_index=reasoning_index,  # needed for teacher distillation context
+            max_reasoning_words=_max_reasoning_words,
+            max_reasoning_chars=_max_reasoning_chars,
         )
     elif sample_mode == "reasoning_only":
         # Only records that have reasoning GT files are used for training
@@ -1252,10 +1258,15 @@ def main() -> None:
     log_target_example("train", train_ds)
     log_target_example("val", val_ds)
 
+    distil_kl_weight = float(getattr(args, "distil_kl_weight", 0.0))
+    distil_teacher_suffix = str(getattr(args, "teacher_suffix", "\n\nUse the following reasoning to guide your prediction:\n{reasoning_text}\n\nNow apply the same reasoning process to predict the gaze point and target."))
+
     train_collator = QwenTrainCollator(
         processor=processor,
         max_text_length=int(args.max_text_length),
         scene_size=_scene_size,
+        distil_kl_weight=distil_kl_weight,
+        distil_teacher_suffix=distil_teacher_suffix,
     )
     test_collator = QwenTestCollator(
         processor=processor,
@@ -1616,6 +1627,24 @@ def main() -> None:
                     gaussian_sigma=gaussian_point_sigma,
                 )
                 raw_loss = losses["loss"]
+
+                # Self-distillation KL loss: teacher sees enriched prompt (+ reasoning_text).
+                kl_loss_val = torch.zeros((), device=device, dtype=raw_loss.dtype)
+                if distil_kl_weight > 0.0 and "teacher_joint_inputs" in batch:
+                    teacher_joint_inputs = to_device(batch["teacher_joint_inputs"], device=device)
+                    with torch.no_grad():
+                        teacher_out = model(joint_inputs=teacher_joint_inputs, use_cache=False)
+                    kl_loss_val = compute_kl_distil_loss(
+                        student_logits=out.get("logits"),
+                        teacher_logits=teacher_out.get("logits"),
+                        student_mask_point=batch.get("loss_mask_point"),
+                        teacher_mask_point=batch.get("teacher_loss_mask_point"),
+                        student_mask_object=batch.get("loss_mask_object"),
+                        teacher_mask_object=batch.get("teacher_loss_mask_object"),
+                        has_distil=batch.get("has_distil"),
+                    )
+                    raw_loss = raw_loss + distil_kl_weight * kl_loss_val
+
                 loss = raw_loss / float(max(current_accum_steps, 1))
             _t_fwd_sum += time.perf_counter() - _t_fwd0
 
@@ -1644,19 +1673,19 @@ def main() -> None:
                             float(updates_done_in_epoch) / max(float(updates_per_epoch), 1.0)
                         )
 
-                        wandb_run.log(
-                            {
-                                "train/loss": float(raw_loss.detach().item()),
-                                "train/loss_point": float(losses["loss_point"].detach().item()),
-                                "train/loss_object": float(losses["loss_object"].detach().item()),
-                                "train/loss_format": float(losses["loss_format"].detach().item()),
-                                "train/loss_reasoning": float(losses["loss_reasoning"].detach().item()),
-                                "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
-                                "train/grad_norm": grad_norm_value,
-                                "train/epoch": epoch_progress,
-                            },
-                            step=global_step,
-                        )
+                        log_payload = {
+                            "train/loss": float(raw_loss.detach().item()),
+                            "train/loss_point": float(losses["loss_point"].detach().item()),
+                            "train/loss_object": float(losses["loss_object"].detach().item()),
+                            "train/loss_format": float(losses["loss_format"].detach().item()),
+                            "train/loss_reasoning": float(losses["loss_reasoning"].detach().item()),
+                            "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
+                            "train/grad_norm": grad_norm_value,
+                            "train/epoch": epoch_progress,
+                        }
+                        if distil_kl_weight > 0.0:
+                            log_payload["train/kl_distil"] = float(kl_loss_val.detach().item())
+                        wandb_run.log(log_payload, step=global_step)
 
             sum_loss += float(raw_loss.detach().item()) * float(bsz)
             sample_count += bsz
