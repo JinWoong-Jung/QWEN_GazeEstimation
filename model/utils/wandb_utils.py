@@ -68,6 +68,7 @@ def init_wandb(args: Any, root: Path):
             wandb.define_metric("train/loss_point", summary="min")
             wandb.define_metric("train/loss_object", summary="min")
             wandb.define_metric("train/loss_format", summary="min")
+            wandb.define_metric("train/loss_kl", summary="min")
             wandb.define_metric("val/dist", summary="min")
             wandb.define_metric("val/object_acc", summary="max")
             wandb.define_metric("val/format_valid", summary="max")

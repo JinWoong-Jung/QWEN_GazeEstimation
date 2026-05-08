@@ -284,7 +284,7 @@ def compute_kl_distil_loss(
     teacher_mask_object: torch.Tensor | None,
     has_distil: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Forward KL divergence KL(student||teacher) at point+object token positions.
+    """Distillation KL KL(teacher||student) at point+object token positions.
 
     Student and teacher sequences have different lengths (teacher prompt is longer),
     so masks are extracted per-sample and aligned by token order within each sample.

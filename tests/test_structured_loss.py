@@ -6,6 +6,7 @@ import torch
 
 from model.utils.loss_utils import (
     compute_answer_loss,
+    compute_kl_distil_loss,
     compute_structured_loss,
     gaussian_soft_label_ce,
     masked_sample_exact_rate,
@@ -194,6 +195,38 @@ class TestGaussianSoftLabelCE(unittest.TestCase):
         logits = torch.randn(2, 20)
         loss = gaussian_soft_label_ce(logits, gt_loc_ids, loc_token_ids)
         self.assertAlmostEqual(float(loss.item()), 0.0)
+
+
+class TestKLDistilLoss(unittest.TestCase):
+    def test_student_is_optimized_toward_teacher_distribution(self):
+        student_logits = torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+            requires_grad=True,
+        )
+        teacher_logits = torch.tensor(
+            [[[0.0, 4.0, -4.0], [0.0, 0.0, 0.0]]],
+        )
+        mask = torch.tensor([[False, True]])
+
+        loss = compute_kl_distil_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            student_mask_point=mask,
+            teacher_mask_point=mask,
+            student_mask_object=None,
+            teacher_mask_object=None,
+        )
+        loss.backward()
+
+        with torch.no_grad():
+            before = torch.softmax(student_logits[0, 0], dim=-1)
+            step_logits = student_logits[0, 0] - 0.5 * student_logits.grad[0, 0]
+            after = torch.softmax(step_logits, dim=-1)
+            teacher = torch.softmax(teacher_logits[0, 0], dim=-1)
+
+        before_gap = torch.abs(before - teacher).sum()
+        after_gap = torch.abs(after - teacher).sum()
+        self.assertLess(float(after_gap.item()), float(before_gap.item()))
 
 
 class TestComputeAnswerLoss(unittest.TestCase):

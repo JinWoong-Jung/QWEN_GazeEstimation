@@ -12,7 +12,7 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
-  train_reasoning_dir: "data/gazefollow_reason/output/train"
+  train_reasoning_dir: "/home/work/jinwoong/QWEN_GazeEstimation/data/gazefollow_reason_train"
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
@@ -31,7 +31,7 @@ train:
   dtype: "bfloat16"
   gradient_checkpointing: false
   epochs: 20
-  batch_size: 16
+  batch_size: 32
   grad_accum_steps: 8
   num_workers: 8
   lr: 1e-4
@@ -39,11 +39,11 @@ train:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   filter_invalid_object_samples: false
-  train_augmentation_mode_direct: "full"  # "full" | "no_crop" | "color_only" | "crop_only" | "no_aug"
+  train_augmentation_mode_direct: "crop_only"  # "full" | "no_crop" | "color_only" | "crop_only" | "no_aug"
   save_last_every_n_epochs: 5
 
 eval:
-  test_batch_size: 16
+  test_batch_size: 32
   eval_only: false
   test_only: false
   run_val_metrics: true
@@ -60,7 +60,6 @@ prompt:
     Given the image and head box <|box_start|>({loc_x1},{loc_y1}),({loc_x2},{loc_y2})<|box_end|>,
     predict the gaze point and target.
     Return only: <|point_start|>{loc_tok_min}~{loc_tok_max}{loc_tok_min}~{loc_tok_max}<|point_end|><|object_start|>{obj_tok_min}~{obj_tok_max}<|object_end|>
-  teacher_suffix: "\n\nUse the following reasoning to guide your prediction:\n{reasoning_text}\n\nNow apply the same reasoning process to predict the gaze point and target."
 
 model:
   coord_bins: 128
@@ -79,7 +78,7 @@ loss:
   gaussian_point_sigma: 3.0
 
 distil:
-  distil_kl_weight: 0.5  # 0.0 = disabled; >0 adds KL(student||teacher) at point+object positions
+  distil_kl_weight: 2.0  # 0.0 = disabled; >0 adds KL(student||teacher) at point+object positions
 
 wandb:
   enabled: true

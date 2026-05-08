@@ -307,7 +307,6 @@ def build_train_inputs(
             "point_tokens=", int(mask_pt.sum().item()),
             "object_tokens=", int(mask_obj.sum().item()),
             "format_tokens=", int(mask_fmt.sum().item()),
-            "reasoning_tokens=", int(mask_rsn.sum().item()),
             "supervised_samples=", int(supervised.sum().item()),
             "batch=", bsz,
         )

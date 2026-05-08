@@ -768,7 +768,6 @@ def main() -> None:
         raise ValueError(
             f"train.sample_mode must be one of {sorted(_VALID_SAMPLE_MODES)}, got: {sample_mode!r}"
         )
-    print(f"[INFO] sample_mode={sample_mode!r}")
 
     # --- val/test output format ---
     val_test_format = str(getattr(args, "output_format", "direct")).strip().lower()
@@ -784,7 +783,6 @@ def main() -> None:
         _prompt_text_eval = _prompt_text_direct
         _eval_target_order = "point_object"
         _force_eval = False
-    print(f"[INFO] output_format={val_test_format!r} → target_order={_eval_target_order!r}")
 
     # generation_max_new_tokens: auto-bump for reasoning eval
     _gen_max_tokens = int(getattr(args, "generation_max_new_tokens", 8))
@@ -792,10 +790,7 @@ def main() -> None:
         _max_rsn_tokens = int(getattr(args, "max_reasoning_tokens", 80))
         _gen_max_tokens_eval = max(_gen_max_tokens, _max_rsn_tokens + 8)
         if _gen_max_tokens_eval > _gen_max_tokens:
-            print(
-                f"[INFO] output_format='reasoning': generation_max_new_tokens "
-                f"auto-set {_gen_max_tokens} → {_gen_max_tokens_eval}"
-            )
+            pass
     else:
         _gen_max_tokens_eval = _gen_max_tokens
 
@@ -1099,13 +1094,7 @@ def main() -> None:
         reasoning_dir = resolve_path(str(getattr(args, "train_reasoning_dir", "")))
         if reasoning_dir.exists():
             reasoning_index = build_reasoning_index(reasoning_dir)
-            print(
-                f"[INFO] Loaded reasoning index: {len(reasoning_index)} entries "
-                f"({len(reasoning_index)}/{max(1, len(train_records))} train samples)"
-            )
             matched_reasoning = 0
-            reasoning_hits: list[str] = []
-            reasoning_misses: list[str] = []
             for rec in train_records:
                 folder = Path(rec.image_rel).parent.name
                 stem = Path(rec.image_rel).stem
@@ -1113,34 +1102,15 @@ def main() -> None:
                 rpath = reasoning_index.get(key)
                 if rpath is not None:
                     matched_reasoning += 1
-                    if len(reasoning_hits) < 3:
-                        try:
-                            rel_rpath = rpath.relative_to(reasoning_dir)
-                        except ValueError:
-                            rel_rpath = rpath
-                        reasoning_hits.append(f"{key} -> {rel_rpath}")
-                elif len(reasoning_misses) < 3:
-                    reasoning_misses.append(key)
-            missing_reasoning = len(train_records) - matched_reasoning
-            print(
-                "[INFO] Reasoning index match: "
-                f"matched={matched_reasoning}/{len(train_records)} "
-                f"missing={missing_reasoning} "
-                f"hit_ratio={matched_reasoning / max(1, len(train_records)):.6f}"
-            )
-            if reasoning_hits:
-                print("[INFO] Reasoning match examples: " + " ; ".join(reasoning_hits))
-            if reasoning_misses:
-                print("[WARN] Reasoning missing examples: " + " ; ".join(reasoning_misses))
             if matched_reasoning == 0 and len(train_records) > 0:
                 print(
-                    "[WARN] No train records matched the reasoning index. "
-                    "Check that reasoning files are stored as folder/stem_sampleid.txt."
+                    "[WARN] No train records matched auxiliary supervision files. "
+                    "Check that files are stored as folder/stem_sampleid.txt."
                 )
         else:
             print(
-                f"[WARN] sample_mode={sample_mode!r} requires reasoning data "
-                f"but train_reasoning_dir not found: {reasoning_dir}"
+                f"[WARN] sample_mode={sample_mode!r} requires auxiliary supervision data "
+                f"but train_reasoning_dir not found."
             )
 
     _max_reasoning_words = int(getattr(args, "max_reasoning_words", 60))
@@ -1534,8 +1504,7 @@ def main() -> None:
 
     print(
         f"[INFO] structured SFT loss: point_w={loss_weights['point']:.2f} "
-        f"object_w={loss_weights['object']:.2f} format_w={loss_weights['format']:.2f} "
-        f"reasoning_w={loss_weights['reasoning']:.2f}"
+        f"object_w={loss_weights['object']:.2f} format_w={loss_weights['format']:.2f}"
     )
     checkpoint_monitor = str(getattr(args, "checkpoint_monitor", "val_dist")).strip() or "val_dist"
     checkpoint_monitor_mode = infer_checkpoint_monitor_mode(
@@ -1678,13 +1647,12 @@ def main() -> None:
                             "train/loss_point": float(losses["loss_point"].detach().item()),
                             "train/loss_object": float(losses["loss_object"].detach().item()),
                             "train/loss_format": float(losses["loss_format"].detach().item()),
-                            "train/loss_reasoning": float(losses["loss_reasoning"].detach().item()),
                             "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                             "train/grad_norm": grad_norm_value,
                             "train/epoch": epoch_progress,
                         }
                         if distil_kl_weight > 0.0:
-                            log_payload["train/kl_distil"] = float(kl_loss_val.detach().item())
+                            log_payload["train/loss_kl"] = float(kl_loss_val.detach().item())
                         wandb_run.log(log_payload, step=global_step)
 
             sum_loss += float(raw_loss.detach().item()) * float(bsz)
