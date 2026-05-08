@@ -201,11 +201,9 @@ def _run_rl_training(
     rl_top_p = float(getattr(args, "rl_top_p", 0.9))
     rl_epochs = max(1, int(getattr(args, "epochs", 5)))
     rl_max_new_tokens = max(16, int(getattr(args, "generation_max_new_tokens", 16)))
-    _rl_val_format = str(getattr(args, "val_test_output_format", "direct")).strip().lower()
+    _rl_val_format = str(getattr(args, "output_format", "direct")).strip().lower()
     _eval_target_order = (
-        "reasoning_point_object"
-        if _rl_val_format == "reasoning"
-        else str(getattr(args, "constrained_target_order", "point_object"))
+        "reasoning_point_object" if _rl_val_format == "reasoning" else "point_object"
     )
 
     # PPO clipping — asymmetric + dual-clip (Rex-Omni)
@@ -751,8 +749,8 @@ def main() -> None:
     if train_stage not in {"sft", "rl"}:
         raise ValueError(f"train_stage must be 'sft' or 'rl', got: {train_stage!r}")
 
-    # prompt_text_direct: used for point_object views and val/test when val_test_output_format=direct
-    # prompt_text_reasoning: used for reasoning views and val/test when val_test_output_format=reasoning
+    # prompt_text_direct: used for point_object views and val/test when output_format=direct
+    # prompt_text_reasoning: used for reasoning views and val/test when output_format=reasoning
     # Falls back to prompt_text if the dedicated keys are absent
     _prompt_fallback = str(getattr(args, "prompt_text", "") or "")
     _prompt_text_direct = str(getattr(args, "prompt_text_direct", "") or "") or _prompt_fallback
@@ -773,10 +771,10 @@ def main() -> None:
     print(f"[INFO] sample_mode={sample_mode!r}")
 
     # --- val/test output format ---
-    val_test_format = str(getattr(args, "val_test_output_format", "direct")).strip().lower()
+    val_test_format = str(getattr(args, "output_format", "direct")).strip().lower()
     if val_test_format not in {"direct", "reasoning"}:
         raise ValueError(
-            f"eval.val_test_output_format must be 'direct' or 'reasoning', got: {val_test_format!r}"
+            f"eval.output_format must be 'direct' or 'reasoning', got: {val_test_format!r}"
         )
     if val_test_format == "reasoning":
         _prompt_text_eval = _prompt_text_reasoning_view
@@ -786,7 +784,7 @@ def main() -> None:
         _prompt_text_eval = _prompt_text_direct
         _eval_target_order = "point_object"
         _force_eval = False
-    print(f"[INFO] val_test_output_format={val_test_format!r} → target_order={_eval_target_order!r}")
+    print(f"[INFO] output_format={val_test_format!r} → target_order={_eval_target_order!r}")
 
     # generation_max_new_tokens: auto-bump for reasoning eval
     _gen_max_tokens = int(getattr(args, "generation_max_new_tokens", 8))
@@ -795,7 +793,7 @@ def main() -> None:
         _gen_max_tokens_eval = max(_gen_max_tokens, _max_rsn_tokens + 8)
         if _gen_max_tokens_eval > _gen_max_tokens:
             print(
-                f"[INFO] val_test_output_format='reasoning': generation_max_new_tokens "
+                f"[INFO] output_format='reasoning': generation_max_new_tokens "
                 f"auto-set {_gen_max_tokens} → {_gen_max_tokens_eval}"
             )
     else:
@@ -1082,13 +1080,15 @@ def main() -> None:
     )
 
     image_cache_size = max(0, int(getattr(args, "image_cache_size", 0)))
-    train_augmentation_mode = str(getattr(args, "train_augmentation_mode", "full") or "full").strip().lower()
-    _aug_modes = {"full", "crop_flip_color", "default", "color", "color_only", "photometric", "safe", "no_crop", "flip_color", "hflip_color", "none", "no_aug", "off", "false"}
-    if train_augmentation_mode not in _aug_modes:
-        raise ValueError(
-            f"unsupported train_augmentation_mode={train_augmentation_mode!r}; "
-            "expected one of: full, color_only, no_crop, no_aug"
-        )
+    _aug_modes = {"full", "crop_flip_color", "default", "color", "color_only", "photometric", "safe", "no_crop", "flip_color", "hflip_color", "crop_only", "safe_crop", "none", "no_aug", "off", "false"}
+    train_augmentation_mode_direct = str(getattr(args, "train_augmentation_mode_direct", "full") or "full").strip().lower()
+    train_augmentation_mode_reasoning = str(getattr(args, "train_augmentation_mode_reasoning", "full") or "full").strip().lower()
+    for _mode_name, _mode_val in (("train_augmentation_mode_direct", train_augmentation_mode_direct), ("train_augmentation_mode_reasoning", train_augmentation_mode_reasoning)):
+        if _mode_val not in _aug_modes:
+            raise ValueError(
+                f"unsupported {_mode_name}={_mode_val!r}; "
+                "expected one of: full, color_only, no_crop, crop_only, no_aug"
+            )
 
     reasoning_index = None
     _needs_reasoning_index = sample_mode in {"reasoning_only", "direct&reasoning", "direct+reasoning"}
@@ -1158,7 +1158,7 @@ def main() -> None:
             image_cache_size=image_cache_size,
             filter_invalid_object_samples=filter_invalid,
             coord_bins=coord_bins,
-            train_augmentation_mode=train_augmentation_mode,
+            train_augmentation_mode=train_augmentation_mode_direct,
             target_order="point_object",
         )
     elif sample_mode == "reasoning_only":
@@ -1191,7 +1191,7 @@ def main() -> None:
             image_cache_size=image_cache_size,
             filter_invalid_object_samples=filter_invalid,
             coord_bins=coord_bins,
-            train_augmentation_mode=train_augmentation_mode,
+            train_augmentation_mode=train_augmentation_mode_reasoning,
             reasoning_index=reasoning_index,
             max_reasoning_words=_max_reasoning_words,
             max_reasoning_chars=_max_reasoning_chars,
@@ -1217,7 +1217,8 @@ def main() -> None:
             max_reasoning_words=_max_reasoning_words,
             max_reasoning_chars=_max_reasoning_chars,
             reasoning_ratio=_reasoning_view_ratio,
-            train_augmentation_mode=train_augmentation_mode,
+            train_augmentation_mode_direct=train_augmentation_mode_direct,
+            train_augmentation_mode_reasoning=train_augmentation_mode_reasoning,
             seed=int(getattr(args, "seed", 42)),
             sample_mode=sample_mode,
         )
@@ -1244,7 +1245,8 @@ def main() -> None:
     ) if len(train_ds) <= 1000 else -1
     print(
         f"[INFO] structured pipeline: filter_invalid_object_samples={filter_invalid} "
-        f"train_augmentation_mode={train_augmentation_mode} "
+        f"train_augmentation_mode_direct={train_augmentation_mode_direct} "
+        f"train_augmentation_mode_reasoning={train_augmentation_mode_reasoning} "
         f"train_valid_structured={n_train_valid if n_train_valid >= 0 else 'not_counted'}"
     )
     log_target_example("train", train_ds)

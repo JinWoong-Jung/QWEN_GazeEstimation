@@ -11,7 +11,6 @@ from .utils.data_utils import (
     Record,
     TestGroup,
     apply_train_augmentation,
-    apply_safe_augmentation,
     alias_label_text,
     build_prompt,
     sanitize_bbox_pixels,
@@ -186,6 +185,16 @@ class GazeDataset(Dataset):
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
 
+        # Pre-load all reasoning texts at init to avoid per-sample disk I/O during training.
+        self._reasoning_text_cache: dict[str, str] = {}
+        if reasoning_index is not None:
+            for _key, _rpath in reasoning_index.items():
+                _text = load_reasoning_text(_rpath)
+                if _text:
+                    self._reasoning_text_cache[_key] = normalize_reasoning_text(
+                        _text, int(max_reasoning_words), int(max_reasoning_chars)
+                    )
+
         if bool(filter_invalid_object_samples):
             before = len(records)
             self.records = [
@@ -230,21 +239,13 @@ class GazeDataset(Dataset):
         # Probe reasoning BEFORE augmentation so aug policy can depend on it.
         reasoning_text: str | None = None
         has_reasoning_file = False
-        if self.reasoning_index is not None:
+        if self._reasoning_text_cache:
             from pathlib import Path as _Path
             folder = _Path(rec.image_rel).parent.name
             stem = _Path(rec.image_rel).stem
             key = f"{folder}/{stem}_{int(rec.sample_id)}"
-            rpath = self.reasoning_index.get(key)
-            if rpath is not None:
-                reasoning_text = load_reasoning_text(rpath)
-                has_reasoning_file = reasoning_text is not None
-                if reasoning_text:
-                    reasoning_text = normalize_reasoning_text(
-                        reasoning_text,
-                        max_words=self.max_reasoning_words,
-                        max_chars=self.max_reasoning_chars,
-                    )
+            reasoning_text = self._reasoning_text_cache.get(key)
+            has_reasoning_file = reasoning_text is not None
 
         if self.apply_augmentation:
             scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
@@ -346,7 +347,8 @@ class MultiViewGazeDataset(Dataset):
         max_reasoning_words: int = 60,
         max_reasoning_chars: int = 500,
         reasoning_ratio: float = 0.2,
-        train_augmentation_mode: str = "full",
+        train_augmentation_mode_direct: str = "full",
+        train_augmentation_mode_reasoning: str = "full",
         seed: int = 42,
         sample_mode: str = "direct+reasoning",
     ) -> None:
@@ -360,7 +362,8 @@ class MultiViewGazeDataset(Dataset):
         self.vocab2id_lower = vocab2id_lower or {}
         self.num_classes = int(num_classes)
         self.coord_bins = int(coord_bins)
-        self.train_augmentation_mode = str(train_augmentation_mode or "full")
+        self.train_augmentation_mode_direct = str(train_augmentation_mode_direct or "full")
+        self.train_augmentation_mode_reasoning = str(train_augmentation_mode_reasoning or "full")
         self.visual_prompting = bool(visual_prompting)
         self.reasoning_index: dict[str, Any] | None = reasoning_index
         self.max_reasoning_words = int(max_reasoning_words)
@@ -411,6 +414,17 @@ class MultiViewGazeDataset(Dataset):
                 if reasoning_index.get(key) is not None:
                     self._capable.append(i)
 
+        # Pre-load all reasoning texts at init to avoid per-sample disk I/O during training.
+        self._reasoning_text_cache: dict[str, str] = {}
+        if reasoning_index is not None:
+            from pathlib import Path as _Path
+            for _key, _rpath in reasoning_index.items():
+                _text = load_reasoning_text(_rpath)
+                if _text:
+                    self._reasoning_text_cache[_key] = normalize_reasoning_text(
+                        _text, int(max_reasoning_words), int(max_reasoning_chars)
+                    )
+
         self._direct_views: list[tuple[int, str]] = []
         self._reasoning_views: list[tuple[int, str]] = []
         self._build_initial_views()
@@ -429,12 +443,12 @@ class MultiViewGazeDataset(Dataset):
         n_r_actual = min(n_r_target, len(self._capable))
 
         if self._sample_mode == "direct&reasoning":
-            # total = N; direct = N - n_r_actual so total stays N after cap
-            n_d = N - n_r_actual
-            all_indices = list(range(N))
-            direct_indices = self._rng.sample(all_indices, n_d) if n_d < N else all_indices
-            self._direct_views = [(i, "direct") for i in direct_indices]
+            # Partition all N samples: reasoning first (from capable), direct gets the rest.
+            # No overlap, full coverage every epoch.
             reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
+            reasoning_set = set(reasoning_indices)
+            direct_indices = [i for i in range(N) if i not in reasoning_set]
+            self._direct_views = [(i, "direct") for i in direct_indices]
             self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
         else:  # direct+reasoning
             # direct = all N (fixed); reasoning = n_r_actual sampled from capable
@@ -449,12 +463,12 @@ class MultiViewGazeDataset(Dataset):
         n_r_actual = min(n_r_target, len(self._capable))
 
         if self._sample_mode == "direct&reasoning":
-            # Resample both direct and reasoning
-            n_d = N - n_r_actual
-            all_indices = list(range(N))
-            direct_indices = self._rng.sample(all_indices, n_d) if n_d < N else all_indices
-            self._direct_views = [(i, "direct") for i in direct_indices]
+            # Partition all N samples: reasoning first (from capable), direct gets the rest.
+            # No overlap, full coverage every epoch.
             reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
+            reasoning_set = set(reasoning_indices)
+            direct_indices = [i for i in range(N) if i not in reasoning_set]
+            self._direct_views = [(i, "direct") for i in direct_indices]
             self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
         else:  # direct+reasoning: direct fixed, only resample reasoning
             reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
@@ -475,7 +489,6 @@ class MultiViewGazeDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         from pathlib import Path as _Path
-        from .utils.gaze_tokens import normalize_reasoning_text
 
         rec_idx, view_type = self._views[idx]
         rec = self.records[rec_idx]
@@ -495,25 +508,17 @@ class MultiViewGazeDataset(Dataset):
         bbox_px = rec.bbox_px
 
         if view_type == "reasoning":
-            # Reasoning view: safe (color-jitter-only) augmentation — no spatial changes
-            scene, gaze_x, gaze_y, bbox_px = apply_safe_augmentation(
+            scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
                 scene=scene, gaze_x=gaze_x, gaze_y=gaze_y, bbox_px=bbox_px,
+                mode=self.train_augmentation_mode_reasoning,
             )
-            # Load reasoning text lazily; fall back to direct format if file is malformed.
+            # Load reasoning text from pre-loaded cache; fall back to direct if missing.
             reasoning_text: str | None = None
-            if self.reasoning_index is not None:
+            if self._reasoning_text_cache:
                 folder = _Path(rec.image_rel).parent.name
                 stem = _Path(rec.image_rel).stem
                 key = f"{folder}/{stem}_{int(rec.sample_id)}"
-                rpath = self.reasoning_index.get(key)
-                if rpath is not None:
-                    raw = load_reasoning_text(rpath)
-                    if raw:
-                        reasoning_text = normalize_reasoning_text(
-                            raw,
-                            max_words=self.max_reasoning_words,
-                            max_chars=self.max_reasoning_chars,
-                        )
+                reasoning_text = self._reasoning_text_cache.get(key)
             if reasoning_text:
                 # Full schema: <|reasoning_start|>...<|reasoning_end|><|point_start|>...<|object_end|>
                 target_order = "reasoning_point_object"
@@ -529,7 +534,7 @@ class MultiViewGazeDataset(Dataset):
                 gaze_x=gaze_x,
                 gaze_y=gaze_y,
                 bbox_px=bbox_px,
-                mode=self.train_augmentation_mode,
+                mode=self.train_augmentation_mode_direct,
             )
             reasoning_text = None
             target_order = "point_object"

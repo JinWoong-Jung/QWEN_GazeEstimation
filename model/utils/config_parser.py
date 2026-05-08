@@ -149,8 +149,8 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--constrained_decoding", dest="constrained_decoding", action="store_true")
     p.add_argument("--no_constrained_decoding", dest="constrained_decoding", action="store_false")
     p.set_defaults(constrained_decoding=bool(default_value(d, "constrained_decoding", False)))
-    p.add_argument("--constrained_target_order", type=str,
-                   default=str(default_value(d, "constrained_target_order", "point_object")))
+    p.add_argument("--output_format", type=str,
+                   default=str(default_value(d, "output_format", "direct")))
     p.add_argument("--constrained_temperature", type=float,
                    default=float(default_value(d, "constrained_temperature", 1.0)))
     p.add_argument("--constrained_loc_decoding", type=str,
@@ -173,13 +173,13 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_true")
     p.add_argument("--no_filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_false")
     p.set_defaults(filter_invalid_object_samples=bool(default_value(d, "filter_invalid_object_samples", True)))
-    p.add_argument("--train_augmentation_mode", type=str,
-                   default=str(default_value(d, "train_augmentation_mode", "full")))
+    p.add_argument("--train_augmentation_mode_direct", type=str,
+                   default=str(default_value(d, "train_augmentation_mode_direct", "full")))
+    p.add_argument("--train_augmentation_mode_reasoning", type=str,
+                   default=str(default_value(d, "train_augmentation_mode_reasoning", "full")))
     p.add_argument("--train_reasoning_dir", type=str, default=str(default_value(d, "train_reasoning_dir", "")))
     p.add_argument("--sample_mode", type=str,
                    default=str(default_value(d, "sample_mode", "direct_only")))
-    p.add_argument("--val_test_output_format", type=str,
-                   default=str(default_value(d, "val_test_output_format", "direct")))
     # legacy flag kept for backward compat; trainer converts use_reasoning=True → sample_mode=direct+reasoning
     p.add_argument("--use_reasoning", dest="use_reasoning", action="store_true")
     p.add_argument("--no_use_reasoning", dest="use_reasoning", action="store_false")

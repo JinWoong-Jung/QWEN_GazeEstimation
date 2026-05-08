@@ -271,6 +271,12 @@ def apply_train_augmentation(
             contrast=(0.5, 1.5),
             saturation=(0.0, 1.5),
         )
+    elif aug_mode in {"crop_only", "safe_crop"}:
+        # Spatial-only: safe crop with no color or flip changes.
+        # Suitable for reasoning views where the text may reference colors or directions.
+        scene, gaze_x, gaze_y, bbox_px = safe_crop(
+            scene, gaze_x, gaze_y, bbox_px, p=0.8, aspect=1.0,
+        )
     elif aug_mode in {"full", "crop_flip_color", "default"}:
         # Match semgaze train augmentation: square safe crop, horizontal flip,
         # strong color jitter. Resize/normalize are handled by the collator and
@@ -289,7 +295,7 @@ def apply_train_augmentation(
     else:
         raise ValueError(
             f"unsupported train augmentation mode={mode!r}; "
-            "expected one of: full, color_only, no_crop, no_aug"
+            "expected one of: full, color_only, no_crop, crop_only, no_aug"
         )
     nw, nh = scene.size
     x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=nw, height=nh)

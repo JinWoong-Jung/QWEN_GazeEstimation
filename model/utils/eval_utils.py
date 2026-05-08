@@ -329,6 +329,9 @@ def _append_token_to_joint(
     if "attention_mask" in joint and torch.is_tensor(joint["attention_mask"]):
         new_mask = torch.ones_like(token_ids, dtype=joint["attention_mask"].dtype)
         out["attention_mask"] = torch.cat([joint["attention_mask"], new_mask], dim=1)
+    if "mm_token_type_ids" in joint and torch.is_tensor(joint["mm_token_type_ids"]):
+        new_type = torch.zeros_like(token_ids, dtype=joint["mm_token_type_ids"].dtype)
+        out["mm_token_type_ids"] = torch.cat([joint["mm_token_type_ids"], new_type], dim=1)
     return out
 
 
@@ -1153,7 +1156,10 @@ def maybe_save_generation_preview(
         return
 
     _max_new_tokens = max_new_tokens if max_new_tokens is not None else int(getattr(args, "generation_max_new_tokens", 8))
-    _target_order = constrained_target_order if constrained_target_order is not None else str(getattr(args, "constrained_target_order", "point_object"))
+    _fmt = str(getattr(args, "output_format", "direct")).strip().lower()
+    _target_order = constrained_target_order if constrained_target_order is not None else (
+        "reasoning_point_object" if _fmt == "reasoning" else "point_object"
+    )
 
     preview_samples = collect_generation_samples(
         model=model,
