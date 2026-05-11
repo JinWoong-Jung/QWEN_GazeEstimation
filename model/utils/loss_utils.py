@@ -132,11 +132,9 @@ def compute_structured_loss(
     loss_mask_point: torch.Tensor | None,
     loss_mask_object: torch.Tensor | None,
     loss_mask_format: torch.Tensor | None,
-    loss_mask_reasoning: torch.Tensor | None = None,
     weight_point: float = 1.0,
     weight_object: float = 1.0,
     weight_format: float = 0.25,
-    weight_reasoning: float = 0.3,
     compute_format_rate: bool = False,
     loc_token_ids: torch.Tensor | None = None,
     gaussian_sigma: float = 0.0,
@@ -148,8 +146,8 @@ def compute_structured_loss(
     exact-match rate — pass True only at wandb logging steps.
 
     Returns dict with keys:
-        loss, loss_point, loss_object, loss_format, loss_reasoning,
-        n_point_tokens, n_object_tokens, n_format_tokens, n_reasoning_tokens,
+        loss, loss_point, loss_object, loss_format,
+        n_point_tokens, n_object_tokens, n_format_tokens,
         format_valid_rate, n_format_samples
     """
     device = labels.device
@@ -165,11 +163,9 @@ def compute_structured_loss(
             "loss_point": z,
             "loss_object": z,
             "loss_format": z,
-            "loss_reasoning": z,
             "n_point_tokens": 0,
             "n_object_tokens": 0,
             "n_format_tokens": 0,
-            "n_reasoning_tokens": 0,
             "format_valid_rate": z,
             "n_format_samples": 0,
         }
@@ -187,20 +183,17 @@ def compute_structured_loss(
     sm_pt  = _shift_mask(loss_mask_point)
     sm_obj = _shift_mask(loss_mask_object)
     sm_fmt = _shift_mask(loss_mask_format)
-    sm_rsn = _shift_mask(loss_mask_reasoning)
 
     pt_valid  = sm_pt  & not_padding
     obj_valid = sm_obj & not_padding
     fmt_valid = sm_fmt & not_padding
-    rsn_valid = sm_rsn & not_padding
 
     n_pt  = int(pt_valid.sum().item())
     n_obj = int(obj_valid.sum().item())
     n_fmt = int(fmt_valid.sum().item())
-    n_rsn = int(rsn_valid.sum().item())
 
     # Build union mask and compute CE exactly once on valid token positions.
-    valid_union = (sm_pt | sm_obj | sm_fmt | sm_rsn) & not_padding   # [B, L-1]
+    valid_union = (sm_pt | sm_obj | sm_fmt) & not_padding   # [B, L-1]
 
     if valid_union.any():
         ce_valid = F.cross_entropy(
@@ -239,9 +232,8 @@ def compute_structured_loss(
 
         l_obj = _cat_mean(obj_valid, n_obj)
         l_fmt = _cat_mean(fmt_valid, n_fmt)
-        l_rsn = _cat_mean(rsn_valid, n_rsn)
     else:
-        l_pt = l_obj = l_fmt = l_rsn = z
+        l_pt = l_obj = l_fmt = z
 
     fmt_valid_rate, n_fmt_samples = (
         masked_sample_exact_rate(logits, labels, loss_mask_format)
@@ -249,7 +241,7 @@ def compute_structured_loss(
         else (z, 0)
     )
 
-    wp, wo, wf, wr = float(weight_point), float(weight_object), float(weight_format), float(weight_reasoning)
+    wp, wo, wf = float(weight_point), float(weight_object), float(weight_format)
     total = z
     if n_pt > 0:
         total = total + wp * l_pt
@@ -257,19 +249,15 @@ def compute_structured_loss(
         total = total + wo * l_obj
     if n_fmt > 0:
         total = total + wf * l_fmt
-    if n_rsn > 0:
-        total = total + wr * l_rsn
 
     return {
         "loss": total,
         "loss_point": l_pt,
         "loss_object": l_obj,
         "loss_format": l_fmt,
-        "loss_reasoning": l_rsn,
         "n_point_tokens": int(n_pt),
         "n_object_tokens": int(n_obj),
         "n_format_tokens": int(n_fmt),
-        "n_reasoning_tokens": int(n_rsn),
         "format_valid_rate": fmt_valid_rate,
         "n_format_samples": int(n_fmt_samples),
     }
@@ -283,15 +271,21 @@ def compute_kl_distil_loss(
     student_mask_object: torch.Tensor | None,
     teacher_mask_object: torch.Tensor | None,
     has_distil: torch.Tensor | None = None,
+    loc_token_ids: torch.Tensor | None = None,
+    object_token_ids: torch.Tensor | None = None,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
-    """Distillation KL KL(teacher||student) at point+object token positions.
+    """SDFT forward KL KL(teacher||student) at point+object token positions.
 
     Student and teacher sequences have different lengths (teacher prompt is longer),
     so masks are extracted per-sample and aligned by token order within each sample.
+    When slot token IDs are provided, point KL is restricted to loc tokens and
+    object KL is restricted to object tokens instead of the full language vocab.
     """
     z = torch.zeros((), device=student_logits.device, dtype=student_logits.dtype)
     if student_logits is None or teacher_logits is None:
         return z
+    temp = max(float(temperature), 1e-6)
 
     # Causal shift: logit[i] predicts token[i+1]
     s_shift = student_logits[:, :-1, :]  # [B, Ls-1, V]
@@ -307,7 +301,97 @@ def compute_kl_distil_loss(
     tm_pt = _shift_mask(teacher_mask_point, teacher_logits.device)
     tm_obj = _shift_mask(teacher_mask_object, teacher_logits.device)
 
-    # Build union mask per model
+    B = s_shift.shape[0]
+
+    def _restrict_ids(ids: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+        if ids is None or not torch.is_tensor(ids) or ids.numel() == 0:
+            return None
+        out = ids.to(device=device, dtype=torch.long).view(-1)
+        return out[(out >= 0) & (out < student_logits.shape[-1])]
+
+    loc_ids = _restrict_ids(loc_token_ids, s_shift.device)
+    obj_ids = _restrict_ids(object_token_ids, s_shift.device)
+    hd = has_distil.to(device=s_shift.device, dtype=torch.bool) if has_distil is not None else None
+
+    def _slot_kl(
+        s_mask: torch.Tensor | None,
+        t_mask: torch.Tensor | None,
+        token_ids: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if s_mask is None or t_mask is None:
+            return None
+
+        s_logits_list: list[torch.Tensor] = []
+        t_logits_list: list[torch.Tensor] = []
+        for i in range(B):
+            if hd is not None and not bool(hd[i].item()):
+                continue
+            sm_i = s_mask[i]
+            tm_i = t_mask[i]
+            n_s = int(sm_i.sum().item())
+            n_t = int(tm_i.sum().item())
+            if n_s == 0 or n_t == 0 or n_s != n_t:
+                continue
+            s_i = s_shift[i][sm_i]
+            t_i = t_shift[i][tm_i]
+            if token_ids is not None and token_ids.numel() > 0:
+                s_i = s_i.index_select(dim=-1, index=token_ids)
+                t_i = t_i.index_select(dim=-1, index=token_ids)
+            s_logits_list.append(s_i)
+            t_logits_list.append(t_i)
+
+        if not s_logits_list:
+            return None
+
+        s_cat = torch.cat(s_logits_list, dim=0)
+        t_cat = torch.cat(t_logits_list, dim=0).detach()
+        student_logp = F.log_softmax(s_cat / temp, dim=-1)
+        teacher_logp = F.log_softmax(t_cat / temp, dim=-1)
+        return (
+            teacher_logp.exp() * (teacher_logp - student_logp)
+        ).sum(dim=-1).mean() * (temp * temp)
+
+    slot_losses = [
+        loss for loss in (
+            _slot_kl(sm_pt, tm_pt, loc_ids),
+            _slot_kl(sm_obj, tm_obj, obj_ids),
+        )
+        if loss is not None
+    ]
+    if not slot_losses:
+        return z
+
+    return torch.stack(slot_losses).mean()
+
+
+def compute_kl_distil_loss_legacy_union(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    student_mask_point: torch.Tensor | None,
+    teacher_mask_point: torch.Tensor | None,
+    student_mask_object: torch.Tensor | None,
+    teacher_mask_object: torch.Tensor | None,
+    has_distil: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Teacher-forcing SDFT forward KL KL(teacher||student) over point/object union masks."""
+    z = torch.zeros((), device=student_logits.device, dtype=student_logits.dtype)
+    if student_logits is None or teacher_logits is None:
+        return z
+
+    # Causal shift: logit[i] predicts token[i+1]
+    s_shift = student_logits[:, :-1, :]
+    t_shift = teacher_logits[:, :-1, :]
+
+    def _shift_mask(m: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+        if m is None or not torch.is_tensor(m) or m.dim() != 2:
+            return None
+        return m.to(device=device, dtype=torch.bool)[:, 1:]
+
+    sm_pt = _shift_mask(student_mask_point, student_logits.device)
+    sm_obj = _shift_mask(student_mask_object, student_logits.device)
+    tm_pt = _shift_mask(teacher_mask_point, teacher_logits.device)
+    tm_obj = _shift_mask(teacher_mask_object, teacher_logits.device)
+
     B = s_shift.shape[0]
     s_union = torch.zeros(s_shift.shape[:2], dtype=torch.bool, device=s_shift.device)
     t_union = torch.zeros(t_shift.shape[:2], dtype=torch.bool, device=t_shift.device)
@@ -325,31 +409,26 @@ def compute_kl_distil_loss(
         s_union[~hd] = False
         t_union[~hd] = False
 
-    # Collect matched logits per sample (student and teacher may have different seq lengths)
     s_logits_list: list[torch.Tensor] = []
     t_logits_list: list[torch.Tensor] = []
     for i in range(B):
-        sm_i = s_union[i]  # [Ls-1]
-        tm_i = t_union[i]  # [Lt-1]
+        sm_i = s_union[i]
+        tm_i = t_union[i]
         n_s = int(sm_i.sum().item())
         n_t = int(tm_i.sum().item())
         if n_s == 0 or n_t == 0 or n_s != n_t:
             continue
-        s_logits_list.append(s_shift[i][sm_i])  # [n_ans, V]
-        t_logits_list.append(t_shift[i][tm_i])  # [n_ans, V]
+        s_logits_list.append(s_shift[i][sm_i])
+        t_logits_list.append(t_shift[i][tm_i])
 
     if not s_logits_list:
         return z
 
-    s_cat = torch.cat(s_logits_list, dim=0)           # [N_total, V]
-    t_cat = torch.cat(t_logits_list, dim=0).detach()  # [N_total, V]
-
-    return F.kl_div(
-        F.log_softmax(s_cat, dim=-1),
-        F.softmax(t_cat, dim=-1),
-        reduction="batchmean",
-        log_target=False,
-    )
+    s_cat = torch.cat(s_logits_list, dim=0)
+    t_cat = torch.cat(t_logits_list, dim=0).detach()
+    student_logp = F.log_softmax(s_cat, dim=-1)
+    teacher_logp = F.log_softmax(t_cat, dim=-1)
+    return (teacher_logp.exp() * (teacher_logp - student_logp)).sum(dim=-1).mean()
 
 
 def compute_answer_loss(
@@ -360,12 +439,10 @@ def compute_answer_loss(
     loss_mask_point: torch.Tensor | None = None,
     loss_mask_object: torch.Tensor | None = None,
     loss_mask_format: torch.Tensor | None = None,
-    loss_mask_reasoning: torch.Tensor | None = None,
     weight_answer: float = 1.0,
     weight_point: float = 1.0,
     weight_object: float = 1.0,
     weight_format: float = 0.25,
-    weight_reasoning: float = 0.3,
     compute_format_rate: bool = False,
     loc_token_ids: torch.Tensor | None = None,
     gaussian_sigma: float = 0.0,
@@ -374,8 +451,7 @@ def compute_answer_loss(
     else fall back to full-answer CE (legacy).
 
     Returns dict with keys: loss, loss_point, loss_object, loss_format,
-    loss_reasoning, loss_answer, n_point_tokens, n_object_tokens,
-    n_format_tokens, n_reasoning_tokens, n_answer_tokens.
+    loss_answer, n_point_tokens, n_object_tokens, n_format_tokens, n_answer_tokens.
     """
     device = labels.device
     dtype = torch.float32
@@ -396,11 +472,9 @@ def compute_answer_loss(
             loss_mask_point=loss_mask_point,
             loss_mask_object=loss_mask_object,
             loss_mask_format=loss_mask_format,
-            loss_mask_reasoning=loss_mask_reasoning,
             weight_point=float(weight_point),
             weight_object=float(weight_object),
             weight_format=float(weight_format),
-            weight_reasoning=float(weight_reasoning),
             compute_format_rate=compute_format_rate,
             loc_token_ids=loc_token_ids,
             gaussian_sigma=float(gaussian_sigma),
@@ -408,7 +482,7 @@ def compute_answer_loss(
         d["loss_answer"] = d["loss"]
         d["n_answer_tokens"] = (
             d["n_point_tokens"] + d["n_object_tokens"]
-            + d["n_format_tokens"] + d["n_reasoning_tokens"]
+            + d["n_format_tokens"]
         )
         return d
 
@@ -427,12 +501,10 @@ def compute_answer_loss(
         "loss_point": z,
         "loss_object": z,
         "loss_format": z,
-        "loss_reasoning": z,
         "n_answer_tokens": int(n_answer),
         "n_point_tokens": 0,
         "n_object_tokens": 0,
         "n_format_tokens": 0,
-        "n_reasoning_tokens": 0,
         "format_valid_rate": z,
         "n_format_samples": 0,
     }

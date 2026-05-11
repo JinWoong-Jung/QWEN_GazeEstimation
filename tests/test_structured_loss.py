@@ -198,6 +198,33 @@ class TestGaussianSoftLabelCE(unittest.TestCase):
 
 
 class TestKLDistilLoss(unittest.TestCase):
+    def test_kl_direction_is_teacher_to_student(self):
+        student_logits = torch.tensor(
+            [[[2.0, 0.0, -1.0], [0.0, 0.0, 0.0]]],
+            requires_grad=True,
+        )
+        teacher_logits = torch.tensor(
+            [[[-1.0, 1.5, 0.5], [0.0, 0.0, 0.0]]],
+        )
+        mask = torch.tensor([[False, True]])
+
+        loss = compute_kl_distil_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            student_mask_point=mask,
+            teacher_mask_point=mask,
+            student_mask_object=None,
+            teacher_mask_object=None,
+        )
+
+        student_logp = torch.log_softmax(student_logits[0, 0], dim=-1)
+        teacher_logp = torch.log_softmax(teacher_logits[0, 0], dim=-1)
+        expected = (teacher_logp.exp() * (teacher_logp - student_logp)).sum()
+        opposite = (student_logp.exp() * (student_logp - teacher_logp)).sum()
+
+        self.assertAlmostEqual(float(loss.item()), float(expected.item()), places=6)
+        self.assertNotAlmostEqual(float(loss.item()), float(opposite.item()), places=3)
+
     def test_student_is_optimized_toward_teacher_distribution(self):
         student_logits = torch.tensor(
             [[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]],
@@ -227,6 +254,28 @@ class TestKLDistilLoss(unittest.TestCase):
         before_gap = torch.abs(before - teacher).sum()
         after_gap = torch.abs(after - teacher).sum()
         self.assertLess(float(after_gap.item()), float(before_gap.item()))
+
+    def test_point_subset_ignores_non_loc_vocab(self):
+        student_logits = torch.tensor(
+            [[[10.0, 1.0, 2.0, -10.0, -10.0], [0.0, 0.0, 0.0, 0.0, 0.0]]],
+            requires_grad=True,
+        )
+        teacher_logits = torch.tensor(
+            [[[-10.0, 1.0, 2.0, 10.0, -10.0], [0.0, 0.0, 0.0, 0.0, 0.0]]],
+        )
+        mask = torch.tensor([[False, True]])
+
+        loss = compute_kl_distil_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            student_mask_point=mask,
+            teacher_mask_point=mask,
+            student_mask_object=None,
+            teacher_mask_object=None,
+            loc_token_ids=torch.tensor([1, 2], dtype=torch.long),
+        )
+
+        self.assertAlmostEqual(float(loss.item()), 0.0, places=6)
 
 
 class TestComputeAnswerLoss(unittest.TestCase):

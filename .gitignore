@@ -1,6 +1,7 @@
 # =========================
 # Dataset / Large Artifacts
 # =========================
+/data
 data/
 checkpoints/
 outputs/

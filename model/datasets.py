@@ -13,13 +13,12 @@ from .utils.data_utils import (
     apply_train_augmentation,
     alias_label_text,
     build_prompt,
+    load_reasoning_record,
     sanitize_bbox_pixels,
-    load_reasoning_text,
 )
 from .utils.gaze_tokens import (
     GAZE_OBJ_UNKNOWN,
     build_structured_target_text,
-    normalize_reasoning_text,
     quantize_coord,
 )
 
@@ -47,44 +46,40 @@ class _ImageLRUCache:
 
 
 class _ReasoningTextLRUCache:
-    """Lazy LRU cache for normalized reasoning text, keyed by reasoning index key."""
+    """Lazy cache for SDFT teacher-demonstration text."""
 
     def __init__(
         self,
         index: dict[str, Any] | None,
         *,
-        max_words: int,
-        max_chars: int,
         maxsize: int = 8192,
     ) -> None:
         self._index = index or {}
-        self._cache: OrderedDict[str, str | None] = OrderedDict()
-        self._max_words = int(max_words)
-        self._max_chars = int(max_chars)
+        self._cache: OrderedDict[str, dict[str, str | None]] = OrderedDict()
         self._maxsize = max(1, int(maxsize))
 
     def __bool__(self) -> bool:
         return bool(self._index)
 
-    def has_key(self, key: str) -> bool:
-        return key in self._index
-
-    def get(self, key: str) -> str | None:
+    def get(self, key: str) -> dict[str, str | None]:
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
-
         path = self._index.get(key)
-        text: str | None = None
-        if path is not None:
-            raw = load_reasoning_text(path)
-            if raw:
-                text = normalize_reasoning_text(raw, self._max_words, self._max_chars)
-
+        raw = load_reasoning_record(path) if path is not None else {}
+        record = {
+            "object_text": _normalize_aux_text(raw.get("object_text")),
+            "reasoning_text": _normalize_aux_text(raw.get("reasoning_text")),
+        }
         if len(self._cache) >= self._maxsize:
             self._cache.popitem(last=False)
-        self._cache[key] = text
-        return text
+        self._cache[key] = record
+        return record
+
+
+def _normalize_aux_text(text: str | None) -> str | None:
+    text = " ".join(str(text or "").split())
+    return text or None
 
 
 def _reasoning_key(image_rel: str, sample_id: int) -> str:
@@ -126,9 +121,7 @@ def format_structured_target_text(
     point_x: float,
     point_y: float,
     coord_bins: int = 1000,
-    reasoning_text: str | None = None,
-    force_reasoning_format: bool = False,
-    target_order: str = "object_point",
+    target_order: str = "point_object",
 ) -> tuple[str, int, float, float]:
     """Build structured target text.
 
@@ -157,9 +150,7 @@ def format_structured_target_text(
         num_classes=int(num_classes),
         obj_token=obj_tok,
         coord_bins=int(coord_bins),
-        target_order=str(target_order or "object_point"),
-        reasoning_text=reasoning_text,
-        force_reasoning_format=bool(force_reasoning_format),
+        target_order=str(target_order or "point_object"),
     )
 
     return text, obj_id, 1.0, 1.0 if obj_id >= 0 else 0.0
@@ -194,6 +185,7 @@ class GazeDataset(Dataset):
         records: list[Record],
         prompt_template: str,
         prompt_text: str = "",
+        prompt_text_teacher: str = "",
         apply_augmentation: bool = False,
         id2label: dict[int, str] | None = None,
         vocab2id: dict[str, int] | None = None,
@@ -204,11 +196,8 @@ class GazeDataset(Dataset):
         filter_invalid_object_samples: bool = True,
         coord_bins: int = 1000,
         train_augmentation_mode: str = "full",
+        target_order: str = "point_object",
         reasoning_index: dict[str, Any] | None = None,
-        force_reasoning_format: bool = False,
-        target_order: str = "reasoning_object_point",
-        max_reasoning_words: int = 60,
-        max_reasoning_chars: int = 500,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -216,6 +205,7 @@ class GazeDataset(Dataset):
     ) -> None:
         self.prompt_template = str(prompt_template or "")
         self.prompt_text = str(prompt_text or "")
+        self.prompt_text_teacher = str(prompt_text_teacher or "")
         self.apply_augmentation = bool(apply_augmentation)
         self.id2label = id2label or {}
         self.vocab2id = vocab2id or {}
@@ -224,20 +214,11 @@ class GazeDataset(Dataset):
         self.coord_bins = int(coord_bins)
         self.train_augmentation_mode = str(train_augmentation_mode or "full")
         self.visual_prompting = bool(visual_prompting)
-        self.reasoning_index: dict[str, Any] | None = reasoning_index
-        self.force_reasoning_format = bool(force_reasoning_format)
-        self.target_order = str(target_order or "reasoning_object_point")
-        self.max_reasoning_words = int(max_reasoning_words)
-        self.max_reasoning_chars = int(max_reasoning_chars)
+        self.target_order = str(target_order or "point_object")
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
-
-        self._reasoning_text_cache = _ReasoningTextLRUCache(
-            reasoning_index,
-            max_words=int(max_reasoning_words),
-            max_chars=int(max_reasoning_chars),
-        )
+        self._reasoning_text_cache = _ReasoningTextLRUCache(reasoning_index)
 
         if bool(filter_invalid_object_samples):
             before = len(records)
@@ -279,14 +260,14 @@ class GazeDataset(Dataset):
         gaze_x = float(rec.gaze_x)
         gaze_y = float(rec.gaze_y)
         bbox_px = rec.bbox_px
-
-        # Probe reasoning BEFORE augmentation so aug policy can depend on it.
         reasoning_text: str | None = None
-        has_reasoning_file = False
+        object_text: str | None = None
         if self._reasoning_text_cache:
-            key = _reasoning_key(str(rec.image_rel), int(rec.sample_id))
-            reasoning_text = self._reasoning_text_cache.get(key)
-            has_reasoning_file = reasoning_text is not None
+            reasoning_record = self._reasoning_text_cache.get(
+                _reasoning_key(str(rec.image_rel), int(rec.sample_id))
+            )
+            reasoning_text = reasoning_record.get("reasoning_text")
+            object_text = reasoning_record.get("object_text")
 
         if self.apply_augmentation:
             scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
@@ -310,6 +291,14 @@ class GazeDataset(Dataset):
             point_decimals=4,
             coord_bins=self.coord_bins,
         )
+        prompt_teacher = build_prompt(
+            bbox_norm,
+            self.prompt_template,
+            self.prompt_text_teacher,
+            num_classes=self.num_classes,
+            point_decimals=4,
+            coord_bins=self.coord_bins,
+        ) if self.prompt_text_teacher else prompt
 
         resolved_label_text = str(rec.label_text or "").strip()
         if (not resolved_label_text) and int(rec.label_id) >= 0:
@@ -325,8 +314,6 @@ class GazeDataset(Dataset):
             point_x=float(gaze_x),
             point_y=float(gaze_y),
             coord_bins=self.coord_bins,
-            reasoning_text=reasoning_text,
-            force_reasoning_format=self.force_reasoning_format,
             target_order=self.target_order,
         )
 
@@ -350,284 +337,9 @@ class GazeDataset(Dataset):
             "gt_points": torch.tensor([[float(gaze_x), float(gaze_y)]], dtype=torch.float32),
             "target_label_text": resolved_label_text,
             "image_rel": str(rec.image_rel),
+            "object_text": object_text or resolved_label_text,
             "reasoning_text": reasoning_text or "",
-            "has_reasoning": has_reasoning_file,
-        }
-
-
-class MultiViewGazeDataset(Dataset):
-    """Mixed direct/reasoning dataset supporting four sample modes.
-
-    sample_mode options:
-    - "direct&reasoning": total size = N; split is (1-ratio)*N direct + ratio*N reasoning.
-      When capable < ratio*N, reasoning is capped and direct is boosted so total stays N.
-      Both views are resampled every epoch.
-    - "direct+reasoning": all N records as direct + ratio*N reasoning appended per epoch.
-      Total per epoch = N * (1 + ratio). Only reasoning views are resampled each epoch.
-
-    Direct views use the configured train augmentation and point_object target order.
-    Reasoning views use safe augmentation (color jitter only) and reasoning_point_object
-    target order (full schema: reasoning + point + object).
-    """
-
-    def __init__(
-        self,
-        records: list[Record],
-        prompt_template: str,
-        prompt_text_direct: str,
-        prompt_text_reasoning: str,
-        id2label: dict[int, str] | None = None,
-        vocab2id: dict[str, int] | None = None,
-        vocab2id_lower: dict[str, int] | None = None,
-        num_classes: int = 0,
-        visual_prompting: bool = False,
-        image_cache_size: int = 0,
-        filter_invalid_object_samples: bool = True,
-        coord_bins: int = 1000,
-        reasoning_index: dict[str, Any] | None = None,
-        max_reasoning_words: int = 60,
-        max_reasoning_chars: int = 500,
-        reasoning_ratio: float = 0.2,
-        train_augmentation_mode_direct: str = "full",
-        train_augmentation_mode_reasoning: str = "full",
-        seed: int = 42,
-        sample_mode: str = "direct+reasoning",
-    ) -> None:
-        self.prompt_template = str(prompt_template or "")
-        self.prompt_text_direct = str(prompt_text_direct or "")
-        self.prompt_text_reasoning = str(prompt_text_reasoning or "")
-        self.id2label = id2label or {}
-        self.vocab2id = vocab2id or {}
-        self.vocab2id_lower = vocab2id_lower or {}
-        self.num_classes = int(num_classes)
-        self.coord_bins = int(coord_bins)
-        self.train_augmentation_mode_direct = str(train_augmentation_mode_direct or "full")
-        self.train_augmentation_mode_reasoning = str(train_augmentation_mode_reasoning or "full")
-        self.visual_prompting = bool(visual_prompting)
-        self.reasoning_index: dict[str, Any] | None = reasoning_index
-        self.max_reasoning_words = int(max_reasoning_words)
-        self.max_reasoning_chars = int(max_reasoning_chars)
-        self._image_cache: _ImageLRUCache | None = (
-            _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
-        )
-        self._sample_mode = str(sample_mode or "direct+reasoning").strip()
-        if self._sample_mode not in {"direct&reasoning", "direct+reasoning"}:
-            raise ValueError(
-                f"MultiViewGazeDataset sample_mode must be 'direct&reasoning' or 'direct+reasoning', "
-                f"got: {self._sample_mode!r}"
-            )
-
-        if bool(filter_invalid_object_samples):
-            before = len(records)
-            records = [
-                r for r in records
-                if _resolve_obj_id(
-                    label_text=str(r.label_text or "").strip(),
-                    label_id=int(r.label_id),
-                    id2label=self.id2label,
-                    vocab2id=self.vocab2id,
-                    vocab2id_lower=self.vocab2id_lower,
-                    num_classes=self.num_classes,
-                ) >= 0
-            ]
-            dropped = before - len(records)
-            if dropped > 0:
-                print(
-                    f"[INFO] MultiViewGazeDataset: filtered {dropped}/{before} records "
-                    f"with invalid object labels"
-                )
-        self.records = records
-        N = len(self.records)
-
-        import random as _random_mod
-        self._rng = _random_mod.Random(int(seed))
-        self._reasoning_ratio: float = float(reasoning_ratio)
-
-        # Build list of record indices that have reasoning files
-        self._capable: list[int] = []
-        if reasoning_index is not None:
-            for i, rec in enumerate(self.records):
-                key = _reasoning_key(str(rec.image_rel), int(rec.sample_id))
-                if reasoning_index.get(key) is not None:
-                    self._capable.append(i)
-
-        self._reasoning_text_cache = _ReasoningTextLRUCache(
-            reasoning_index,
-            max_words=int(max_reasoning_words),
-            max_chars=int(max_reasoning_chars),
-        )
-
-        self._direct_views: list[tuple[int, str]] = []
-        self._reasoning_views: list[tuple[int, str]] = []
-        self._build_initial_views()
-        self._views: list[tuple[int, str]] = self._direct_views + self._reasoning_views
-
-        n_d, n_r = len(self._direct_views), len(self._reasoning_views)
-        print(
-            f"[INFO] MultiViewGazeDataset ({self._sample_mode}): "
-            f"{n_d} direct views + {n_r} reasoning views = {n_d + n_r} total "
-            f"(capable={len(self._capable)}, ratio={self._reasoning_ratio:.2f})"
-        )
-
-    def _build_initial_views(self) -> None:
-        N = len(self.records)
-        n_r_target = max(0, int(round(N * self._reasoning_ratio)))
-        n_r_actual = min(n_r_target, len(self._capable))
-
-        if self._sample_mode == "direct&reasoning":
-            # Partition all N samples: reasoning first (from capable), direct gets the rest.
-            # No overlap, full coverage every epoch.
-            reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
-            reasoning_set = set(reasoning_indices)
-            direct_indices = [i for i in range(N) if i not in reasoning_set]
-            self._direct_views = [(i, "direct") for i in direct_indices]
-            self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
-        else:  # direct+reasoning
-            # direct = all N (fixed); reasoning = n_r_actual sampled from capable
-            self._direct_views = [(i, "direct") for i in range(N)]
-            reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
-            self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
-
-    def resample_epoch_views(self) -> None:
-        """Resample views at the start of each epoch."""
-        N = len(self.records)
-        n_r_target = max(0, int(round(N * self._reasoning_ratio)))
-        n_r_actual = min(n_r_target, len(self._capable))
-
-        if self._sample_mode == "direct&reasoning":
-            # Partition all N samples: reasoning first (from capable), direct gets the rest.
-            # No overlap, full coverage every epoch.
-            reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
-            reasoning_set = set(reasoning_indices)
-            direct_indices = [i for i in range(N) if i not in reasoning_set]
-            self._direct_views = [(i, "direct") for i in direct_indices]
-            self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
-        else:  # direct+reasoning: direct fixed, only resample reasoning
-            reasoning_indices = self._rng.sample(self._capable, n_r_actual) if n_r_actual > 0 else []
-            self._reasoning_views = [(i, "reasoning") for i in reasoning_indices]
-
-        self._views = self._direct_views + self._reasoning_views
-
-    # backward-compat alias kept for callers using the old name
-    def resample_reasoning_views(self) -> None:
-        self.resample_epoch_views()
-
-    def get_view_counts(self) -> tuple[int, int]:
-        """Return (n_direct, n_reasoning) view counts."""
-        return len(self._direct_views), len(self._reasoning_views)
-
-    def __len__(self) -> int:
-        return len(self._views)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        rec_idx, view_type = self._views[idx]
-        rec = self.records[rec_idx]
-
-        path_str = str(rec.image_path)
-        scene: Image.Image | None = None
-        if self._image_cache is not None:
-            scene = self._image_cache.get(path_str)
-        if scene is None:
-            with Image.open(rec.image_path) as img:
-                scene = img.convert("RGB")
-            if self._image_cache is not None:
-                self._image_cache.put(path_str, scene)
-
-        gaze_x = float(rec.gaze_x)
-        gaze_y = float(rec.gaze_y)
-        bbox_px = rec.bbox_px
-
-        if view_type == "reasoning":
-            scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
-                scene=scene, gaze_x=gaze_x, gaze_y=gaze_y, bbox_px=bbox_px,
-                mode=self.train_augmentation_mode_reasoning,
-            )
-            # Load reasoning text from pre-loaded cache; fall back to direct if missing.
-            reasoning_text: str | None = None
-            if self._reasoning_text_cache:
-                key = _reasoning_key(str(rec.image_rel), int(rec.sample_id))
-                reasoning_text = self._reasoning_text_cache.get(key)
-            if reasoning_text:
-                # Full schema: <|reasoning_start|>...<|reasoning_end|><|point_start|>...<|object_end|>
-                target_order = "reasoning_point_object"
-                prompt_text = self.prompt_text_reasoning
-            else:
-                # Malformed or missing reasoning content → treat as direct view
-                target_order = "point_object"
-                prompt_text = self.prompt_text_direct
-        else:
-            # Direct view: configured train augmentation
-            scene, gaze_x, gaze_y, bbox_px = apply_train_augmentation(
-                scene=scene,
-                gaze_x=gaze_x,
-                gaze_y=gaze_y,
-                bbox_px=bbox_px,
-                mode=self.train_augmentation_mode_direct,
-            )
-            reasoning_text = None
-            target_order = "point_object"
-            prompt_text = self.prompt_text_direct
-
-        w, h = scene.size
-        x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
-        if self.visual_prompting:
-            scene = draw_head_bbox_prompt(scene, x1=x1, y1=y1, x2=x2, y2=y2)
-        bbox_norm = (x1 / w, y1 / h, x2 / w, y2 / h)
-        prompt = build_prompt(
-            bbox_norm,
-            self.prompt_template,
-            prompt_text,
-            num_classes=self.num_classes,
-            point_decimals=4,
-            coord_bins=self.coord_bins,
-        )
-
-        resolved_label_text = str(rec.label_text or "").strip()
-        if (not resolved_label_text) and int(rec.label_id) >= 0:
-            resolved_label_text = str(self.id2label.get(int(rec.label_id), "")).strip()
-
-        target_text, obj_id, target_text_valid, target_object_valid = format_structured_target_text(
-            label_text=resolved_label_text,
-            label_id=int(rec.label_id),
-            id2label=self.id2label,
-            vocab2id=self.vocab2id,
-            vocab2id_lower=self.vocab2id_lower,
-            num_classes=self.num_classes,
-            point_x=float(gaze_x),
-            point_y=float(gaze_y),
-            coord_bins=self.coord_bins,
-            reasoning_text=reasoning_text,
-            force_reasoning_format=False,
-            target_order=target_order,
-        )
-
-        bx = quantize_coord(float(gaze_x), bins=self.coord_bins)
-        by = quantize_coord(float(gaze_y), bins=self.coord_bins)
-
-        # reasoning_point_object views contain the full schema, so point/object are always valid.
-        point_valid = 1.0
-        object_valid = float(target_object_valid)
-
-        return {
-            "scene_image": scene,
-            "text_input": prompt,
-            "target_text": target_text,
-            "target_text_valid": torch.tensor(target_text_valid, dtype=torch.float32),
-            "target_point_valid": torch.tensor(point_valid, dtype=torch.float32),
-            "target_object_valid": torch.tensor(object_valid, dtype=torch.float32),
-            "target_label": int(rec.label_id),
-            "target_label_ids": [int(obj_id)] if int(obj_id) >= 0 else [],
-            "target_point": torch.tensor([float(gaze_x), float(gaze_y)], dtype=torch.float32),
-            "target_point_bin": torch.tensor([bx, by], dtype=torch.long),
-            "target_object_id": torch.tensor(max(0, obj_id), dtype=torch.long),
-            "target_structured_valid": torch.tensor(target_text_valid, dtype=torch.float32),
-            "target_format_valid": torch.tensor(1.0, dtype=torch.float32),
-            "gt_points": torch.tensor([[float(gaze_x), float(gaze_y)]], dtype=torch.float32),
-            "target_label_text": resolved_label_text,
-            "image_rel": str(rec.image_rel),
-            "reasoning_text": reasoning_text or "",
-            "has_reasoning": reasoning_text is not None,
-            "view_type": view_type,
+            "text_input_teacher": prompt_teacher,
         }
 
 
@@ -644,8 +356,7 @@ class GazeTestDataset(Dataset):
         visual_prompting: bool = False,
         image_cache_size: int = 0,
         coord_bins: int = 1000,
-        force_reasoning_format: bool = False,
-        target_order: str = "object_point",
+        target_order: str = "point_object",
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -660,8 +371,7 @@ class GazeTestDataset(Dataset):
         self.num_classes = int(num_classes)
         self.coord_bins = int(coord_bins)
         self.visual_prompting = bool(visual_prompting)
-        self.force_reasoning_format = bool(force_reasoning_format)
-        self.target_order = str(target_order or "object_point")
+        self.target_order = str(target_order or "point_object")
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
@@ -710,7 +420,6 @@ class GazeTestDataset(Dataset):
             point_x=px,
             point_y=py,
             coord_bins=self.coord_bins,
-            force_reasoning_format=self.force_reasoning_format,
             target_order=self.target_order,
         )
 

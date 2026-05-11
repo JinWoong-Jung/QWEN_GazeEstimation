@@ -19,8 +19,6 @@ from model.utils.special_tokens import (
     OBJECT_START_MARKER,
     POINT_END_MARKER,
     POINT_START_MARKER,
-    REASONING_END_MARKER,
-    REASONING_START_MARKER,
     GAZE_SCHEMA_MARKERS,
 )
 
@@ -58,7 +56,7 @@ class TestBuildSpecialTokens(unittest.TestCase):
     def test_token_count(self):
         num_classes = 158
         tokens = build_gaze_special_tokens(num_classes)
-        self.assertEqual(len(tokens), 6 + COORD_BINS + num_classes + 1)
+        self.assertEqual(len(tokens), len(GAZE_SCHEMA_MARKERS) + COORD_BINS + num_classes + 1)
 
     def test_schema_markers_present(self):
         tokens = build_gaze_special_tokens(10)
@@ -87,40 +85,6 @@ class TestBuildStructuredTargetText(unittest.TestCase):
         )
         self.assertEqual(t, expected)
 
-    def test_object_point_exact_format(self):
-        t = build_structured_target_text(0.5, 0.5, 10, 100, target_order="object_point")
-        bx = quantize_coord(0.5)
-        by = quantize_coord(0.5)
-        expected = (
-            f"{OBJECT_START_MARKER}<obj_010>{OBJECT_END_MARKER}"
-            f"{POINT_START_MARKER}{format_loc_token(bx)}{format_loc_token(by)}{POINT_END_MARKER}"
-        )
-        self.assertEqual(t, expected)
-
-    def test_reasoning_point_object_format(self):
-        t = build_structured_target_text(
-            0.5,
-            0.5,
-            10,
-            100,
-            target_order="reasoning_point_object",
-            reasoning_text="Looking at the TV.",
-        )
-        self.assertTrue(t.startswith(REASONING_START_MARKER))
-        self.assertIn(REASONING_END_MARKER, t)
-        self.assertLess(t.index(POINT_START_MARKER), t.index(OBJECT_START_MARKER))
-
-    def test_reasoning_only_format(self):
-        t = build_structured_target_text(
-            0.5,
-            0.5,
-            10,
-            100,
-            target_order="reasoning_only",
-            reasoning_text="some reason",
-        )
-        self.assertEqual(t, f"{REASONING_START_MARKER}some reason.{REASONING_END_MARKER}")
-
     def test_unknown_object_token(self):
         t = build_structured_target_text(0.5, 0.5, None, 100, obj_token=GAZE_OBJ_UNKNOWN)
         self.assertIn(GAZE_OBJ_UNKNOWN, t)
@@ -140,25 +104,6 @@ class TestParseStructuredOutputText(unittest.TestCase):
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["object_id"], 7)
         self.assertIsNotNone(p["point_xy"])
-
-    def test_roundtrip_object_point(self):
-        t = build_structured_target_text(0.5, 0.3, 7, 100, target_order="object_point")
-        p = parse_structured_output_text(t, 100)
-        self.assertTrue(p["valid_format"])
-        self.assertEqual(p["object_id"], 7)
-
-    def test_roundtrip_reasoning_object_point(self):
-        t = build_structured_target_text(
-            0.5,
-            0.3,
-            7,
-            100,
-            target_order="reasoning_object_point",
-            reasoning_text="Looking at TV.",
-        )
-        p = parse_structured_output_text(t, 100)
-        self.assertTrue(p["valid_format"])
-        self.assertEqual(p["object_id"], 7)
 
     def test_custom_coord_bins_roundtrip(self):
         t = build_structured_target_text(1.0, 0.0, 7, 100, coord_bins=128)

@@ -22,14 +22,18 @@ class QwenTextGenerationModel(nn.Module):
         *,
         joint_inputs: dict[str, Any],
         use_cache: bool = False,
+        past_key_values: Any = None,
     ) -> dict[str, Any]:
         kwargs = dict(joint_inputs)
         kwargs["return_dict"] = True
         kwargs["use_cache"] = bool(use_cache)
+        if past_key_values is not None:
+            kwargs["past_key_values"] = past_key_values
         out = self.qwen(**kwargs)
-        return {
-            "logits": getattr(out, "logits", None),
-        }
+        result: dict[str, Any] = {"logits": getattr(out, "logits", None)}
+        if bool(use_cache):
+            result["past_key_values"] = getattr(out, "past_key_values", None)
+        return result
 
     def generate(
         self,

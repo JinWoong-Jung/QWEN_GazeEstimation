@@ -88,23 +88,19 @@ class TestBuildPrompt(unittest.TestCase):
             (root / name).read_text(encoding="utf-8")
             for name in ("sft.yaml", "RL.yaml")
         )
-        # point_object schema (sft.yaml: prompt_text_direct; RL.yaml: prompt_text)
+        # Direct SFT uses the token-based point/object span schema.
         self.assertIn(
-            "<|point_start|><loc_NNN><loc_MMM><|point_end|><|object_start|><obj_KKK><|object_end|>",
+            "<|point_start|>{loc_tok_min}~{loc_tok_max}{loc_tok_min}~{loc_tok_max}<|point_end|><|object_start|>{obj_tok_min}~{obj_tok_max}<|object_end|>",
             cfg,
         )
-        # reasoning_only schema (sft.yaml: prompt_text_reasoning)
-        self.assertIn("<|reasoning_start|><your reasoning here><|reasoning_end|>", cfg)
-        self.assertNotIn("Reasoning: <your reasoning here>", cfg)
 
     def test_sft_uses_split_prompt_multiview_sampling(self) -> None:
         cfg = (Path(__file__).resolve().parents[1] / "sft.yaml").read_text(encoding="utf-8")
-        # New design: separate prompts for point_object and reasoning_only views
         self.assertIn("prompt_text_direct", cfg)
-        self.assertIn("prompt_text_reasoning", cfg)
-        self.assertIn("reasoning_view_ratio", cfg)
+        self.assertIn("<|point_start|>{loc_tok_min}~{loc_tok_max}", cfg)
+        self.assertIn("<|object_start|>{obj_tok_min}~{obj_tok_max}<|object_end|>", cfg)
         self.assertIn("constrained_decoding: true", cfg)
-        self.assertIn("output_format:", cfg)
+        self.assertIn('constrained_loc_decoding: "round_expectation"', cfg)
         self.assertNotIn("direct_view_ratio", cfg)
 
 

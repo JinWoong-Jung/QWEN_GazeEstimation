@@ -8,3 +8,7 @@ tqdm
 wandb
 sentencepiece
 safetensors
+huggingface_hub
+numpy
+matplotlib
+pytest

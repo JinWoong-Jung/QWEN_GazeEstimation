@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .special_tokens import (
@@ -12,8 +13,6 @@ from .special_tokens import (
     OBJECT_START_MARKER,
     POINT_END_MARKER,
     POINT_START_MARKER,
-    REASONING_END_MARKER,
-    REASONING_START_MARKER,
     _LOC_RE,
     _OBJ_RE,
     _loc_token_width,
@@ -25,38 +24,13 @@ from .special_tokens import (
 )
 
 
-def _clean_reasoning_text(text: str) -> str:
-    text = str(text or "")
-    for marker in GAZE_SCHEMA_MARKERS:
-        text = text.replace(marker, "")
-    return " ".join(text.split())
-
-
-def _ensure_trailing_period(text: str) -> str:
-    if text and not text.endswith("."):
-        return text + "."
-    return text
-
-
-def normalize_reasoning_text(text: str, max_words: int = 60, max_chars: int = 500) -> str:
-    """Collapse whitespace, truncate, and ensure trailing period."""
-    text = _clean_reasoning_text(text)
-    if not text:
-        return text
-    words = text.split()
-    if int(max_words) > 0 and len(words) > int(max_words):
-        text = " ".join(words[: int(max_words)])
-    if int(max_chars) > 0 and len(text) > int(max_chars):
-        truncated = text[: int(max_chars)]
-        last_space = truncated.rfind(" ")
-        text = truncated[:last_space] if last_space > 0 else truncated
-    return _ensure_trailing_period(text)
-
-
-def sanitize_reasoning_text(text: str) -> str:
-    """Normalize reasoning formatting without applying length caps."""
-    return _ensure_trailing_period(_clean_reasoning_text(text))
-
+POINT_PREFIX: str = "Point:"
+OBJECT_PREFIX: str = "Object:"
+_LEGACY_POINT_OBJECT_RE = re.compile(
+    r"^\s*Point:\s*(<loc_\d+>)(<loc_\d+>)\s*"
+    r"Object:\s*(<obj_\d+>|<obj_unknown>)\s*$",
+    re.DOTALL,
+)
 
 def quantize_coord(coord: float, bins: int = COORD_BINS) -> int:
     b = int(bins)
@@ -77,10 +51,6 @@ def _format_object(obj_tok: str) -> str:
     return f"{OBJECT_START_MARKER}{obj_tok}{OBJECT_END_MARKER}"
 
 
-def _format_reasoning(reasoning_body: str) -> str:
-    return f"{REASONING_START_MARKER}{reasoning_body}{REASONING_END_MARKER}"
-
-
 def build_structured_target_text(
     point_x: float,
     point_y: float,
@@ -89,11 +59,9 @@ def build_structured_target_text(
     *,
     obj_token: str | None = None,
     coord_bins: int = COORD_BINS,
-    target_order: str = "object_point",
-    reasoning_text: str | None = None,
-    force_reasoning_format: bool = False,
+    target_order: str = "point_object",
 ) -> str:
-    """Build structured target text for the active span schema."""
+    """Build structured target text using the token-based point/object span schema."""
     coord_n = int(coord_bins)
     bx = quantize_coord(float(point_x), bins=coord_n)
     by = quantize_coord(float(point_y), bins=coord_n)
@@ -110,58 +78,14 @@ def build_structured_target_text(
 
     point_span = _format_point(format_loc_token(bx, loc_w), format_loc_token(by, loc_w))
     object_span = _format_object(resolved_obj_tok)
-    order = str(target_order or "object_point").strip()
+    order = str(target_order or "point_object").strip()
 
     if order == "point_object":
         return f"{point_span}{object_span}"
-    if order == "object_point":
-        return f"{object_span}{point_span}"
-    if order == "reasoning_only":
-        reasoning_body = sanitize_reasoning_text(str(reasoning_text or "").strip())
-        return _format_reasoning(reasoning_body)
-    if order == "reasoning_point_object":
-        reasoning_body = sanitize_reasoning_text(str(reasoning_text or "").strip())
-        if reasoning_body or bool(force_reasoning_format):
-            return f"{_format_reasoning(reasoning_body)}{point_span}{object_span}"
-        return f"{point_span}{object_span}"
-    if order == "reasoning_object_point":
-        reasoning_body = sanitize_reasoning_text(str(reasoning_text or "").strip())
-        if reasoning_body or bool(force_reasoning_format):
-            return f"{_format_reasoning(reasoning_body)}{object_span}{point_span}"
-        return f"{object_span}{point_span}"
 
     raise ValueError(
         f"unsupported target_order={target_order!r}; expected one of "
-        "'point_object', 'object_point', 'reasoning_only', "
-        "'reasoning_point_object', 'reasoning_object_point'"
-    )
-
-
-def build_structured_target_text_with_reasoning(
-    point_x: float,
-    point_y: float,
-    obj_id: int | None,
-    num_classes: int,
-    reasoning_text: str | None = None,
-    *,
-    obj_token: str | None = None,
-    coord_bins: int = COORD_BINS,
-    force_reasoning_format: bool = False,
-    target_order: str = "reasoning_object_point",
-) -> str:
-    effective_order = str(target_order or "reasoning_object_point").strip()
-    if not (bool(reasoning_text) or bool(force_reasoning_format)):
-        effective_order = "object_point"
-    return build_structured_target_text(
-        point_x=point_x,
-        point_y=point_y,
-        obj_id=obj_id,
-        num_classes=num_classes,
-        obj_token=obj_token,
-        coord_bins=coord_bins,
-        target_order=effective_order,
-        reasoning_text=reasoning_text,
-        force_reasoning_format=force_reasoning_format,
+        "'point_object'"
     )
 
 
@@ -274,14 +198,18 @@ def _parse_object_span(s: str, start: int) -> tuple[str, int] | None:
     return obj_tok, pos + len(OBJECT_END_MARKER)
 
 
-def _skip_reasoning_span(s: str, start: int) -> int | None:
-    if not s.startswith(REASONING_START_MARKER, start):
-        return start
-    content_start = start + len(REASONING_START_MARKER)
-    end = s.find(REASONING_END_MARKER, content_start)
-    if end < 0:
-        return None
-    return end + len(REASONING_END_MARKER)
+def _parse_legacy_text(s: str, start: int, *, num_classes: int, coord_bins: int) -> dict[str, Any] | None:
+    body = s[start:].strip()
+    m = _LEGACY_POINT_OBJECT_RE.match(body)
+    if m is not None:
+        return _make_parsed(
+            m.group(1),
+            m.group(2),
+            m.group(3),
+            num_classes=num_classes,
+            coord_bins=coord_bins,
+        )
+    return None
 
 
 def parse_structured_output_text(
@@ -289,7 +217,7 @@ def parse_structured_output_text(
     num_classes: int,
     coord_bins: int = COORD_BINS,
 ) -> dict[str, Any]:
-    """Parse active span-schema structured output."""
+    """Parse legacy Point/Object output, with span-schema backward compatibility."""
     s = _strip_optional_eos(text)
     if not s:
         return _invalid(False)
@@ -297,9 +225,11 @@ def parse_structured_output_text(
     if coord_n <= 0:
         raise ValueError(f"coord_bins must be positive, got: {coord_bins!r}")
 
-    pos = _skip_reasoning_span(s, 0)
-    if pos is None:
-        return _invalid(True)
+    pos = 0
+
+    legacy = _parse_legacy_text(s, pos, num_classes=num_classes, coord_bins=coord_n)
+    if legacy is not None:
+        return legacy
 
     parsed_point = _parse_point_span(s, pos)
     if parsed_point is not None:
@@ -308,23 +238,6 @@ def parse_structured_output_text(
         if parsed_object is None:
             return _invalid(True)
         obj_tok, end_pos = parsed_object
-        if end_pos != len(s):
-            return _invalid(True)
-        return _make_parsed(
-            x_tok,
-            y_tok,
-            obj_tok,
-            num_classes=num_classes,
-            coord_bins=coord_n,
-        )
-
-    parsed_object = _parse_object_span(s, pos)
-    if parsed_object is not None:
-        obj_tok, pos_after_object = parsed_object
-        parsed_point = _parse_point_span(s, pos_after_object)
-        if parsed_point is None:
-            return _invalid(True)
-        x_tok, y_tok, end_pos = parsed_point
         if end_pos != len(s):
             return _invalid(True)
         return _make_parsed(

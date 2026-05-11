@@ -279,7 +279,6 @@ def apply_train_augmentation(
         )
     elif aug_mode in {"crop_only", "safe_crop"}:
         # Spatial-only: safe crop with no color or flip changes.
-        # Suitable for reasoning views where the text may reference colors or directions.
         scene, gaze_x, gaze_y, bbox_px = safe_crop(
             scene, gaze_x, gaze_y, bbox_px, p=0.8, aspect=1.0,
         )
@@ -1013,29 +1012,8 @@ def load_test_groups(
     return groups
 
 
-# ---------------------------------------------------------------------------
-# Reasoning file utilities (R1)
-# ---------------------------------------------------------------------------
-
-def resolve_reasoning_path(
-    image_rel: str,
-    sample_id: int,
-    reasoning_dir: Path,
-) -> Path:
-    """Map train/00000106/00106978.jpg + 57936 → reasoning_dir/00000106/00106978_57936.txt"""
-    stem = Path(image_rel).stem
-    folder = Path(image_rel).parent.name
-    return reasoning_dir / folder / f"{stem}_{int(sample_id)}.txt"
-
-
 def load_reasoning_record(path: Path) -> dict[str, str | None]:
-    """Parse a GPT reasoning txt file into {object_text, reasoning_text}.
-
-    Expected file format:
-        Object: <object description>
-        Reasoning: <reasoning text>
-    Either line may be absent; missing lines return None.
-    """
+    """Parse an auxiliary demonstration file into object/reasoning fields."""
     result: dict[str, str | None] = {"object_text": None, "reasoning_text": None}
     try:
         content = path.read_text(encoding="utf-8").strip()
@@ -1050,17 +1028,11 @@ def load_reasoning_record(path: Path) -> dict[str, str | None]:
 
 
 def load_reasoning_text(path: Path) -> str | None:
-    """Extract the Reasoning: line from a GPT reasoning txt file. Returns None on failure."""
     return load_reasoning_record(path)["reasoning_text"]
 
 
 def build_reasoning_index(reasoning_dir: Path) -> dict[str, Path]:
-    """Scan reasoning_dir and return {folder/stem: Path} index for fast lookup.
-
-    key format: "00000106/00106978_57936"  (parent_name/stem, no extension)
-    """
     index: dict[str, Path] = {}
     for txt in reasoning_dir.rglob("*.txt"):
-        key = f"{txt.parent.name}/{txt.stem}"
-        index[key] = txt
+        index[f"{txt.parent.name}/{txt.stem}"] = txt
     return index

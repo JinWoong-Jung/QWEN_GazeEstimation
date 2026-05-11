@@ -149,20 +149,16 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--constrained_decoding", dest="constrained_decoding", action="store_true")
     p.add_argument("--no_constrained_decoding", dest="constrained_decoding", action="store_false")
     p.set_defaults(constrained_decoding=bool(default_value(d, "constrained_decoding", False)))
-    p.add_argument("--output_format", type=str,
-                   default=str(default_value(d, "output_format", "direct")))
     p.add_argument("--constrained_temperature", type=float,
                    default=float(default_value(d, "constrained_temperature", 1.0)))
     p.add_argument("--constrained_loc_decoding", type=str,
                    default=str(default_value(d, "constrained_loc_decoding", "argmax")))
-    p.add_argument("--max_reasoning_tokens", type=int,
-                   default=int(default_value(d, "max_reasoning_tokens", 80)))
 
     # --- prompt ---
     p.add_argument("--prompt_template", type=str, default=str(default_value(d, "prompt_template", "")))
     p.add_argument("--prompt_text", type=str, default=str(default_value(d, "prompt_text", "")))
     p.add_argument("--prompt_text_direct", type=str, default=str(default_value(d, "prompt_text_direct", "")))
-    p.add_argument("--prompt_text_reasoning", type=str, default=str(default_value(d, "prompt_text_reasoning", "")))
+    p.add_argument("--prompt_text_teacher", type=str, default=str(default_value(d, "prompt_text_teacher", "")))
     p.add_argument("--visual_prompting", dest="visual_prompting", action="store_true")
     p.add_argument("--no_visual_prompting", dest="visual_prompting", action="store_false")
     p.set_defaults(visual_prompting=bool(default_value(d, "visual_prompting", False)))
@@ -175,31 +171,53 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.set_defaults(filter_invalid_object_samples=bool(default_value(d, "filter_invalid_object_samples", True)))
     p.add_argument("--train_augmentation_mode_direct", type=str,
                    default=str(default_value(d, "train_augmentation_mode_direct", "full")))
-    p.add_argument("--train_augmentation_mode_reasoning", type=str,
-                   default=str(default_value(d, "train_augmentation_mode_reasoning", "full")))
     p.add_argument("--train_reasoning_dir", type=str, default=str(default_value(d, "train_reasoning_dir", "")))
-    p.add_argument("--sample_mode", type=str,
-                   default=str(default_value(d, "sample_mode", "direct_only")))
-    # legacy flag kept for backward compat; trainer converts use_reasoning=True → sample_mode=direct+reasoning
-    p.add_argument("--use_reasoning", dest="use_reasoning", action="store_true")
-    p.add_argument("--no_use_reasoning", dest="use_reasoning", action="store_false")
-    p.set_defaults(use_reasoning=bool(default_value(d, "use_reasoning", False)))
-
-    # --- reasoning sub-config ---
-    p.add_argument("--reasoning_view_ratio", type=float, default=float(default_value(d, "reasoning_view_ratio", 0.2)))
-    p.add_argument("--max_reasoning_words", type=int, default=int(default_value(d, "max_reasoning_words", 60)))
-    p.add_argument("--max_reasoning_chars", type=int, default=int(default_value(d, "max_reasoning_chars", 500)))
 
     # --- self-distillation KL loss ---
     p.add_argument("--distil_kl_weight", type=float, default=float(default_value(d, "distil_kl_weight", 0.0)))
+    p.add_argument("--distil_temperature", type=float, default=float(default_value(d, "distil_temperature", 1.0)))
+    p.add_argument("--distil_teacher_eval_mode", dest="distil_teacher_eval_mode", action="store_true")
+    p.add_argument("--no_distil_teacher_eval_mode", dest="distil_teacher_eval_mode", action="store_false")
+    p.set_defaults(distil_teacher_eval_mode=bool(default_value(d, "distil_teacher_eval_mode", False)))
     p.add_argument("--teacher_suffix", type=str,
                    default=str(default_value(d, "teacher_suffix", "\n\nUse the following reasoning to guide your prediction:\n{reasoning_text}\n\nNow apply the same reasoning process to predict the gaze point and target.")))
+    p.add_argument("--teacher_update", type=str, default=str(default_value(d, "teacher_update", "fixed")))
+    p.add_argument("--teacher_ema_decay", type=float, default=float(default_value(d, "teacher_ema_decay", 0.999)))
+
+    # --- sdft mode selection and rollout config ---
+    p.add_argument("--sdft_mode", type=str, default=str(default_value(d, "sdft_mode", "teacher_forcing")))
+    p.add_argument("--sdft_ce_weight", type=float, default=float(default_value(d, "sdft_ce_weight", 0.0)))
+    p.add_argument("--rollout_max_new_tokens", type=int, default=int(default_value(d, "rollout_max_new_tokens", 16)))
+    p.add_argument("--rollout_do_sample", dest="rollout_do_sample", action="store_true")
+    p.add_argument("--no_rollout_do_sample", dest="rollout_do_sample", action="store_false")
+    p.set_defaults(rollout_do_sample=bool(default_value(d, "rollout_do_sample", False)))
+    p.add_argument("--rollout_temperature", type=float, default=float(default_value(d, "rollout_temperature", 1.0)))
+    p.add_argument("--rollout_top_p", type=float, default=float(default_value(d, "rollout_top_p", 1.0)))
+    p.add_argument("--rollout_constrained_decoding", dest="rollout_constrained_decoding", action="store_true")
+    p.add_argument("--no_rollout_constrained_decoding", dest="rollout_constrained_decoding", action="store_false")
+    p.set_defaults(rollout_constrained_decoding=bool(default_value(d, "rollout_constrained_decoding", False)))
+    p.add_argument("--rollout_constrained_loc_decoding", type=str,
+                   default=str(default_value(d, "rollout_constrained_loc_decoding", "argmax")))
+    p.add_argument("--skip_invalid_rollouts", dest="skip_invalid_rollouts", action="store_true")
+    p.add_argument("--no_skip_invalid_rollouts", dest="skip_invalid_rollouts", action="store_false")
+    p.set_defaults(skip_invalid_rollouts=bool(default_value(d, "skip_invalid_rollouts", True)))
+    p.add_argument("--skip_truncated_rollouts", dest="skip_truncated_rollouts", action="store_true")
+    p.add_argument("--no_skip_truncated_rollouts", dest="skip_truncated_rollouts", action="store_false")
+    p.set_defaults(skip_truncated_rollouts=bool(default_value(d, "skip_truncated_rollouts", True)))
+    p.add_argument("--kl_on_point", dest="kl_on_point", action="store_true")
+    p.add_argument("--no_kl_on_point", dest="kl_on_point", action="store_false")
+    p.set_defaults(kl_on_point=bool(default_value(d, "kl_on_point", True)))
+    p.add_argument("--kl_on_object", dest="kl_on_object", action="store_true")
+    p.add_argument("--no_kl_on_object", dest="kl_on_object", action="store_false")
+    p.set_defaults(kl_on_object=bool(default_value(d, "kl_on_object", True)))
+    p.add_argument("--kl_on_format", dest="kl_on_format", action="store_true")
+    p.add_argument("--no_kl_on_format", dest="kl_on_format", action="store_false")
+    p.set_defaults(kl_on_format=bool(default_value(d, "kl_on_format", False)))
 
     # --- structured loss weights ---
     p.add_argument("--loss_point_weight", type=float, default=float(default_value(d, "loss_point_weight", 1.0)))
     p.add_argument("--loss_object_weight", type=float, default=float(default_value(d, "loss_object_weight", 1.0)))
     p.add_argument("--loss_format_weight", type=float, default=float(default_value(d, "loss_format_weight", 0.25)))
-    p.add_argument("--loss_reasoning_weight", type=float, default=float(default_value(d, "loss_reasoning_weight", 0.3)))
     p.add_argument("--gaussian_point_sigma", type=float, default=float(default_value(d, "gaussian_point_sigma", 0.0)))
 
     # --- RL (disabled by default) ---

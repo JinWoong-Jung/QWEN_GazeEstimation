@@ -13,7 +13,7 @@ from model.utils.special_tokens import (
     POINT_END_MARKER,
     POINT_START_MARKER,
 )
-from model.utils.eval_utils import decode_generated, l2_stats, valid_label_ids
+from model.utils.eval_utils import decode_generated, l2_stats, valid_label_ids, _topk_indices_from_probs
 import torch
 
 
@@ -129,6 +129,10 @@ class TestMetricCalculations(unittest.TestCase):
         parsed = {"object_id": 9}
         gt_obj_ids = valid_label_ids(torch.tensor([4, 9, -1], dtype=torch.long))
         self.assertIn(int(parsed["object_id"]), gt_obj_ids)
+
+    def test_object_topk_indices_follow_probability_order(self):
+        probs = torch.tensor([[0.10, 0.70, 0.05, 0.15]], dtype=torch.float32)
+        self.assertEqual(_topk_indices_from_probs(probs, k=3), [[1, 3, 0]])
 
 
 class TestFormatValidMetric(unittest.TestCase):

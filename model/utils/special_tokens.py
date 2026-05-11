@@ -11,16 +11,12 @@ COORD_BINS: int = 1000
 ANSWER_END: str = "<|im_end|>"
 GAZE_OBJ_UNKNOWN: str = "<obj_unknown>"
 
-REASONING_START_MARKER: str = "<|reasoning_start|>"
-REASONING_END_MARKER: str = "<|reasoning_end|>"
 POINT_START_MARKER: str = "<|point_start|>"
 POINT_END_MARKER: str = "<|point_end|>"
 OBJECT_START_MARKER: str = "<|object_start|>"
 OBJECT_END_MARKER: str = "<|object_end|>"
 
 GAZE_SCHEMA_MARKERS: list[str] = [
-    REASONING_START_MARKER,
-    REASONING_END_MARKER,
     POINT_START_MARKER,
     POINT_END_MARKER,
     OBJECT_START_MARKER,
@@ -96,8 +92,6 @@ __all__ = [
     "OBJECT_START_MARKER",
     "POINT_END_MARKER",
     "POINT_START_MARKER",
-    "REASONING_END_MARKER",
-    "REASONING_START_MARKER",
     "_LOC_RE",
     "_OBJ_RE",
     "_loc_token_width",

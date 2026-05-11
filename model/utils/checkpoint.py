@@ -8,6 +8,58 @@ import torch
 
 
 
+def save_ema_teacher(
+    ckpt_dir: Path,
+    ema_teacher: Any | None,
+) -> None:
+    if ema_teacher is None or not hasattr(ema_teacher, "ema_params"):
+        return
+
+    ema_params = getattr(ema_teacher, "ema_params")
+    if not isinstance(ema_params, dict) or not ema_params:
+        return
+
+    torch.save(
+        {
+            "decay": float(getattr(ema_teacher, "decay", 0.0)),
+            "ema_params": {str(k): v.detach().cpu().clone() for k, v in ema_params.items()},
+        },
+        ckpt_dir / "ema_teacher.pt",
+    )
+
+
+def load_ema_teacher_params(
+    ckpt_dir: Path,
+    model: Any,
+    device: torch.device,
+) -> bool:
+    path = ckpt_dir / "ema_teacher.pt"
+    if not path.exists():
+        return False
+
+    payload = torch.load(path, map_location=device)
+    ema_params = payload.get("ema_params", payload)
+    if not isinstance(ema_params, dict):
+        raise RuntimeError(f"Invalid EMA teacher checkpoint: {path}")
+
+    named_params = dict(model.named_parameters())
+    missing: list[str] = []
+    for name, ema_tensor in ema_params.items():
+        param = named_params.get(str(name))
+        if param is None:
+            missing.append(str(name))
+            continue
+        param.data.copy_(ema_tensor.to(device=param.device, dtype=param.dtype))
+
+    if missing:
+        raise RuntimeError(
+            f"EMA teacher checkpoint has {len(missing)} parameter(s) not present in model; "
+            f"first missing: {missing[0]}"
+        )
+
+    return True
+
+
 def resolve_qwen_model(model: Any) -> Any:
     if hasattr(model, "qwen"):
         return model.qwen
@@ -193,6 +245,7 @@ def save_checkpoint(
     clear_dir: bool = False,
     base_vocab_size: int | None = None,
     token_ids_to_save: list[int] | None = None,
+    ema_teacher: Any | None = None,
 ) -> None:
     if clear_dir and ckpt_dir.exists():
         for p in ckpt_dir.iterdir():
@@ -223,6 +276,7 @@ def save_checkpoint(
             model=model,
             token_ids=token_ids_to_save,
         )
+    save_ema_teacher(ckpt_dir=ckpt_dir, ema_teacher=ema_teacher)
 
     torch.save(
         {
@@ -304,8 +358,16 @@ def checkpoint_monitor_value(
     key_map: dict[str, str] = {
         "val_dist": "Dist",
         "dist": "Dist",
-        "val_object_acc": "ObjectAcc",
-        "object_acc": "ObjectAcc",
+        "val_acc_at_1": "Acc@1",
+        "acc_at_1": "Acc@1",
+        "val_acc_1": "Acc@1",
+        "acc_1": "Acc@1",
+        "val_object_acc": "Acc@1",
+        "object_acc": "Acc@1",
+        "val_acc_at_3": "Acc@3",
+        "acc_at_3": "Acc@3",
+        "val_acc_3": "Acc@3",
+        "acc_3": "Acc@3",
         "val_format_valid": "FormatValid",
         "format_valid": "FormatValid",
         "val_extra_text_rate": "ExtraTextRate",
@@ -315,6 +377,6 @@ def checkpoint_monitor_value(
     if metric_key is None:
         raise ValueError(
             "Unsupported checkpoint_monitor. Use one of: "
-            "val_dist, val_object_acc, val_format_valid."
+            "val_dist, val_acc_at_1, val_acc_at_3, val_format_valid."
         )
     return float(val_gen_metrics.get(metric_key, 0.0))

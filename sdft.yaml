@@ -1,6 +1,8 @@
 paths:
   model_path: "model/Qwen3-VL-2B-Instruct" # model/Qwen3-VL-4B-Instruct or model/Qwen3-VL-2B-Instruct
   output_dir: "checkpoints"
+  # Set this to the Stage1 best-val_dist checkpoint before running Stage2.
+  checkpoint_dir: "checkpoints/SFT_direct"
   image_root: "data/gazefollow_extended/train"
   train_ann: "data/gazefollow/train_annotations_new.txt"
   val_ann: "data/gazefollow/val_annotations_new.txt"
@@ -12,6 +14,7 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
+  train_reasoning_dir: "/home/work/jinwoong/QWEN_GazeEstimation/data/gazefollow_reason_train"
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
@@ -25,22 +28,22 @@ data:
   test_bbox_round_decimals: 3
 
 train:
-  train_stage: "sft"
+  train_stage: "sdft"
   seed: 42
   device: "cuda"
   dtype: "bfloat16"
   gradient_checkpointing: false
-  epochs: 20
+  epochs: 2
   batch_size: 32
-  grad_accum_steps: 4
+  grad_accum_steps: 8
   num_workers: 8
-  lr: 1e-4
+  lr: 2e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   filter_invalid_object_samples: false
-  train_augmentation_mode_direct: "full"  # "full" | "no_crop" | "color_only" | "crop_only" | "no_aug"
-  save_last_every_n_epochs: 5
+  train_augmentation_mode_direct: "crop_only"  # "full" | "no_crop" | "color_only" | "crop_only" | "no_aug"
+  save_last_every_n_epochs: 1
 
 eval:
   test_batch_size: 32
@@ -48,7 +51,7 @@ eval:
   test_only: false
   run_val_metrics: true
   run_val_metrics_every_n_epochs: 1
-  checkpoint_monitor: "val_dist" # "val_dist" | "val_acc_at_1" | "val_acc_at_3" | "val_format_valid"
+  checkpoint_monitor: "val_dist"
   checkpoint_monitor_mode: "min"
   generation_max_new_tokens: 8
   constrained_decoding: true
@@ -60,6 +63,9 @@ prompt:
     Given the image and head box <|box_start|>({loc_x1},{loc_y1}),({loc_x2},{loc_y2})<|box_end|>,
     predict the gaze point and target.
     Return only: <|point_start|>{loc_tok_min}~{loc_tok_max}{loc_tok_min}~{loc_tok_max}<|point_end|><|object_start|>{obj_tok_min}~{obj_tok_max}<|object_end|>
+  prompt_text_teacher: |
+    Given the image and head box <|box_start|>({loc_x1},{loc_y1}),({loc_x2},{loc_y2})<|box_end|>,
+    predict the gaze point and target.
 
 model:
   coord_bins: 128
@@ -77,11 +83,50 @@ loss:
   loss_format_weight: 1.0
   gaussian_point_sigma: 3.0
 
+distil:
+  # Stage2 SDFT: student sees the point-object prompt; teacher receives an auxiliary reasoning demonstration.
+  distil_kl_weight: 1.0
+  distil_temperature: 1.0
+  distil_teacher_eval_mode: true
+  teacher_update: "ema" 
+  teacher_ema_decay: 0.99
+  teacher_suffix: |
+
+    Use the following reasoning to guide your prediction: {reasoning_text}
+    The object at the gaze point appears to be {object_text}.
+
+    Now apply the same reasoning process to predict the gaze point and target.
+    Return only: <|point_start|>{loc_tok_min}~{loc_tok_max}{loc_tok_min}~{loc_tok_max}<|point_end|><|object_start|>{obj_tok_min}~{obj_tok_max}<|object_end|>
+
+sdft:
+  # Mode selection: teacher_forcing (current) or rollout (on-policy SDFT).
+  sdft_mode: rollout   # choices: teacher_forcing, rollout
+
+  # rollout mode: optional weak CE on GT target (paper-core is KL only, ce_weight=0.0).
+  sdft_ce_weight: 0.0
+
+  # Rollout generation parameters (rollout mode only).
+  rollout_max_new_tokens: 8
+  rollout_do_sample: false
+  rollout_temperature: 1.0  # no work if do_sample=false
+  rollout_top_p: 1.0  # no work if do_sample=false 
+  rollout_constrained_decoding: true
+  rollout_constrained_loc_decoding: "round_expectation"  # "argmax" | "round_expectation"
+
+  # Rollout validity filtering.
+  skip_invalid_rollouts: true
+  skip_truncated_rollouts: true
+
+  # KL application scope.
+  kl_on_point: true
+  kl_on_object: true
+  kl_on_format: false
+
 wandb:
   enabled: true
   project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "SFT_direct_expectation_round"
+  run_name: "SDFT_direct_expectation"
   wandb_log_every_steps: 20
-  tags: []
-  notes: ""
+  tags: ["sdft"]
+  notes: "Stage2 point-object self-distillation with teacher-side reasoning demonstrations from Stage1 best val_dist checkpoint."

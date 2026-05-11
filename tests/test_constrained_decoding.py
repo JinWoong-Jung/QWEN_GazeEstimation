@@ -68,13 +68,28 @@ def _make_joint(bsz: int = 1, seq_len: int = 5, device: str = "cpu") -> dict[str
 
 
 def _make_model(vocab_size: int = 500) -> MagicMock:
-    """Model whose forward always returns uniform logits, so argmax picks index 0."""
-    def _forward(joint_inputs: dict, use_cache: bool = False) -> dict:
+    """Model whose generate() applies LogitsProcessors with uniform logits and picks greedily."""
+    def _generate(
+        joint_inputs: dict,
+        max_new_tokens: int = 7,
+        do_sample: bool = False,
+        num_beams: int = 1,
+        logits_processor=None,
+        **kwargs,
+    ) -> torch.Tensor:
         bsz = int(joint_inputs["input_ids"].shape[0])
-        logits = torch.zeros(bsz, 1, vocab_size)
-        return {"logits": logits}
+        generated = joint_inputs["input_ids"].clone()
+        for _ in range(max_new_tokens):
+            scores = torch.zeros(bsz, vocab_size)
+            if logits_processor is not None:
+                scores = logits_processor(generated, scores)
+            next_tok = torch.argmax(scores, dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_tok], dim=1)
+        return generated
 
-    return MagicMock(side_effect=_forward)
+    model = MagicMock()
+    model.generate.side_effect = _generate
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -176,11 +191,6 @@ class TestAppendTokenToJoint(unittest.TestCase):
 _PT_OBJ_RE = re.compile(
     r"^<\|point_start\|>(<loc_\d+>)(<loc_\d+>)<\|point_end\|><\|object_start\|>(<obj_\d+>)<\|object_end\|>$"
 )
-_OBJ_PT_RE = re.compile(
-    r"^<\|object_start\|>(<obj_\d+>)<\|object_end\|><\|point_start\|>(<loc_\d+>)(<loc_\d+>)<\|point_end\|>$"
-)
-
-
 class TestConstrainedGenerateStructured(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -208,23 +218,8 @@ class TestConstrainedGenerateStructured(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIsNotNone(_PT_OBJ_RE.match(results[0]), msg=f"No match: {results[0]!r}")
 
-    def test_object_point_order_valid_format(self) -> None:
-        joint = _make_joint(bsz=1, seq_len=3)
-        results = constrained_generate_structured(
-            model=self.model,
-            joint=joint,
-            processor=self.processor,
-            num_classes=self.num_classes,
-            coord_bins=self.coord_bins,
-            amp_dtype=torch.float32,
-            target_order="object_point",
-        )
-        self.assertEqual(len(results), 1)
-        self.assertIsNotNone(_OBJ_PT_RE.match(results[0]), msg=f"No match: {results[0]!r}")
-
     def test_unsupported_order_raises_value_error(self) -> None:
         joint = _make_joint(bsz=1, seq_len=3)
-        # "reasoning_only" is a training-only target order; constrained eval must reject it.
         with self.assertRaises(ValueError):
             constrained_generate_structured(
                 model=self.model,
@@ -233,7 +228,7 @@ class TestConstrainedGenerateStructured(unittest.TestCase):
                 num_classes=self.num_classes,
                 coord_bins=self.coord_bins,
                 amp_dtype=torch.float32,
-                target_order="reasoning_only",
+                target_order="object_point",
             )
 
     def test_batch_size_2(self) -> None:
@@ -283,21 +278,6 @@ class TestPointObjectEvalOrderMatchesTrainer(unittest.TestCase):
         self.assertIsNotNone(parsed["point_xy"])
         self.assertIsNotNone(parsed["point_bins"])
         self.assertIsNotNone(parsed["object_id"])
-
-    def test_parser_accepts_constrained_object_point_output(self) -> None:
-        joint = _make_joint(bsz=1, seq_len=3)
-        results = constrained_generate_structured(
-            model=self.model,
-            joint=joint,
-            processor=self.processor,
-            num_classes=self.num_classes,
-            coord_bins=self.coord_bins,
-            amp_dtype=torch.float32,
-            target_order="object_point",
-        )
-        parsed = parse_structured_output_text(results[0], self.num_classes, coord_bins=self.coord_bins)
-        self.assertTrue(parsed["valid_format"], msg=f"Parser rejected: {results[0]!r} -> {parsed}")
-
 
 if __name__ == "__main__":
     unittest.main()

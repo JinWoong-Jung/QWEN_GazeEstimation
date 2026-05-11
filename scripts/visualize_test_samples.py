@@ -374,7 +374,7 @@ def main() -> None:
         stop_at_object_end=bool(getattr(args, "generation_stop_at_object_end", True)),
         max_samples=len(dataset),
         constrained_decoding=bool(getattr(args, "constrained_decoding", False)),
-        constrained_target_order="reasoning_point_object" if str(getattr(args, "output_format", "direct")).strip().lower() == "reasoning" else "point_object",
+        constrained_target_order="point_object",
         constrained_temperature=float(getattr(args, "constrained_temperature", 1.0)),
     )
 
