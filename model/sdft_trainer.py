@@ -122,6 +122,7 @@ def train_step_sdft_rollout(
             ce_loss = ce_result["loss"]
 
     scene_images: list[Any] = batch["scene_images"]
+    head_crop_images: list[Any] | None = batch.get("head_crop_images")
     text_inputs: list[str] = batch["text_input"]
     reasoning_texts: list[str] = batch.get("reasoning_texts", [""] * len(text_inputs))
     object_texts: list[str] = batch.get("object_texts", [""] * len(text_inputs))
@@ -132,6 +133,7 @@ def train_step_sdft_rollout(
         scene_images=scene_images,
         text_inputs=text_inputs,
         max_text_length=max_text_length,
+        head_crop_images=head_crop_images,
     )
     infer_inputs_dev = to_device(infer_inputs, device=device)
     prompt_input_ids_cpu = infer_inputs["input_ids"].detach().cpu()
@@ -210,6 +212,9 @@ def train_step_sdft_rollout(
         return None
 
     valid_scene_images = [scene_images[i] for i in valid_indices]
+    valid_head_crop_images = (
+        [head_crop_images[i] for i in valid_indices] if head_crop_images is not None else None
+    )
     valid_direct_prompts = [text_inputs[i] for i in valid_indices]
     valid_teacher_base_prompts = [teacher_base_inputs[i] for i in valid_indices]
     valid_reasoning_texts = [reasoning_texts[i] for i in valid_indices]
@@ -227,6 +232,7 @@ def train_step_sdft_rollout(
         target_object_valid=all_ones,
         target_format_valid=all_ones,
         max_text_length=max_text_length,
+        head_crop_images=valid_head_crop_images,
     )
 
     _has_any_reasoning = any(rt or ot for rt, ot in zip(valid_reasoning_texts, valid_object_texts))
@@ -246,6 +252,7 @@ def train_step_sdft_rollout(
             target_object_valid=all_ones,
             target_format_valid=all_ones,
             max_text_length=max_text_length,
+            head_crop_images=valid_head_crop_images,
         )
         teacher_inputs_dev = to_device(teacher_inputs, device=device)
     else:

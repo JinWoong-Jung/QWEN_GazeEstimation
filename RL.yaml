@@ -111,7 +111,9 @@ rl:
   reward_object_weight: 0.75
   reward_joint_bonus: 0.15 # 0.25     # bonus when both point and object are correct
   reward_extra_penalty: 0.0 # 0.5    # penalty for extra text in output
-  reward_point_beta: 7.0      # beta in exp(-beta * min_l2)
+  reward_point_beta: 7.0      # beta in exp(-beta * distance)
+  reward_point_mode: "l2"    # "l2" | "box"
+  reward_point_box_radius: 0.05  # half-side of GT box in normalised coords (box mode only)
 
   # Rollout sampling
   rl_temperature: 0.7           # sampling temperature during rollout (Rex-Omni: 1.0)

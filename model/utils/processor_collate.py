@@ -190,10 +190,13 @@ def build_train_inputs(
     target_object_valid: torch.Tensor,
     target_format_valid: torch.Tensor,
     max_text_length: int,
+    head_crop_images: list[Any] | None = None,
 ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not (len(scene_images) == len(text_inputs) == len(target_texts)):
         raise ValueError("scene/text/target batch sizes must match.")
 
+    use_head_crop = head_crop_images is not None and len(head_crop_images) == len(scene_images)
+    num_images = 2 if use_head_crop else 1
     chat_texts = [
         chat_text(
             processor=processor,
@@ -201,13 +204,18 @@ def build_train_inputs(
             assistant_text=target_texts[i],
             with_image=True,
             add_generation_prompt=False,
+            num_images=num_images,
         )
         for i in range(len(text_inputs))
     ]
+    images_for_proc = (
+        [[s, c] for s, c in zip(scene_images, head_crop_images)]
+        if use_head_crop else scene_images
+    )
     # truncation=False: prevents VLM image-token alignment from breaking.
     joint_inputs = processor(
         text=chat_texts,
-        images=scene_images,
+        images=images_for_proc,
         return_tensors="pt",
         padding=True,
         truncation=False,
@@ -278,9 +286,12 @@ def build_infer_inputs(
     scene_images: list[Any],
     text_inputs: list[str],
     max_text_length: int,
+    head_crop_images: list[Any] | None = None,
 ) -> dict[str, Any]:
     if len(scene_images) != len(text_inputs):
         raise ValueError("scene/text batch sizes must match for inference inputs.")
+    use_head_crop = head_crop_images is not None and len(head_crop_images) == len(scene_images)
+    num_images = 2 if use_head_crop else 1
     chat_texts = [
         chat_text(
             processor=processor,
@@ -288,12 +299,17 @@ def build_infer_inputs(
             assistant_text=None,
             with_image=True,
             add_generation_prompt=True,
+            num_images=num_images,
         )
         for t in text_inputs
     ]
+    images_for_proc = (
+        [[s, c] for s, c in zip(scene_images, head_crop_images)]
+        if use_head_crop else scene_images
+    )
     joint_inputs = processor(
         text=chat_texts,
-        images=scene_images,
+        images=images_for_proc,
         return_tensors="pt",
         padding=True,
         truncation=False,
@@ -309,6 +325,7 @@ class QwenTrainCollator:
         scene_size: tuple[int, int] | None = None,
         distil_kl_weight: float = 0.0,
         distil_teacher_suffix: str = "\n\nUse the following object and reasoning to guide your prediction:\nObject: {object_text}\nReasoning: {reasoning_text}\n\nNow apply the same reasoning process to predict the gaze point and target.",
+        use_head_crop: bool = False,
     ) -> None:
         self.processor = processor
         self.max_text_length = int(max_text_length)
@@ -317,6 +334,7 @@ class QwenTrainCollator:
         # Struct-token variables ({loc_tok_min} etc.) are pre-resolved in trainer.py before
         # this suffix is passed in. Only {reasoning_text} and {object_text} remain for per-sample fill.
         self.distil_teacher_suffix = str(distil_teacher_suffix)
+        self.use_head_crop = bool(use_head_crop)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         raw_images = [x["scene_image"] for x in batch]
@@ -325,6 +343,11 @@ class QwenTrainCollator:
             if self.scene_size is not None
             else raw_images
         )
+        head_crop_images: list[Any] | None = None
+        if self.use_head_crop:
+            crops = [x.get("head_crop_image") for x in batch]
+            if all(c is not None for c in crops):
+                head_crop_images = crops
         text_inputs = [str(x["text_input"]) for x in batch]
         target_texts = [str(x["target_text"]) for x in batch]
         target_text_valid = torch.stack(
@@ -353,6 +376,7 @@ class QwenTrainCollator:
             target_object_valid=target_object_valid,
             target_format_valid=target_format_valid,
             max_text_length=self.max_text_length,
+            head_crop_images=head_crop_images,
         )
 
         target_point_bin = torch.stack(
@@ -384,6 +408,7 @@ class QwenTrainCollator:
             # a separate collator).
             "text_input": text_inputs,
             "scene_images": scene_images,
+            "head_crop_images": head_crop_images,
             "reasoning_texts": reasoning_texts,
             "object_texts": object_texts,
             "teacher_base_inputs": teacher_base_inputs,
@@ -407,6 +432,7 @@ class QwenTrainCollator:
                 target_object_valid=target_object_valid,
                 target_format_valid=target_format_valid,
                 max_text_length=self.max_text_length,
+                head_crop_images=head_crop_images,
             )
             result["teacher_joint_inputs"] = teacher_joint_inputs
             result["teacher_loss_mask_point"] = teacher_mask_pt
@@ -430,10 +456,12 @@ class QwenRLCollator:
         processor: Any,
         max_text_length: int = 256,
         scene_size: tuple[int, int] | None = None,
+        use_head_crop: bool = False,
     ) -> None:
         self.processor = processor
         self.max_text_length = int(max_text_length)
         self.scene_size = (int(scene_size[0]), int(scene_size[1])) if scene_size is not None else None
+        self.use_head_crop = bool(use_head_crop)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         raw_images = [x["scene_image"] for x in batch]
@@ -442,16 +470,23 @@ class QwenRLCollator:
             if self.scene_size is not None
             else raw_images
         )
+        head_crop_images: list[Any] | None = None
+        if self.use_head_crop:
+            crops = [x.get("head_crop_image") for x in batch]
+            if all(c is not None for c in crops):
+                head_crop_images = crops
         text_inputs = [str(x["text_input"]) for x in batch]
         joint_inputs = build_infer_inputs(
             processor=self.processor,
             scene_images=scene_images,
             text_inputs=text_inputs,
             max_text_length=self.max_text_length,
+            head_crop_images=head_crop_images,
         )
         return {
             "joint_inputs": joint_inputs,
             "scene_images": scene_images,       # resized PIL images for logprob re-processing
+            "head_crop_images": head_crop_images,
             "text_input": text_inputs,
             "target_text": [str(x["target_text"]) for x in batch],
             "target_text_valid": torch.stack(
@@ -487,10 +522,12 @@ class QwenTestCollator:
         processor: Any,
         max_text_length: int = 256,
         scene_size: tuple[int, int] | None = None,
+        use_head_crop: bool = False,
     ) -> None:
         self.processor = processor
         self.max_text_length = int(max_text_length)
         self.scene_size = (int(scene_size[0]), int(scene_size[1])) if scene_size is not None else None
+        self.use_head_crop = bool(use_head_crop)
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         raw_images = [x["scene_image"] for x in batch]
@@ -499,12 +536,18 @@ class QwenTestCollator:
             if self.scene_size is not None
             else raw_images
         )
+        head_crop_images: list[Any] | None = None
+        if self.use_head_crop:
+            crops = [x.get("head_crop_image") for x in batch]
+            if all(c is not None for c in crops):
+                head_crop_images = crops
         text_inputs = [str(x["text_input"]) for x in batch]
         joint_inputs = build_infer_inputs(
             processor=self.processor,
             scene_images=scene_images,
             text_inputs=text_inputs,
             max_text_length=self.max_text_length,
+            head_crop_images=head_crop_images,
         )
         return {
             "joint_inputs": joint_inputs,

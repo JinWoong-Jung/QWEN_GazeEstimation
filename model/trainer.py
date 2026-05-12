@@ -251,6 +251,11 @@ def main() -> None:
     )
     _proc_min_pixels: int | None = None if _fixed_resize else int(getattr(args, "min_pixels", 12544))
     _proc_max_pixels: int | None = None if _fixed_resize else int(getattr(args, "max_pixels", 2007040))
+    use_head_crop = bool(getattr(args, "use_head_crop", False))
+    head_crop_padding = float(getattr(args, "head_crop_padding", 0.3))
+    head_crop_size = int(getattr(args, "head_crop_size", 224))
+    if use_head_crop:
+        print(f"[INFO] head_crop enabled: padding={head_crop_padding} size={head_crop_size}")
 
     # --- Phase 2 init order: processor → register tokens → base model → resize → LoRA ---
     processor = init_processor(
@@ -317,6 +322,7 @@ def main() -> None:
             processor=processor,
             max_text_length=int(args.max_text_length),
             scene_size=_scene_size,
+            use_head_crop=use_head_crop,
         )
 
         base_qwen = init_base_model(model_path=model_path, model_kwargs=model_kwargs)
@@ -379,6 +385,9 @@ def main() -> None:
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
                 target_order=_eval_target_order,
+                use_head_crop=use_head_crop,
+                head_crop_padding=head_crop_padding,
+                head_crop_size=head_crop_size,
             )
             log_target_example("test_only", test_ds)
             _tnw = int(args.num_workers)
@@ -548,6 +557,9 @@ def main() -> None:
         train_augmentation_mode=train_augmentation_mode_direct,
         target_order=_train_target_order,
         reasoning_index=reasoning_index,
+        use_head_crop=use_head_crop,
+        head_crop_padding=head_crop_padding,
+        head_crop_size=head_crop_size,
     )
     val_ds = GazeDataset(
         records=val_records,
@@ -563,6 +575,9 @@ def main() -> None:
         filter_invalid_object_samples=filter_invalid,
         coord_bins=coord_bins,
         target_order=_eval_target_order,
+        use_head_crop=use_head_crop,
+        head_crop_padding=head_crop_padding,
+        head_crop_size=head_crop_size,
     )
 
     # Count filtered samples
@@ -628,11 +643,13 @@ def main() -> None:
         scene_size=_scene_size,
         distil_kl_weight=distil_kl_weight,
         distil_teacher_suffix=distil_teacher_suffix,
+        use_head_crop=use_head_crop,
     )
     test_collator = QwenTestCollator(
         processor=processor,
         max_text_length=int(args.max_text_length),
         scene_size=_scene_size,
+        use_head_crop=use_head_crop,
     )
 
     _nw = int(args.num_workers)
@@ -817,6 +834,9 @@ def main() -> None:
                     image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                     coord_bins=coord_bins,
                     target_order=_eval_target_order,
+                    use_head_crop=use_head_crop,
+                    head_crop_padding=head_crop_padding,
+                    head_crop_size=head_crop_size,
                 )
                 test_loader = DataLoader(
                     test_ds,
@@ -1211,6 +1231,9 @@ def main() -> None:
                 image_cache_size=max(0, int(getattr(args, "image_cache_size", 0))),
                 coord_bins=coord_bins,
                 target_order=_eval_target_order,
+                use_head_crop=use_head_crop,
+                head_crop_padding=head_crop_padding,
+                head_crop_size=head_crop_size,
             )
             log_target_example("test", test_ds)
             test_loader = DataLoader(

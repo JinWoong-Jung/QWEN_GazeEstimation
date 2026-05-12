@@ -21,6 +21,38 @@ def compute_point_reward(min_l2: float, beta: float) -> float:
     return math.exp(-float(beta) * max(0.0, float(min_l2)))
 
 
+def compute_box_distance(
+    pred_xy: tuple[float, float],
+    gt_points: torch.Tensor,
+    radius: float,
+) -> float | None:
+    """Min distance from pred to the nearest GT square box (half-side = radius).
+
+    Returns 0.0 if pred falls inside any GT box, else the Euclidean distance
+    from pred to the nearest point on the closest box boundary.
+    With multiple GT points, takes the minimum over all boxes.
+    """
+    if (not torch.is_tensor(gt_points)) or gt_points.numel() < 2:
+        return None
+    if int(gt_points.numel()) % 2 != 0:
+        return None
+    pts = gt_points.to(dtype=torch.float32).view(-1, 2)
+    if int(pts.shape[0]) <= 0:
+        return None
+    px, py = float(pred_xy[0]), float(pred_xy[1])
+    r = float(radius)
+    min_d = float("inf")
+    for j in range(int(pts.shape[0])):
+        gx = float(pts[j, 0].item())
+        gy = float(pts[j, 1].item())
+        nx = max(gx - r, min(px, gx + r))
+        ny = max(gy - r, min(py, gy + r))
+        d = math.sqrt((px - nx) ** 2 + (py - ny) ** 2)
+        if d < min_d:
+            min_d = d
+    return min_d
+
+
 def compute_object_reward(pred_obj_id: int | None, gt_obj_ids: list[int]) -> float:
     """r_object = 1.0 if pred matches any GT object id, else 0.0."""
     if pred_obj_id is None or not gt_obj_ids:
@@ -38,6 +70,8 @@ def compute_total_reward(
     reward_joint_bonus: float = 0.25,
     reward_extra_penalty: float = 0.5,
     reward_point_beta: float = 10.0,
+    reward_point_mode: str = "l2",
+    reward_point_box_radius: float = 0.05,
 ) -> dict[str, float]:
     """Compute per-rollout reward decomposed into point/object/joint/extra components.
 
@@ -64,14 +98,22 @@ def compute_total_reward(
 
     base["valid_format"] = True
 
-    # Point reward: exp(-beta * min_l2)
+    # Point reward
     r_point = 0.0
     min_l2_val: float | None = None
     if parsed.get("point_xy") is not None and gt_points is not None:
         stats = l2_stats(parsed["point_xy"], gt_points)
         if stats is not None:
             min_l2_val = float(stats[1])
-            r_point = compute_point_reward(min_l2_val, float(reward_point_beta))
+        if reward_point_mode == "box":
+            box_d = compute_box_distance(
+                parsed["point_xy"], gt_points, float(reward_point_box_radius)
+            )
+            if box_d is not None:
+                r_point = math.exp(-float(reward_point_beta) * box_d)
+        else:
+            if min_l2_val is not None:
+                r_point = compute_point_reward(min_l2_val, float(reward_point_beta))
     base["reward_point"] = float(r_point)
 
     # Object reward: exact match (supports multi-label)

@@ -19,6 +19,30 @@ def is_normalized_point(x: float, y: float) -> bool:
     return 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
 
 
+def crop_head_region(
+    image: Image.Image,
+    bbox_px: tuple[int, int, int, int],
+    padding: float = 0.3,
+    target_size: int = 224,
+) -> Image.Image:
+    """Crop head region from image at original resolution, then resize.
+
+    bbox_px must be already sanitized (x1 < x2, y1 < y2, within image bounds).
+    Cropping happens before any resize so the crop preserves native resolution.
+    """
+    W, H = image.size
+    x1, y1, x2, y2 = bbox_px
+    bw, bh = x2 - x1, y2 - y1
+    pad_x = bw * padding
+    pad_y = bh * padding
+    cx1 = max(0.0, x1 - pad_x)
+    cy1 = max(0.0, y1 - pad_y)
+    cx2 = min(float(W), x2 + pad_x)
+    cy2 = min(float(H), y2 + pad_y)
+    crop = image.crop((cx1, cy1, cx2, cy2))
+    return crop.resize((target_size, target_size), Image.BILINEAR)
+
+
 def sanitize_bbox_pixels(
     bbox: tuple[float, float, float, float],
     width: int,

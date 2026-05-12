@@ -133,6 +133,11 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--image_resize_mode", type=str, default=str(default_value(d, "image_resize_mode", "native")))
     p.add_argument("--scene_h", type=int, default=int(default_value(d, "scene_h", 512)))
     p.add_argument("--scene_w", type=int, default=int(default_value(d, "scene_w", 512)))
+    p.add_argument("--use_head_crop", dest="use_head_crop", action="store_true")
+    p.add_argument("--no_use_head_crop", dest="use_head_crop", action="store_false")
+    p.set_defaults(use_head_crop=bool(default_value(d, "use_head_crop", False)))
+    p.add_argument("--head_crop_padding", type=float, default=float(default_value(d, "head_crop_padding", 0.3)))
+    p.add_argument("--head_crop_size", type=int, default=int(default_value(d, "head_crop_size", 224)))
     p.add_argument("--min_pixels", type=int, default=int(default_value(d, "min_pixels", 12544)))
     p.add_argument("--max_pixels", type=int, default=int(default_value(d, "max_pixels", 2007040)))
 
@@ -246,6 +251,8 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--reward_extra_penalty", type=float, default=float(default_value(d, "reward_extra_penalty", 0.5)))
     p.add_argument("--reward_format_weight", type=float, default=float(default_value(d, "reward_format_weight", 0.5)))
     p.add_argument("--reward_point_beta", type=float, default=float(default_value(d, "reward_point_beta", 10.0)))
+    p.add_argument("--reward_point_mode", type=str, default=str(default_value(d, "reward_point_mode", "l2")))
+    p.add_argument("--reward_point_box_radius", type=float, default=float(default_value(d, "reward_point_box_radius", 0.05)))
     p.add_argument("--rl_temperature", type=float, default=float(default_value(d, "rl_temperature", 0.7)))
     p.add_argument("--rl_top_p", type=float, default=float(default_value(d, "rl_top_p", 0.9)))
 

@@ -25,12 +25,14 @@ def chat_text(
     *,
     with_image: bool,
     add_generation_prompt: bool,
+    num_images: int = 1,
 ) -> str:
     user_txt = str(user_text)
     if hasattr(processor, "apply_chat_template"):
         content: list[dict[str, str]] = []
         if with_image:
-            content.append({"type": "image"})
+            for _ in range(max(1, int(num_images))):
+                content.append({"type": "image"})
         content.append({"type": "text", "text": user_txt})
         messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
         if assistant_text is not None:
@@ -44,7 +46,8 @@ def chat_text(
         except TypeError:
             return processor.apply_chat_template(messages, tokenize=False)
 
-    prefix = f"<|vision_start|><|image_pad|><|vision_end|>\n{user_txt}" if with_image else user_txt
+    img_tokens = "<|vision_start|><|image_pad|><|vision_end|>" * max(1, int(num_images))
+    prefix = f"{img_tokens}\n{user_txt}" if with_image else user_txt
     if assistant_text is None:
         return prefix
     return f"{prefix}\n{str(assistant_text)}"

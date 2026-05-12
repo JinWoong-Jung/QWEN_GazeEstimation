@@ -13,6 +13,7 @@ from .utils.data_utils import (
     apply_train_augmentation,
     alias_label_text,
     build_prompt,
+    crop_head_region,
     load_reasoning_record,
     sanitize_bbox_pixels,
 )
@@ -198,6 +199,9 @@ class GazeDataset(Dataset):
         train_augmentation_mode: str = "full",
         target_order: str = "point_object",
         reasoning_index: dict[str, Any] | None = None,
+        use_head_crop: bool = False,
+        head_crop_padding: float = 0.3,
+        head_crop_size: int = 224,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -215,6 +219,9 @@ class GazeDataset(Dataset):
         self.train_augmentation_mode = str(train_augmentation_mode or "full")
         self.visual_prompting = bool(visual_prompting)
         self.target_order = str(target_order or "point_object")
+        self.use_head_crop = bool(use_head_crop)
+        self.head_crop_padding = float(head_crop_padding)
+        self.head_crop_size = int(head_crop_size)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
@@ -280,6 +287,13 @@ class GazeDataset(Dataset):
 
         w, h = scene.size
         x1, y1, x2, y2 = sanitize_bbox_pixels(bbox_px, width=w, height=h)
+        head_crop: Image.Image | None = None
+        if self.use_head_crop:
+            head_crop = crop_head_region(
+                scene, (x1, y1, x2, y2),
+                padding=self.head_crop_padding,
+                target_size=self.head_crop_size,
+            )
         if self.visual_prompting:
             scene = draw_head_bbox_prompt(scene, x1=x1, y1=y1, x2=x2, y2=y2)
         bbox_norm = (x1 / w, y1 / h, x2 / w, y2 / h)
@@ -322,6 +336,7 @@ class GazeDataset(Dataset):
 
         return {
             "scene_image": scene,
+            "head_crop_image": head_crop,
             "text_input": prompt,
             "target_text": target_text,
             "target_text_valid": torch.tensor(target_text_valid, dtype=torch.float32),
@@ -357,6 +372,9 @@ class GazeTestDataset(Dataset):
         image_cache_size: int = 0,
         coord_bins: int = 1000,
         target_order: str = "point_object",
+        use_head_crop: bool = False,
+        head_crop_padding: float = 0.3,
+        head_crop_size: int = 224,
         # deprecated args kept for backward compat (ignored)
         answer_template: str = "",
         fallback_target_text: str = "",
@@ -372,6 +390,9 @@ class GazeTestDataset(Dataset):
         self.coord_bins = int(coord_bins)
         self.visual_prompting = bool(visual_prompting)
         self.target_order = str(target_order or "point_object")
+        self.use_head_crop = bool(use_head_crop)
+        self.head_crop_padding = float(head_crop_padding)
+        self.head_crop_size = int(head_crop_size)
         self._image_cache: _ImageLRUCache | None = (
             _ImageLRUCache(int(image_cache_size)) if int(image_cache_size) > 0 else None
         )
@@ -393,6 +414,13 @@ class GazeTestDataset(Dataset):
         w, h = scene.size
 
         x1, y1, x2, y2 = sanitize_bbox_pixels(g.bbox_px, width=w, height=h)
+        head_crop: Image.Image | None = None
+        if self.use_head_crop:
+            head_crop = crop_head_region(
+                scene, (x1, y1, x2, y2),
+                padding=self.head_crop_padding,
+                target_size=self.head_crop_size,
+            )
         if self.visual_prompting:
             scene = draw_head_bbox_prompt(scene, x1=x1, y1=y1, x2=x2, y2=y2)
         bbox_norm = (x1 / w, y1 / h, x2 / w, y2 / h)
@@ -428,6 +456,7 @@ class GazeTestDataset(Dataset):
 
         return {
             "scene_image": scene,
+            "head_crop_image": head_crop,
             "text_input": prompt,
             "target_text": target_text,
             "target_text_valid": torch.tensor(target_text_valid, dtype=torch.float32),

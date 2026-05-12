@@ -86,6 +86,8 @@ def run_rl_training(
     reward_joint_bonus = float(getattr(args, "reward_joint_bonus", 0.25))
     reward_extra_penalty = float(getattr(args, "reward_extra_penalty", 0.5))
     reward_point_beta = float(getattr(args, "reward_point_beta", 10.0))
+    reward_point_mode = str(getattr(args, "reward_point_mode", "l2"))
+    reward_point_box_radius = float(getattr(args, "reward_point_box_radius", 0.05))
     rl_temperature = float(getattr(args, "rl_temperature", 0.7))
     rl_top_p = float(getattr(args, "rl_top_p", 0.9))
     rl_epochs = max(1, int(getattr(args, "epochs", 5)))
@@ -300,6 +302,8 @@ def run_rl_training(
                     reward_joint_bonus=reward_joint_bonus,
                     reward_extra_penalty=reward_extra_penalty,
                     reward_point_beta=reward_point_beta,
+                    reward_point_mode=reward_point_mode,
+                    reward_point_box_radius=reward_point_box_radius,
                 )
                 rewards_list.append(rwd)
                 sum_reward += rwd["reward_total"]

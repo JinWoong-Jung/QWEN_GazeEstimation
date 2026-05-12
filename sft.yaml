@@ -15,6 +15,9 @@ paths:
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
+  min_pixels: 12544            # 16 × 28² — minimum (≈112×112 px)
+  max_pixels: 2007040          # 2560 × 28² — maximum (≈1418×1416 px, 2560 visual tokens)
+  # scene_h / scene_w are used only in "fixed" mode; ignored in "native" mode
   scene_h: 512
   scene_w: 512
   image_cache_size: 1000
@@ -23,6 +26,9 @@ data:
   test_split_prefix: "test2/"
   test_strip_split_prefix: true
   test_bbox_round_decimals: 3
+  use_head_crop: true      # feed head crop as a second image to the model
+  head_crop_padding: 0.3    # padding around head bbox (fraction of box size)
+  head_crop_size: 224       # resize head crop to this square size (px)
 
 train:
   train_stage: "sft"
@@ -31,21 +37,21 @@ train:
   device: "cuda"
   dtype: "bfloat16"
   gradient_checkpointing: false
-  epochs: 10
-  batch_size: 32
-  grad_accum_steps: 8
+  epochs: 20
+  batch_size: 32          
+  grad_accum_steps: 8   
   num_workers: 8
-  lr: 2e-5
+  lr: 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   show_tqdm: true
   filter_invalid_object_samples: false
-  train_augmentation_mode_direct: "full"  # "full" | "no_crop" | "color_only" | "crop_only" | "no_aug"
+  train_augmentation_mode_direct: "no_aug"  # "full" | "no_crop" | "color_only" | "crop_only" | "no_aug"
   save_last_every_n_epochs: 3
 
 eval:
-  test_batch_size: 32
+  test_batch_size: 8    # native 모드 가변 크기 대응
   eval_only: false
   test_only: false
   run_val_metrics: true
@@ -54,7 +60,7 @@ eval:
   checkpoint_monitor_mode: "min"
   generation_max_new_tokens: 8
   constrained_decoding: true
-  constrained_loc_decoding: "argmax"  # "argmax" | "round_expectation"
+  constrained_loc_decoding: "round_expectation"  # "argmax" | "round_expectation"
 
 prompt:
   visual_prompting: true
@@ -82,7 +88,7 @@ wandb:
   enabled: true
   project: "VLM_gaze"
   entity: "semgaze"
-  run_name: "SFT_128bins"
+  run_name: "SFT"
   wandb_log_every_steps: 20
   tags: []
   notes: ""

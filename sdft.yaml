@@ -14,7 +14,7 @@ paths:
   labels_rgs: "data/gazefollow/gaze-labels-rgs.csv"
   labels_ssa: "data/gazefollow/gaze-labels-ssa.csv"
   vocab2id: "data/gazefollow/vocab2id.json"
-  train_reasoning_dir: "/home/work/jinwoong/QWEN_GazeEstimation/data/gazefollow_reason_train"
+  train_reasoning_dir: "/home/elicer/QWEN_GazeEstimation/data/gazefollow_reason/output/train"
 
 data:
   image_resize_mode: "fixed"  # "native" | "fixed"
@@ -26,6 +26,9 @@ data:
   test_split_prefix: "test2/"
   test_strip_split_prefix: true
   test_bbox_round_decimals: 3
+  use_head_crop: false      # feed head crop as a second image to the model
+  head_crop_padding: 0.3    # padding around head bbox (fraction of box size)
+  head_crop_size: 224       # resize head crop to this square size (px)
 
 train:
   train_stage: "sdft"
