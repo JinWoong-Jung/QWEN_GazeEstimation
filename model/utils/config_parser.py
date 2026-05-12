@@ -110,7 +110,9 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--gradient_checkpointing", dest="gradient_checkpointing", action="store_true")
     p.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing", action="store_false")
     p.set_defaults(gradient_checkpointing=bool(default_value(d, "gradient_checkpointing", False)))
-    # show_tqdm is always True; removed from config
+    p.add_argument("--show_tqdm", dest="show_tqdm", action="store_true")
+    p.add_argument("--no_show_tqdm", dest="show_tqdm", action="store_false")
+    p.set_defaults(show_tqdm=bool(default_value(d, "show_tqdm", True)))
 
     # --- val/test control ---
     # run_test is always True; removed from config
@@ -165,6 +167,7 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
 
     # --- structured token pipeline ---
     p.add_argument("--train_stage", type=str, default=str(default_value(d, "train_stage", "sft")))
+    p.add_argument("--output_format", type=str, default=str(default_value(d, "output_format", "point_object")))
     p.add_argument("--save_last_every_n_epochs", type=int, default=int(default_value(d, "save_last_every_n_epochs", 5)))
     p.add_argument("--filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_true")
     p.add_argument("--no_filter_invalid_object_samples", dest="filter_invalid_object_samples", action="store_false")

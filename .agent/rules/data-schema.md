@@ -30,13 +30,14 @@ QwenTextGenerationModel.generate()
 
 ## Special Tokens
 
-Implemented in `model/utils/gaze_tokens.py`.
+Implemented in `model/utils/special_tokens.py` and `model/utils/gaze_tokens.py`.
 
-Schema markers:
+Active schema markers:
 
-- `<|gaze_reasoning|>`
-- `<|gaze_point|>`
-- `<|gaze_object|>`
+- `<|point_start|>`
+- `<|point_end|>`
+- `<|object_start|>`
+- `<|object_end|>`
 
 Coordinate tokens:
 
@@ -50,23 +51,28 @@ Object tokens:
 - `<obj_000>` through `<obj_{num_classes-1}>`, padded to at least 3 digits.
 - Unknown object fallback: `<obj_unknown>`.
 
+## Target Text
+
+The active target text is direct point-object:
+
+```text
+<|point_start|><loc_x><loc_y><|point_end|><|object_start|><obj_k><|object_end|>
+```
+
+`output_format` currently supports:
+
+- `point_object`: `<|point_start|><loc_x><loc_y><|point_end|><|object_start|><obj_k><|object_end|>`
+- `text_point_object`: `Point:<loc_x><loc_y>\nObject:<obj_k>`
+
+The old reasoning-first target order is not active.
+
+Qwen chat templating wraps the assistant answer with chat markers. The collator searches for the raw target span, supervises point/object/format tokens, and additionally marks the trailing `<|im_end|>` token as format loss so the model learns to stop after the object span.
+
 ## Reasoning Text
 
-Reasoning text is indexed by `build_reasoning_index()` and loaded lazily in `GazeDataset`.
+Reasoning text is optional and currently relevant to SDFT teacher prompts, not Stage1 SFT targets.
 
-Normalization:
-
-- collapses whitespace,
-- strips schema markers from reasoning content,
-- truncates to `max_reasoning_words` and `max_reasoning_chars`,
-- appends a trailing period if needed.
-
-Current limits:
-
-- `max_reasoning_words=60`
-- `max_reasoning_chars=500`
-
-Reasoning is capped in `GazeDataset` when reading train reasoning files. `build_structured_target_text()` only sanitizes formatting and does not apply a second length cap.
+`build_reasoning_index()` indexes reasoning files. `GazeDataset` can lazily load `reasoning_text` and `object_text`; the SDFT collator/trainer uses those fields to build teacher-side prompts when distillation is enabled.
 
 ## Datasets
 
@@ -77,8 +83,7 @@ Reasoning is capped in `GazeDataset` when reading train reasoning files. `build_
 Active train construction:
 
 - always `GazeDataset`,
-- `force_reasoning_format=True`,
-- `target_order="reasoning_point_object"`,
+- `target_order="point_object"`,
 - `apply_augmentation=True`.
 
 Active val/test construction:
@@ -92,5 +97,6 @@ Active val/test construction:
 
 - Builds chat-template train/infer inputs.
 - Uses `truncation=False` to avoid breaking Qwen VLM image token alignment.
-- Builds `loss_mask_reasoning`, `loss_mask_point`, `loss_mask_object`, and `loss_mask_format`.
-- Still emits default `view_type`, but active training no longer logs view-based metrics.
+- Builds `loss_mask_point`, `loss_mask_object`, and `loss_mask_format`.
+- Emits rollout SDFT helper fields such as `scene_images`, `text_input`, `reasoning_texts`, `object_texts`, and `teacher_base_inputs`.
+- When `distil_kl_weight > 0`, it can also build teacher inputs for teacher-forcing SDFT.

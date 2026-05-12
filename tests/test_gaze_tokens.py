@@ -85,6 +85,13 @@ class TestBuildStructuredTargetText(unittest.TestCase):
         )
         self.assertEqual(t, expected)
 
+    def test_text_point_object_exact_format(self):
+        t = build_structured_target_text(0.5, 0.5, 10, 100, target_order="text_point_object")
+        bx = quantize_coord(0.5)
+        by = quantize_coord(0.5)
+        expected = f"Point:{format_loc_token(bx)}{format_loc_token(by)}\nObject:<obj_010>"
+        self.assertEqual(t, expected)
+
     def test_unknown_object_token(self):
         t = build_structured_target_text(0.5, 0.5, None, 100, obj_token=GAZE_OBJ_UNKNOWN)
         self.assertIn(GAZE_OBJ_UNKNOWN, t)
@@ -100,6 +107,13 @@ class TestParseStructuredOutputText(unittest.TestCase):
 
     def test_roundtrip_point_object(self):
         t = self._make(0.5, 0.3, 7)
+        p = parse_structured_output_text(t, 100)
+        self.assertTrue(p["valid_format"])
+        self.assertEqual(p["object_id"], 7)
+        self.assertIsNotNone(p["point_xy"])
+
+    def test_roundtrip_text_point_object(self):
+        t = build_structured_target_text(0.5, 0.3, 7, 100, target_order="text_point_object")
         p = parse_structured_output_text(t, 100)
         self.assertTrue(p["valid_format"])
         self.assertEqual(p["object_id"], 7)

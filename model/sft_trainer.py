@@ -45,6 +45,7 @@ def run_sft_epoch(
     updates_per_epoch: int,
     global_step: int,
     train_log_every: int,
+    show_tqdm: bool = True,
 ) -> SftEpochResult:
     """Run one SFT epoch. Pure CE loss, no distillation."""
     model.train()
@@ -65,7 +66,7 @@ def run_sft_epoch(
         desc=f"Train {epoch}/{num_epochs}",
         leave=False,
         dynamic_ncols=True,
-        disable=False,
+        disable=not show_tqdm,
     )
 
     _t_data0 = time.perf_counter()

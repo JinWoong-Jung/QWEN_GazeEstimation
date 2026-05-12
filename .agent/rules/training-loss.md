@@ -6,7 +6,11 @@ description: Training loop, LoRA trainable tokens, augmentation, and losses.
 
 ## Trainer
 
-`model/trainer.py` owns the SFT train/eval loop.
+`model/trainer.py` owns setup and dispatch. Stage-specific epoch logic lives in:
+
+- `model/sft_trainer.py` for pure SFT,
+- `model/sdft_trainer.py` for SDFT teacher-forcing and rollout,
+- `model/rl_trainer.py` for RL.
 
 High-level order:
 
@@ -17,8 +21,8 @@ High-level order:
 5. Build train/val/test datasets.
 6. Create LoRA model.
 7. Use PEFT trainable token rows for gaze special tokens.
-8. Train with structured CE losses.
-9. Save `last/` and monitored `best/` checkpoints.
+8. Dispatch to the selected training path based on `train_stage`.
+9. Save `last/` according to `save_last_every_n_epochs` and monitored `best/` checkpoints.
 10. Run validation/test generation metrics when configured.
 
 Per-epoch timing is printed as:
@@ -53,46 +57,51 @@ Implemented in `model/utils/loss_utils.py`.
 
 Structured masks:
 
-- `loss_mask_reasoning`
 - `loss_mask_point`
 - `loss_mask_object`
 - `loss_mask_format`
 
-`compute_answer_loss()` dispatches to `compute_structured_loss()` when structured masks exist.
+`compute_answer_loss()` uses the point/object/format masks for structured CE.
 
 Current weighted terms:
 
 - `loss_point_weight=3.0`
 - `loss_object_weight=1.0`
-- `loss_format_weight=0.2`
-- `loss_reasoning_weight=0.1`
-- `gaussian_point_sigma=7.0`
-- `point_expectation_weight=0.1`
-- `point_expectation_loss="l2"`
+- `loss_format_weight=1.0`
+- `gaussian_point_sigma=3.0`
 
 Point CE:
 
 - If `gaussian_point_sigma > 0`, point tokens use Gaussian soft-label CE over loc bins.
 - Otherwise point tokens use hard CE.
+- Gaussian point CE normalizes over loc-token logits only, not the full vocabulary. This intentionally changes the absolute loss scale compared with older full-vocab normalization.
 - Validation does not compute teacher-forced loss in the active path. It uses generation metrics only.
 
-Expectation loss:
+## SDFT
 
-- Computes expected loc bin from the predicted distribution over loc tokens.
-- Penalizes distance to GT bin using L1 or L2.
-- It is auxiliary and lightweight compared with Qwen forward/backward, but still adds work on point-token logits.
+`sdft.yaml` uses `train_stage: "sdft"` and requires `checkpoint_dir` to point to a Stage1 SFT checkpoint.
+
+Current SDFT rollout stabilization choices:
+
+- `distil_kl_weight=0.5`
+- `distil_temperature=2.0`
+- `teacher_update="ema"`
+- `teacher_ema_decay=0.999`
+- `sdft_ce_weight=0.3`
+- KL applies to point/object tokens, not format tokens (`kl_on_format=false`).
+
+In rollout mode, if the valid batch has no reasoning or object text, teacher inputs are identical to student inputs. `train_step_sdft_rollout()` reuses the student processed inputs/masks for the teacher forward pass to avoid a duplicate Qwen image tokenization pass.
 
 ## Augmentation
 
 Implemented in `model/utils/data_utils.py`.
 
-Active train augmentation is weak photometric-only:
+Current SFT config uses `train_augmentation_mode_direct: "no_aug"`. Available modes include `full`, `no_crop`, `color_only`, `crop_only`, and `no_aug`.
 
-- bbox sanitization,
-- weak `color_jitter` with probability `0.5`,
-- no horizontal flip,
-- no random crop,
-- no bbox expansion,
-- no coordinate-changing spatial augmentation.
+Be careful with spatial augmentation: it must keep gaze coordinates, bbox coordinates, and visual prompting consistent.
 
-This preserves gaze coordinates and reasoning annotations.
+## DataLoader And Cache
+
+Train/val DataLoaders use persistent workers when `num_workers > 0`.
+
+Image caches are per dataset instance and therefore per worker process. With `num_workers=8` and `image_cache_size=1000`, the effective upper bound is about 8000 cached PIL images. This improves repeated I/O but can exceed Slurm CPU RAM limits if `--mem` is too small.

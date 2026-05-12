@@ -209,7 +209,15 @@ def main() -> None:
     _prompt_text_teacher = str(getattr(args, "prompt_text_teacher", "") or "")
     prompt_text_for_run = _prompt_text_direct
     _prompt_text_eval = _prompt_text_direct
-    _eval_target_order = "point_object"
+    _output_format = str(getattr(args, "output_format", "point_object") or "point_object").strip().lower()
+    _supported_output_formats = {"point_object", "text_point_object"}
+    if _output_format not in _supported_output_formats:
+        raise ValueError(
+            f"output_format must be one of {sorted(_supported_output_formats)}, got: {_output_format!r}"
+        )
+    _train_target_order = _output_format
+    _eval_target_order = _output_format
+    print(f"[INFO] output_format={_output_format}")
     _gen_max_tokens = int(getattr(args, "generation_max_new_tokens", 8))
     _gen_max_tokens_eval = _gen_max_tokens
 
@@ -538,7 +546,7 @@ def main() -> None:
         filter_invalid_object_samples=filter_invalid,
         coord_bins=coord_bins,
         train_augmentation_mode=train_augmentation_mode_direct,
-        target_order="point_object",
+        target_order=_train_target_order,
         reasoning_index=reasoning_index,
     )
     val_ds = GazeDataset(
@@ -638,7 +646,7 @@ def main() -> None:
         num_workers=_nw,
         pin_memory=(device.type == "cuda"),
         collate_fn=train_collator,
-        persistent_workers=False,
+        persistent_workers=_persistent,
         prefetch_factor=_prefetch,
     )
     val_metric_loader = None
@@ -651,7 +659,7 @@ def main() -> None:
             num_workers=_val_metric_nw,
             pin_memory=(device.type == "cuda"),
             collate_fn=test_collator,
-            persistent_workers=False,
+            persistent_workers=(_val_metric_nw > 0),
             prefetch_factor=2 if _val_metric_nw > 0 else None,
         )
 
@@ -932,6 +940,7 @@ def main() -> None:
                 updates_per_epoch=updates_per_epoch,
                 global_step=global_step,
                 train_log_every=max(1, int(getattr(args, "wandb_log_every_steps", 20))),
+                show_tqdm=bool(getattr(args, "show_tqdm", True)),
             )
             global_step = _sft.global_step
             train_loss = _sft.train_loss
@@ -973,6 +982,7 @@ def main() -> None:
                 rollout_top_p=rollout_top_p,
                 rollout_constrained_decoding=rollout_constrained_decoding,
                 rollout_constrained_loc_decoding=rollout_constrained_loc_decoding,
+                rollout_target_order=_eval_target_order,
                 skip_invalid_rollouts=skip_invalid_rollouts,
                 skip_truncated_rollouts=skip_truncated_rollouts,
                 kl_on_point=kl_on_point,
@@ -1100,18 +1110,20 @@ def main() -> None:
                 ema_teacher=ema_teacher,
             )
 
-        save_checkpoint(
-            out_dir / "last",
-            epoch,
-            model,
-            processor,
-            optimizer,
-            scheduler,
-            clear_dir=True,
-            base_vocab_size=base_vocab_size,
-            token_ids_to_save=gaze_token_ids,
-            ema_teacher=ema_teacher,
-        )
+        save_last_every_n = max(1, int(getattr(args, "save_last_every_n_epochs", 1)))
+        if epoch % save_last_every_n == 0 or epoch == effective_epochs:
+            save_checkpoint(
+                out_dir / "last",
+                epoch,
+                model,
+                processor,
+                optimizer,
+                scheduler,
+                clear_dir=True,
+                base_vocab_size=base_vocab_size,
+                token_ids_to_save=gaze_token_ids,
+                ema_teacher=ema_teacher,
+            )
 
     if bool(args.eval_only) and len(val_ds) > 0:
         val_gen_metrics = None

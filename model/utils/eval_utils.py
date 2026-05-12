@@ -249,13 +249,13 @@ def _expected_xy_from_loc_probs(
 
 
 class ConstrainedGazeLogitsProcessor(LogitsProcessor):
-    """Forces 7-token structured gaze output via model.generate().
+    """Forces structured gaze output via model.generate().
 
-    Token order: <|point_start|> loc_x loc_y <|point_end|> <|object_start|> obj_k <|object_end|>
+    Default token order:
+    <|point_start|> loc_x loc_y <|point_end|> <|object_start|> obj_k <|object_end|>
 
-    Steps 0/3/4/6 are forced to a single token.
-    Steps 1/2 select from loc_ids using loc_selection_strategy and save probs.
-    Step 5 selects from obj_ids (argmax) and saves probs.
+    Forced steps are single tokens. Loc steps select from loc_ids using
+    loc_selection_strategy and save probs. The object step selects from obj_ids.
 
     Probs are accessible via .x_probs, .y_probs, .obj_probs after generation.
     """
@@ -270,13 +270,22 @@ class ConstrainedGazeLogitsProcessor(LogitsProcessor):
         obj_ids: torch.LongTensor,
         temperature: float,
         loc_selection_strategy: str,
+        forced_steps: dict[int, int] | None = None,
+        loc_steps: tuple[int, int] = (1, 2),
+        obj_step: int = 5,
     ) -> None:
-        self._forced: dict[int, int] = {
-            0: int(point_start_id),
-            3: int(point_end_id),
-            4: int(object_start_id),
-            6: int(object_end_id),
-        }
+        self._forced: dict[int, int] = (
+            dict(forced_steps)
+            if forced_steps is not None
+            else {
+                0: int(point_start_id),
+                3: int(point_end_id),
+                4: int(object_start_id),
+                6: int(object_end_id),
+            }
+        )
+        self.loc_steps = (int(loc_steps[0]), int(loc_steps[1]))
+        self.obj_step = int(obj_step)
         self.loc_ids = loc_ids
         self.obj_ids = obj_ids
         self.temperature = max(float(temperature), 1e-6)
@@ -307,11 +316,11 @@ class ConstrainedGazeLogitsProcessor(LogitsProcessor):
             new_scores[:, self._forced[step]] = 0.0
             return new_scores
 
-        if step in (1, 2):
+        if step in self.loc_steps:
             loc_ids = self.loc_ids.to(device)
             allowed_logits = scores.index_select(dim=-1, index=loc_ids)
             probs = torch.softmax(allowed_logits / self.temperature, dim=-1)
-            if step == 1:
+            if step == self.loc_steps[0]:
                 self.x_probs = probs.detach().float()
             else:
                 self.y_probs = probs.detach().float()
@@ -322,7 +331,7 @@ class ConstrainedGazeLogitsProcessor(LogitsProcessor):
                 new_scores[b, sel_tok[b]] = 0.0
             return new_scores
 
-        if step == 5:
+        if step == self.obj_step:
             obj_ids = self.obj_ids.to(device)
             allowed_logits = scores.index_select(dim=-1, index=obj_ids)
             probs = torch.softmax(allowed_logits, dim=-1)
@@ -359,13 +368,13 @@ def constrained_generate_structured(
     """Slot-level constrained decoding via model.generate() + ConstrainedGazeLogitsProcessor.
 
     Uses model.generate() so flash_attention_2 KV cache is handled correctly internally.
-    Supported target_order value: "point_object".
+    Supported target_order values: "point_object", "text_point_object".
     """
     order = str(target_order or "point_object").strip()
-    if order != "point_object":
+    if order not in {"point_object", "text_point_object"}:
         raise ValueError(
             f"constrained_generate_structured: unsupported target_order={order!r}. "
-            "Supported: 'point_object'."
+            "Supported: 'point_object', 'text_point_object'."
         )
 
     tokenizer = getattr(processor, "tokenizer", None) or processor
@@ -381,6 +390,32 @@ def constrained_generate_structured(
     object_start_id = _marker_id(tokenizer, OBJECT_START_MARKER)
     object_end_id = _marker_id(tokenizer, OBJECT_END_MARKER)
 
+    forced_steps: dict[int, int] | None = None
+    loc_steps = (1, 2)
+    obj_step = 5
+    max_new_tokens = 7
+    if order == "text_point_object":
+        point_prefix_ids = [
+            int(x) for x in tokenizer.encode("Point:", add_special_tokens=False)
+        ]
+        object_prefix_ids = [
+            int(x) for x in tokenizer.encode("\nObject:", add_special_tokens=False)
+        ]
+        if not point_prefix_ids or not object_prefix_ids:
+            raise ValueError("text_point_object requires non-empty Point:/Object: tokenization")
+        forced_steps = {}
+        step = 0
+        for tid in point_prefix_ids:
+            forced_steps[step] = int(tid)
+            step += 1
+        loc_steps = (step, step + 1)
+        step += 2
+        for tid in object_prefix_ids:
+            forced_steps[step] = int(tid)
+            step += 1
+        obj_step = step
+        max_new_tokens = obj_step + 1
+
     lp = ConstrainedGazeLogitsProcessor(
         point_start_id=point_start_id,
         point_end_id=point_end_id,
@@ -390,20 +425,23 @@ def constrained_generate_structured(
         obj_ids=obj_t,
         temperature=float(temperature),
         loc_selection_strategy=str(loc_selection_strategy),
+        forced_steps=forced_steps,
+        loc_steps=loc_steps,
+        obj_step=obj_step,
     )
 
     prompt_len = int(joint["input_ids"].shape[1])
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
         generated_ids = model.generate(
             joint_inputs=joint,
-            max_new_tokens=7,
+            max_new_tokens=max_new_tokens,
             do_sample=False,
             num_beams=1,
             logits_processor=LogitsProcessorList([lp]),
         )
 
-    # Slice the 7 generated gaze tokens; guard against early-stop edge cases
-    gen_ids = generated_ids[:, prompt_len: prompt_len + 7].detach().cpu()
+    # Slice the generated gaze tokens; guard against early-stop edge cases.
+    gen_ids = generated_ids[:, prompt_len: prompt_len + max_new_tokens].detach().cpu()
     texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=False)
     stripped = [str(t).strip() for t in texts]
 

@@ -20,7 +20,7 @@ data:
   image_resize_mode: "fixed"  # "native" | "fixed"
   scene_h: 512
   scene_w: 512
-  image_cache_size: 0
+  image_cache_size: 1000
   split_prefix: "train/"
   strip_split_prefix: true
   test_split_prefix: "test2/"
@@ -85,11 +85,11 @@ loss:
 
 distil:
   # Stage2 SDFT: student sees the point-object prompt; teacher receives an auxiliary reasoning demonstration.
-  distil_kl_weight: 1.0
-  distil_temperature: 1.0
+  distil_kl_weight: 0.5
+  distil_temperature: 2.0
   distil_teacher_eval_mode: true
   teacher_update: "ema" 
-  teacher_ema_decay: 0.99
+  teacher_ema_decay: 0.999
   teacher_suffix: |
 
     Use the following reasoning to guide your prediction: {reasoning_text}
@@ -103,7 +103,7 @@ sdft:
   sdft_mode: rollout   # choices: teacher_forcing, rollout
 
   # rollout mode: optional weak CE on GT target (paper-core is KL only, ce_weight=0.0).
-  sdft_ce_weight: 0.0
+  sdft_ce_weight: 0.3
 
   # Rollout generation parameters (rollout mode only).
   rollout_max_new_tokens: 8

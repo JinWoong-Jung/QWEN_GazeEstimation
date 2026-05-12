@@ -7,6 +7,7 @@ checkpoints/
 outputs/
 wandb/
 eval_train_dist_output/
+/logs
 
 # Qwen / HuggingFace local model snapshots and caches
 model/Qwen3-VL-4B-Instruct/

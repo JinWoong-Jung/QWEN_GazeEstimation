@@ -82,6 +82,7 @@ def train_step_sdft_rollout(
     rollout_top_p: float,
     rollout_constrained_decoding: bool,
     rollout_constrained_loc_decoding: str,
+    rollout_target_order: str,
     skip_invalid_rollouts: bool,
     skip_truncated_rollouts: bool,
     kl_on_point: bool,
@@ -150,7 +151,7 @@ def train_step_sdft_rollout(
                     num_classes=int(num_classes),
                     coord_bins=int(coord_bins),
                     amp_dtype=amp_dtype,
-                    target_order="point_object",
+                    target_order=str(rollout_target_order),
                     temperature=float(rollout_temperature),
                     loc_selection_strategy=str(rollout_constrained_loc_decoding),
                 )
@@ -228,25 +229,32 @@ def train_step_sdft_rollout(
         max_text_length=max_text_length,
     )
 
-    teacher_text_inputs = [
-        (base + distil_teacher_suffix.format(reasoning_text=rt, object_text=ot))
-        if (rt or ot) else base
-        for base, rt, ot in zip(valid_teacher_base_prompts, valid_reasoning_texts, valid_object_texts)
-    ]
-    teacher_inputs, _teacher_labels, teacher_mask_pt, teacher_mask_obj, _teacher_mask_fmt = build_train_inputs(
-        processor=processor,
-        scene_images=valid_scene_images,
-        text_inputs=teacher_text_inputs,
-        target_texts=valid_generated_texts,
-        target_text_valid=all_ones,
-        target_point_valid=all_ones,
-        target_object_valid=all_ones,
-        target_format_valid=all_ones,
-        max_text_length=max_text_length,
-    )
+    _has_any_reasoning = any(rt or ot for rt, ot in zip(valid_reasoning_texts, valid_object_texts))
+    if _has_any_reasoning:
+        teacher_text_inputs = [
+            (base + distil_teacher_suffix.format(reasoning_text=rt, object_text=ot))
+            if (rt or ot) else base
+            for base, rt, ot in zip(valid_teacher_base_prompts, valid_reasoning_texts, valid_object_texts)
+        ]
+        teacher_inputs, _teacher_labels, teacher_mask_pt, teacher_mask_obj, _teacher_mask_fmt = build_train_inputs(
+            processor=processor,
+            scene_images=valid_scene_images,
+            text_inputs=teacher_text_inputs,
+            target_texts=valid_generated_texts,
+            target_text_valid=all_ones,
+            target_point_valid=all_ones,
+            target_object_valid=all_ones,
+            target_format_valid=all_ones,
+            max_text_length=max_text_length,
+        )
+        teacher_inputs_dev = to_device(teacher_inputs, device=device)
+    else:
+        teacher_mask_pt = student_mask_pt
+        teacher_mask_obj = student_mask_obj
 
     student_inputs_dev = to_device(student_inputs, device=device)
-    teacher_inputs_dev = to_device(teacher_inputs, device=device)
+    if not _has_any_reasoning:
+        teacher_inputs_dev = student_inputs_dev
 
     with torch.autocast(
         device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")
@@ -340,6 +348,7 @@ def run_sdft_epoch(
     rollout_top_p: float,
     rollout_constrained_decoding: bool,
     rollout_constrained_loc_decoding: str,
+    rollout_target_order: str,
     skip_invalid_rollouts: bool,
     skip_truncated_rollouts: bool,
     kl_on_point: bool,
@@ -413,6 +422,7 @@ def run_sdft_epoch(
                 rollout_top_p=rollout_top_p,
                 rollout_constrained_decoding=rollout_constrained_decoding,
                 rollout_constrained_loc_decoding=rollout_constrained_loc_decoding,
+                rollout_target_order=rollout_target_order,
                 skip_invalid_rollouts=skip_invalid_rollouts,
                 skip_truncated_rollouts=skip_truncated_rollouts,
                 kl_on_point=kl_on_point,

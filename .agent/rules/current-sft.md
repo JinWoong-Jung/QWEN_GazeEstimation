@@ -5,40 +5,44 @@ alwaysApply: true
 
 # Current SFT Behavior
 
-The active SFT path always trains and evaluates the reasoning-point-object schema:
+The active Stage1 SFT path trains and evaluates the direct point-object schema:
 
 ```text
-<|gaze_reasoning|><reasoning text><|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>
+<|point_start|><loc_x><loc_y><|point_end|><|object_start|><obj_k><|object_end|>
 ```
 
 ## Active Decisions
 
-- `target_order` is hardcoded as `reasoning_point_object` in the active trainer path.
-- `force_reasoning_format=True` for train, val, test, and `test_only`.
-- Train uses reasoning annotations when files exist.
-- Val/test do not have GT reasoning annotations, but still generate the same schema.
-- Val uses pure generation metrics only; it does not run teacher-forced loss.
-- The old direct/reasoning multiview SFT sampler is removed from the active trainer path.
-- `train/view_reasoning_frac` was removed because it only described the old multiview view mix.
-- `constrained_decoding=false` because free-form reasoning is generated before point/object slots.
-- `generation_stop_at_object_end=false`; allow natural EOS after the full schema.
-- `generation_max_new_tokens=80`, based on sampled reasoning length plus schema overhead.
+- `sft.yaml` sets `train_stage: "sft"`.
+- `output_format` is configurable in the active SFT trainer path. Supported values are `point_object` and `text_point_object`.
+- Train uses `GazeDataset`; val uses `GazeDataset`; test uses grouped `GazeTestDataset`.
+- Val/test do not run teacher-forced validation loss in the normal SFT loop; they use generation metrics.
+- Current SFT config uses `constrained_decoding: true` and `constrained_loc_decoding: "argmax"`.
+- `generation_max_new_tokens=8` because the direct schema is short.
+- Visual prompting is enabled; the dataset draws the head box on the scene image when `visual_prompting: true`.
+- `image_resize_mode: "fixed"` resizes PIL images to `scene_h x scene_w` before the Qwen processor. `"native"` skips this repo-level resize but the Qwen processor can still resize according to its pixel limits.
+- DataLoader workers are persistent when `num_workers > 0`, so per-worker image caches persist across epochs.
 
 ## Active `sft.yaml` Values
 
 - Base model: `model/Qwen3-VL-2B-Instruct`
 - Image resize: fixed `512 x 512`
+- Image cache size: `1000` per worker in the current config
 - Batch size: `32`
-- Grad accumulation: `4`
+- Grad accumulation: `8`
 - Epochs: `20`
+- Learning rate: `2e-5`
+- Output format: `point_object`
 - Coord bins: `128`
-- Reasoning cap: `max_reasoning_words=60`, `max_reasoning_chars=500`
+- LoRA rank/alpha: `32` / `64`
 - LoRA target modules: `q_proj`, `k_proj`, `v_proj`, `o_proj`
-- Train reasoning dir: `/home/elicer/QWEN_GazeEstimation/data/bucket_data/data/gazefollow_reason/output/train`
+- Train augmentation mode: `no_aug`
+- Checkpoint monitor: `val_dist` with mode `min`
+- `save_last_every_n_epochs: 3`
 
 ## Prompt
 
-The active prompt asks for one or two short reasoning sentences, then exactly one x-bin, one y-bin, and one object token. It explicitly mentions the loc/object token ranges. Keep prompt/schema changes synchronized with `gaze_tokens.py`, collator masks, eval parsing, and tests.
+The active prompt asks the model to return only the configured point/object schema. Keep prompt/schema changes synchronized with `special_tokens.py`, `gaze_tokens.py`, collator masks, eval parsing, constrained decoding, and tests.
 
 ## Legacy Formats
 
@@ -49,4 +53,10 @@ Point: 0.4230 0.7112
 Object: television
 ```
 
-That is legacy only.
+or:
+
+```text
+<|gaze_reasoning|><reasoning text><|gaze_point|><loc_x><loc_y><|gaze_object|><obj_k>
+```
+
+Those are legacy or inactive formats for the current SFT path.

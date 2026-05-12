@@ -14,11 +14,11 @@ python -m pytest tests/
 Useful focused commands:
 
 ```bash
-python -m pytest tests/test_gaze_tokens.py tests/test_reasoning_format.py tests/test_reasoning_masks.py
+python -m pytest tests/test_gaze_tokens.py tests/test_special_token_pipeline.py tests/test_constrained_decoding.py
 python -m pytest tests/test_structured_loss.py
 python -m pytest tests/test_full_generation.py
 python -m pytest tests/test_run_name_config.py
-python -m py_compile model/trainer.py model/datasets.py model/utils/*.py
+python -m py_compile model/trainer.py model/sft_trainer.py model/sdft_trainer.py model/rl_trainer.py model/datasets.py model/utils/*.py
 ```
 
 Testing notes:

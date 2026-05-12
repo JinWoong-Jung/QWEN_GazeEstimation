@@ -92,8 +92,8 @@ def gaussian_soft_label_ce(
 
     Each loc token is treated as a bin; bins near the GT bin receive
     partial credit proportional to a Gaussian centered at the GT bin.
-    log_softmax is computed over the full vocabulary; only the C loc
-    token positions contribute to the loss.
+    log_softmax is computed over only the C loc token positions so probability
+    mass is normalized within the coordinate-bin vocabulary.
 
     Args:
         logits_at_pt:  [N, V] logits at the N point-token positions.
@@ -120,8 +120,9 @@ def gaussian_soft_label_ce(
     soft = torch.exp(-0.5 * diff ** 2 / (float(sigma) ** 2))
     soft = soft / soft.sum(dim=1, keepdim=True)  # [N, C], sums to 1
 
-    # log_softmax over full vocab, then slice to loc token positions only
-    log_p = F.log_softmax(logits_at_pt, dim=-1)[:, loc_ids_dev]  # [N, C]
+    # Normalize over loc token positions only.
+    loc_logits = logits_at_pt[:, loc_ids_dev]  # [N, C]
+    log_p = F.log_softmax(loc_logits, dim=-1)  # [N, C]
     return -(soft * log_p).sum(dim=-1).mean()
 
 

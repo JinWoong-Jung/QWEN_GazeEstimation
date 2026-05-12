@@ -10,12 +10,12 @@ description: Evaluation, generation, parsing, and checkpoint behavior.
 
 Current eval/test generation:
 
-- Generates free-form reasoning followed by point/object special tokens.
+- Generates or constrains the direct point/object span-marker schema.
 - Validation is pure generation-based; the active path does not run teacher-forced validation loss.
 - Keep `preview_val_samples=0` when measuring validation speed; previews are a separate generation pass.
-- `constrained_decoding=false`.
-- `generation_max_new_tokens=80`.
-- `generation_stop_at_object_end=false`.
+- Current `sft.yaml` uses `constrained_decoding=true`.
+- `generation_max_new_tokens=8`.
+- `constrained_loc_decoding` can be `argmax` or `round_expectation`.
 
 Metrics are based on parsed structured output:
 
@@ -28,6 +28,8 @@ Metrics are based on parsed structured output:
 `JointExact` is intentionally not measured. With quantized gaze bins it is too strict to be a useful model-selection signal.
 
 When changing output schema, update parser tests and eval tests together.
+
+Constrained decoding is natural for this repo's current closed-vocabulary point/object schemas. It supports both `point_object` and `text_point_object`. Free generation is stricter because it also measures format following; constrained generation is usually a cleaner point/object selection metric.
 
 ## Checkpoints
 
@@ -45,8 +47,10 @@ New trainable-token PEFT rows are saved through adapter save plus effective row 
 
 Checkpoint layout:
 
-- `last/`: most recent checkpoint.
+- `last/`: saved according to `save_last_every_n_epochs` and always on the final epoch.
 - `best/`: checkpoint selected by `checkpoint_monitor`.
+
+The trainer currently runs final test after training in the SFT/SDFT path. If adding a `run_test` option, keep the existing `test_only` path behavior intact.
 
 ## Compatibility Notes
 

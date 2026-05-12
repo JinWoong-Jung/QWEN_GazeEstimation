@@ -47,6 +47,8 @@ def _make_tokenizer(coord_bins: int = 8, num_classes: int = 4) -> MagicMock:
         _register(f"<loc_{i:0{loc_w}d}>")
     for i in range(num_classes):
         _register(f"<obj_{i:0{obj_w}d}>")
+    _register("Point:")
+    _register("\nObject:")
 
     tok = MagicMock()
     tok.encode.side_effect = lambda s, add_special_tokens=False: (
@@ -230,6 +232,22 @@ class TestConstrainedGenerateStructured(unittest.TestCase):
                 amp_dtype=torch.float32,
                 target_order="object_point",
             )
+
+    def test_text_point_object_order_valid_format(self) -> None:
+        joint = _make_joint(bsz=1, seq_len=3)
+        results = constrained_generate_structured(
+            model=self.model,
+            joint=joint,
+            processor=self.processor,
+            num_classes=self.num_classes,
+            coord_bins=self.coord_bins,
+            amp_dtype=torch.float32,
+            target_order="text_point_object",
+        )
+        self.assertEqual(len(results), 1)
+        self.assertRegex(results[0], r"^Point:<loc_\d+><loc_\d+>\nObject:<obj_\d+>$")
+        parsed = parse_structured_output_text(results[0], self.num_classes, coord_bins=self.coord_bins)
+        self.assertTrue(parsed["valid_format"], msg=f"Parser rejected: {results[0]!r} -> {parsed}")
 
     def test_batch_size_2(self) -> None:
         joint = _make_joint(bsz=2, seq_len=3)

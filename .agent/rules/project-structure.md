@@ -13,7 +13,9 @@ QWEN_GazeEstimation fine-tunes Qwen3-VL with LoRA for gaze estimation from a sce
 
 - `main.py`: calls `model.trainer.main()`.
 - `sft.yaml`: active SFT configuration.
-- `RL.yaml` and `model/utils/rl_utils.py`: separate RL path; do not assume SFT changes automatically cover RL.
+- `sdft.yaml`: Stage2 self-distillation configuration.
+- `RL.yaml`: separate RL path; do not assume SFT/SDFT changes automatically cover RL.
+- `sft.sh`: Slurm launcher for `python main.py --config sft.yaml`.
 
 ## Layout
 
@@ -21,12 +23,18 @@ QWEN_GazeEstimation fine-tunes Qwen3-VL with LoRA for gaze estimation from a sce
 QWEN_GazeEstimation/
 ├── main.py
 ├── sft.yaml
+├── sdft.yaml
+├── sft.sh
 ├── RL.yaml
 ├── RL_data_pipeline.py
 ├── eval_train_dist.py
 ├── model/
 │   ├── model.py
 │   ├── trainer.py
+│   ├── sft_trainer.py
+│   ├── sdft_trainer.py
+│   ├── rl_trainer.py
+│   ├── train_context.py
 │   ├── datasets.py
 │   ├── modules/preprocess.py
 │   ├── Qwen3-VL-2B-Instruct/
@@ -58,13 +66,17 @@ Generated directories such as `checkpoints/`, `outputs/`, `wandb/`, `.pytest_cac
 ## Module Responsibilities
 
 - `model/model.py`: minimal `QwenTextGenerationModel` wrapper; returns logits and delegates generation.
-- `model/trainer.py`: config loading, model setup, dataset setup, LoRA, train/eval loop, checkpointing.
+- `model/trainer.py`: config loading, model setup, dataset setup, LoRA, train-stage dispatch, checkpointing, final eval/test orchestration.
+- `model/sft_trainer.py`: pure SFT epoch loop.
+- `model/sdft_trainer.py`: SDFT teacher-forcing and rollout epoch logic.
+- `model/rl_trainer.py`: RL/GRPO-style training path.
+- `model/train_context.py`: typed runtime context shared by training paths.
 - `model/datasets.py`: train/val/test dataset classes and structured target construction.
 - `model/utils/gaze_tokens.py`: structured target formatting, quantization, structured parser, legacy re-exports.
 - `model/utils/special_tokens.py`: gaze special-token constants, loc/object token formatting, tokenizer registration.
 - `model/utils/processor_collate.py`: chat template input building, labels, structured loss masks.
-- `model/utils/loss_utils.py`: structured CE, Gaussian point CE, point expectation loss.
-- `model/utils/eval_utils.py`: generation decode, structured parsing, validation/test metrics.
+- `model/utils/loss_utils.py`: structured CE, Gaussian point CE over loc-token logits, KL distillation helpers.
+- `model/utils/eval_utils.py`: constrained/free generation decode, structured parsing, validation/test metrics.
 - `model/utils/data_utils.py`: annotation loading, label maps, reasoning index, augmentation.
 - `model/utils/checkpoint.py`: LoRA/processor/trainer state and gaze token row save/load.
 - `model/utils/config_parser.py`: YAML flattening and CLI override support.

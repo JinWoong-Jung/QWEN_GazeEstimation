@@ -26,6 +26,7 @@ from .special_tokens import (
 
 POINT_PREFIX: str = "Point:"
 OBJECT_PREFIX: str = "Object:"
+SUPPORTED_TARGET_ORDERS: set[str] = {"point_object", "text_point_object"}
 _LEGACY_POINT_OBJECT_RE = re.compile(
     r"^\s*Point:\s*(<loc_\d+>)(<loc_\d+>)\s*"
     r"Object:\s*(<obj_\d+>|<obj_unknown>)\s*$",
@@ -51,6 +52,10 @@ def _format_object(obj_tok: str) -> str:
     return f"{OBJECT_START_MARKER}{obj_tok}{OBJECT_END_MARKER}"
 
 
+def _format_text_point_object(loc_x: str, loc_y: str, obj_tok: str) -> str:
+    return f"{POINT_PREFIX}{loc_x}{loc_y}\n{OBJECT_PREFIX}{obj_tok}"
+
+
 def build_structured_target_text(
     point_x: float,
     point_y: float,
@@ -61,7 +66,7 @@ def build_structured_target_text(
     coord_bins: int = COORD_BINS,
     target_order: str = "point_object",
 ) -> str:
-    """Build structured target text using the token-based point/object span schema."""
+    """Build structured target text using the configured point/object schema."""
     coord_n = int(coord_bins)
     bx = quantize_coord(float(point_x), bins=coord_n)
     by = quantize_coord(float(point_y), bins=coord_n)
@@ -82,10 +87,16 @@ def build_structured_target_text(
 
     if order == "point_object":
         return f"{point_span}{object_span}"
+    if order == "text_point_object":
+        return _format_text_point_object(
+            format_loc_token(bx, loc_w),
+            format_loc_token(by, loc_w),
+            resolved_obj_tok,
+        )
 
     raise ValueError(
         f"unsupported target_order={target_order!r}; expected one of "
-        "'point_object'"
+        f"{sorted(SUPPORTED_TARGET_ORDERS)}"
     )
 
 
